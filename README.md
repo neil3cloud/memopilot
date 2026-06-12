@@ -120,15 +120,21 @@ docs/          — Product documentation
 
 ## Current Implementation Status
 
-**Completed:** Phase 1 + Phase 2 (extension shell + backend foundation)
+**Completed:** Phases 1–15 (MVP + v1 production scope)
 
-- Extension installs as VSIX with activity bar, webview panel, 8 commands
-- Backend starts, authenticates, writes lockfile, creates `.memopilot/` workspace
-- SQLite + WAL mode + migration runner (001_initial.sql applied)
-- 13 passing tests (auth, health, migrations, workspace_init)
-- `GET /v1/health` and `POST /v1/workspace/init` endpoints operational
+- Workspace indexing delivered (`/v1/workspace/index`, stale-file handling, symbol extraction, rebuild-memory flow)
+- Cost guard and cache delivered (budget checks, task run + usage ledger, savings report, response cache)
+- Agentic safety delivered (credential redaction, DB write blocker checks, MCP loop capped to 5 iterations)
+- Hardening delivered (provider resilience test call, DB recovery path, `detect-secrets` integration, VSIX packaging hardening)
+- Governance UX delivered (Workspace Profile, Memory Manager actions, Privacy Dashboard, agent modes)
+- Extension commands/views include Evidence Board and investigation actions
+- Backend startup false-timeout fix delivered in extension (`BackendManager` now accepts log-discovered port + health check fallback when lockfile detection lags)
+- Investigation mode delivered:
+  - Evidence attach endpoint (`/v1/investigation/evidence/attach`) with source classification and trust scoring
+  - Evidence board endpoint (`/v1/investigation/evidence`) with extraction status and redaction metadata
+  - Investigation run endpoint (`/v1/investigation/run`) generating context packs with extracted/redacted findings, impacted file discovery, related test discovery, and missing test coverage detection
 
-**Next:** Phase 3 (Project Scanner and Symbol Indexer)
+**Next (Post-v1, excluding v2):** Phase 16 → Phase 17(v1 core) → Phase 17(v1.5 add-ons), starting with non-code artifact analysis (PDF/Excel extraction).
 
 ## Development
 
@@ -163,11 +169,6 @@ code --install-extension packages/extension/memopilot-0.1.0.vsix
 ## Documentation
 
 - [Master Product & Implementation Reference](docs/master-reference.md)
-
-## License
-
-MIT
-```
 
 ## License
 

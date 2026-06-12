@@ -26,6 +26,7 @@ class Config:
     log_level: str = "info"
     api_version: int = 1
     schema_version: int = 1
+    monthly_budget_usd: float = 20.0
 
     # Derived paths
     db_path: Path = field(init=False)
@@ -62,10 +63,14 @@ def load_config() -> Config:
 
     # Merge: workspace wins
     merged = {**global_settings, **workspace_settings}
+    budget_settings = merged.get("budget", {})
+    if not isinstance(budget_settings, dict):
+        budget_settings = {}
 
     return Config(
         workspace_path=workspace_path,
         memopilot_dir=memopilot_dir,
         global_dir=global_dir,
         log_level=merged.get("log_level", "info"),
+        monthly_budget_usd=float(budget_settings.get("monthly_budget_usd", 20.0)),
     )
