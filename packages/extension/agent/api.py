@@ -30,6 +30,11 @@ from .privacy_dashboard_service import PrivacyDashboardService
 from .provider_resilience import ProviderCallError, ProviderResilienceService
 from .response_cache import ResponseCacheService
 from .security_policy import CredentialRedactor, DatabaseWriteBlocker
+from .waveb_service import (
+    ProviderCapabilityRecord,
+    WaveBService,
+)
+from .wavec_service import WaveCService
 from .workspace_indexer import WorkspaceIndexer
 from .workspace_init import ensure_global_config
 from .workspace_profile_service import WorkspaceProfileService
@@ -306,6 +311,7 @@ class AttachEvidenceRequest(BaseModel):
     evidence_path: str | None = None
     source_url: str | None = None
     task_run_id: str | None = None
+    column_mapping: dict[str, str] | None = None
 
 
 class AttachEvidenceResponse(BaseModel):
@@ -335,6 +341,17 @@ class EvidenceBoardResponse(BaseModel):
     items: list[EvidenceBoardItemResponse]
 
 
+class EvidenceColumnsPreviewRequest(BaseModel):
+    evidence_path: str
+
+
+class EvidenceColumnsPreviewResponse(BaseModel):
+    source_type: str
+    columns: list[str]
+    suggested_mapping: dict[str, str]
+    requires_confirmation: bool
+
+
 class RunInvestigationRequest(BaseModel):
     title: str
     description: str = ""
@@ -349,6 +366,179 @@ class RunInvestigationResponse(BaseModel):
     related_tests: list[str]
     missing_test_coverage: list[str]
     evidence_count: int
+
+
+class ContextTemplateItemResponse(BaseModel):
+    template_id: str
+    name: str
+    scope: str
+    path: str
+    selected: bool
+
+
+class ContextTemplatesResponse(BaseModel):
+    templates: list[ContextTemplateItemResponse]
+
+
+class SaveContextTemplateRequest(BaseModel):
+    name: str
+    content: str
+    scope: str = "workspace"
+
+
+class SaveContextTemplateResponse(BaseModel):
+    template_id: str
+
+
+class SelectContextTemplateRequest(BaseModel):
+    template_id: str
+
+
+class ContextPackVersionStoreRequest(BaseModel):
+    task_run_id: str | None = None
+    context_pack_text: str
+    pack_path: str | None = None
+    token_estimate: int | None = None
+    selected_model: str | None = None
+    template_id: str | None = None
+
+
+class ContextPackVersionResponse(BaseModel):
+    version_id: str
+    task_run_id: str | None = None
+    pack_path: str
+    pack_hash: str
+    token_estimate: int | None = None
+    selected_model: str | None = None
+    template_id: str | None = None
+    created_at: str
+
+
+class ContextPackVersionsResponse(BaseModel):
+    versions: list[ContextPackVersionResponse]
+
+
+class ContextPackDiffRequest(BaseModel):
+    left_version_id: str
+    right_version_id: str
+
+
+class ContextPackDiffResponse(BaseModel):
+    left_version_id: str
+    right_version_id: str
+    diff_text: str
+
+
+class PatchAssessmentRequest(BaseModel):
+    task_run_id: str
+    diff_text: str
+    files_changed: list[str]
+    active_rules: list[str] = Field(default_factory=list)
+
+
+class PatchAssessmentResponse(BaseModel):
+    patch_attempt_id: str
+    risk_level: str
+    rule_compliance_score: float
+    reasons: list[str]
+
+
+class ProviderCapabilityItemResponse(BaseModel):
+    model_id: str
+    source: str
+    max_context_tokens: int | None = None
+    supports_tool_calling: bool
+    supports_json_mode: bool
+    estimated_cost_per_1m_input: float
+    estimated_cost_per_1m_output: float
+    privacy_level: str
+    allowed_task_types: list[str]
+    denied_task_types: list[str]
+    requires_approval: bool
+
+
+class ProviderCapabilitiesResponse(BaseModel):
+    items: list[ProviderCapabilityItemResponse]
+
+
+class ReplayAICallResponse(BaseModel):
+    ai_call_id: str
+    task_run_id: str
+    provider: str
+    model: str
+    purpose: str | None = None
+    context_pack_path: str | None = None
+    context_pack_text: str
+    replay_payload: dict[str, str | int | float | bool | None]
+
+
+class SkillStoreItemResponse(BaseModel):
+    skill_id: str
+    name: str
+    applies_when: str
+    enabled: bool
+    version: int
+    conflict: bool
+
+
+class SkillStoreListResponse(BaseModel):
+    items: list[SkillStoreItemResponse]
+
+
+class SkillStoreUpsertRequest(BaseModel):
+    name: str
+    applies_when: str
+    rules: list[str] = Field(default_factory=list)
+    tools: list[str] = Field(default_factory=list)
+
+
+class BackupMemoryResponse(BaseModel):
+    backup_id: str
+    backup_path: str
+    item_count: int
+    created_at: str
+
+
+class RestoreMemoryRequest(BaseModel):
+    backup_path: str
+
+
+class RestoreMemoryResponse(BaseModel):
+    restored_count: int
+
+
+class ToolSkillOptimizeRequest(BaseModel):
+    task_text: str
+    available_tools: list[str] = Field(default_factory=list)
+
+
+class ToolSkillOptimizeResponse(BaseModel):
+    suggested_tools: list[str]
+    suggested_skills: list[str]
+    reasons: list[str]
+
+
+class BudgetProfilesResponse(BaseModel):
+    active_profile: str
+    monthly_budget_usd: float
+    effective_budget_usd: float
+    multiplier: float
+    profiles: dict[str, float]
+
+
+class SetBudgetProfileRequest(BaseModel):
+    profile: str
+
+
+class EvidenceClassifyRequest(BaseModel):
+    evidence_path: str | None = None
+    source_url: str | None = None
+
+
+class EvidenceClassifyResponse(BaseModel):
+    source_type: str
+    trust_level: int
+    extraction_method: str
 
 
 def configure(config: Config, db: DatabaseManager) -> None:
@@ -835,6 +1025,7 @@ async def attach_evidence(request: AttachEvidenceRequest) -> AttachEvidenceRespo
             evidence_path=request.evidence_path,
             source_url=request.source_url,
             task_run_id=request.task_run_id,
+            column_mapping=request.column_mapping,
         )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -872,6 +1063,26 @@ async def list_evidence(task_run_id: str | None = None) -> EvidenceBoardResponse
     )
 
 
+@app.post(
+    "/v1/investigation/evidence/columns",
+    response_model=EvidenceColumnsPreviewResponse,
+)
+async def preview_evidence_columns(
+    request: EvidenceColumnsPreviewRequest,
+) -> EvidenceColumnsPreviewResponse:
+    service = InvestigationService(config=_get_config(), db=_get_db())
+    try:
+        preview = await service.preview_columns(evidence_path=request.evidence_path)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return EvidenceColumnsPreviewResponse(
+        source_type=preview.source_type,
+        columns=preview.columns,
+        suggested_mapping=preview.suggested_mapping,
+        requires_confirmation=preview.requires_confirmation,
+    )
+
+
 @app.post("/v1/investigation/run", response_model=RunInvestigationResponse)
 async def run_investigation(request: RunInvestigationRequest) -> RunInvestigationResponse:
     service = InvestigationService(config=_get_config(), db=_get_db())
@@ -888,6 +1099,332 @@ async def run_investigation(request: RunInvestigationRequest) -> RunInvestigatio
         related_tests=result.related_tests,
         missing_test_coverage=result.missing_test_coverage,
         evidence_count=result.evidence_count,
+    )
+
+
+@app.get("/v1/context/templates", response_model=ContextTemplatesResponse)
+async def list_context_templates() -> ContextTemplatesResponse:
+    service = WaveBService(config=_get_config(), db=_get_db())
+    templates = await service.list_templates()
+    return ContextTemplatesResponse(
+        templates=[
+            ContextTemplateItemResponse(
+                template_id=item.template_id,
+                name=item.name,
+                scope=item.scope,
+                path=item.path,
+                selected=item.selected,
+            )
+            for item in templates
+        ]
+    )
+
+
+@app.post("/v1/context/templates", response_model=SaveContextTemplateResponse)
+async def save_context_template(
+    request: SaveContextTemplateRequest,
+) -> SaveContextTemplateResponse:
+    service = WaveBService(config=_get_config(), db=_get_db())
+    try:
+        template_id = await service.save_template(
+            name=request.name,
+            content=request.content,
+            scope=request.scope,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return SaveContextTemplateResponse(template_id=template_id)
+
+
+@app.post("/v1/context/templates/select")
+async def select_context_template(request: SelectContextTemplateRequest) -> MemoryActionResponse:
+    service = WaveBService(config=_get_config(), db=_get_db())
+    try:
+        await service.select_template(request.template_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    return MemoryActionResponse(success=True)
+
+
+@app.post("/v1/context/versions", response_model=ContextPackVersionResponse)
+async def store_context_pack_version(
+    request: ContextPackVersionStoreRequest,
+) -> ContextPackVersionResponse:
+    service = WaveBService(config=_get_config(), db=_get_db())
+    version = await service.store_context_pack_version(
+        task_run_id=request.task_run_id,
+        context_pack_text=request.context_pack_text,
+        pack_path=request.pack_path,
+        token_estimate=request.token_estimate,
+        selected_model=request.selected_model,
+        template_id=request.template_id,
+    )
+    return ContextPackVersionResponse(
+        version_id=version.version_id,
+        task_run_id=version.task_run_id,
+        pack_path=version.pack_path,
+        pack_hash=version.pack_hash,
+        token_estimate=version.token_estimate,
+        selected_model=version.selected_model,
+        template_id=version.template_id,
+        created_at=version.created_at,
+    )
+
+
+@app.get("/v1/context/versions", response_model=ContextPackVersionsResponse)
+async def list_context_pack_versions(
+    task_run_id: str | None = None,
+    limit: int = 20,
+) -> ContextPackVersionsResponse:
+    service = WaveBService(config=_get_config(), db=_get_db())
+    versions = await service.list_context_pack_versions(task_run_id=task_run_id, limit=limit)
+    return ContextPackVersionsResponse(
+        versions=[
+            ContextPackVersionResponse(
+                version_id=item.version_id,
+                task_run_id=item.task_run_id,
+                pack_path=item.pack_path,
+                pack_hash=item.pack_hash,
+                token_estimate=item.token_estimate,
+                selected_model=item.selected_model,
+                template_id=item.template_id,
+                created_at=item.created_at,
+            )
+            for item in versions
+        ]
+    )
+
+
+@app.post("/v1/context/versions/diff", response_model=ContextPackDiffResponse)
+async def diff_context_pack_versions(
+    request: ContextPackDiffRequest,
+) -> ContextPackDiffResponse:
+    service = WaveBService(config=_get_config(), db=_get_db())
+    try:
+        diff_result = await service.diff_context_pack_versions(
+            left_version_id=request.left_version_id,
+            right_version_id=request.right_version_id,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    return ContextPackDiffResponse(
+        left_version_id=diff_result.left_version_id,
+        right_version_id=diff_result.right_version_id,
+        diff_text=diff_result.diff_text,
+    )
+
+
+@app.post("/v1/patch/assess", response_model=PatchAssessmentResponse)
+async def assess_patch_risk_and_compliance(
+    request: PatchAssessmentRequest,
+) -> PatchAssessmentResponse:
+    service = WaveBService(config=_get_config(), db=_get_db())
+    result = await service.assess_patch(
+        task_run_id=request.task_run_id,
+        diff_text=request.diff_text,
+        files_changed=request.files_changed,
+        active_rules=request.active_rules,
+    )
+    return PatchAssessmentResponse(
+        patch_attempt_id=result.patch_attempt_id,
+        risk_level=result.risk_level,
+        rule_compliance_score=result.rule_compliance_score,
+        reasons=result.reasons,
+    )
+
+
+@app.get("/v1/providers/capabilities", response_model=ProviderCapabilitiesResponse)
+async def list_provider_capabilities(limit: int = 100) -> ProviderCapabilitiesResponse:
+    service = WaveBService(config=_get_config(), db=_get_db())
+    items = await service.list_provider_capabilities(limit=limit)
+    return ProviderCapabilitiesResponse(
+        items=[
+            ProviderCapabilityItemResponse(
+                model_id=item.model_id,
+                source=item.source,
+                max_context_tokens=item.max_context_tokens,
+                supports_tool_calling=item.supports_tool_calling,
+                supports_json_mode=item.supports_json_mode,
+                estimated_cost_per_1m_input=item.estimated_cost_per_1m_input,
+                estimated_cost_per_1m_output=item.estimated_cost_per_1m_output,
+                privacy_level=item.privacy_level,
+                allowed_task_types=item.allowed_task_types,
+                denied_task_types=item.denied_task_types,
+                requires_approval=item.requires_approval,
+            )
+            for item in items
+        ]
+    )
+
+
+@app.post("/v1/providers/capabilities")
+async def upsert_provider_capability(
+    request: ProviderCapabilityItemResponse,
+) -> MemoryActionResponse:
+    service = WaveBService(config=_get_config(), db=_get_db())
+    await service.upsert_provider_capability(
+        ProviderCapabilityRecord(
+            model_id=request.model_id,
+            source=request.source,
+            max_context_tokens=request.max_context_tokens,
+            supports_tool_calling=request.supports_tool_calling,
+            supports_json_mode=request.supports_json_mode,
+            estimated_cost_per_1m_input=request.estimated_cost_per_1m_input,
+            estimated_cost_per_1m_output=request.estimated_cost_per_1m_output,
+            privacy_level=request.privacy_level,
+            allowed_task_types=request.allowed_task_types,
+            denied_task_types=request.denied_task_types,
+            requires_approval=request.requires_approval,
+        )
+    )
+    return MemoryActionResponse(success=True)
+
+
+@app.get("/v1/ai/replay/{ai_call_id}", response_model=ReplayAICallResponse)
+async def replay_ai_call(ai_call_id: str) -> ReplayAICallResponse:
+    service = WaveBService(config=_get_config(), db=_get_db())
+    try:
+        replay = await service.replay_ai_call(ai_call_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    return ReplayAICallResponse(
+        ai_call_id=replay.ai_call_id,
+        task_run_id=replay.task_run_id,
+        provider=replay.provider,
+        model=replay.model,
+        purpose=replay.purpose,
+        context_pack_path=replay.context_pack_path,
+        context_pack_text=replay.context_pack_text,
+        replay_payload=replay.replay_payload,
+    )
+
+
+@app.get("/v1/skills/store", response_model=SkillStoreListResponse)
+async def list_skill_store(limit: int = 100) -> SkillStoreListResponse:
+    service = WaveCService(config=_get_config(), db=_get_db())
+    items = await service.list_skills(limit=limit)
+    return SkillStoreListResponse(
+        items=[
+            SkillStoreItemResponse(
+                skill_id=item.skill_id,
+                name=item.name,
+                applies_when=item.applies_when,
+                enabled=item.enabled,
+                version=item.version,
+                conflict=item.conflict,
+            )
+            for item in items
+        ]
+    )
+
+
+@app.post("/v1/skills/store", response_model=SkillStoreItemResponse)
+async def upsert_skill_store_item(
+    request: SkillStoreUpsertRequest,
+) -> SkillStoreItemResponse:
+    service = WaveCService(config=_get_config(), db=_get_db())
+    try:
+        item = await service.create_or_update_skill(
+            name=request.name,
+            applies_when=request.applies_when,
+            rules=request.rules,
+            tools=request.tools,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return SkillStoreItemResponse(
+        skill_id=item.skill_id,
+        name=item.name,
+        applies_when=item.applies_when,
+        enabled=item.enabled,
+        version=item.version,
+        conflict=item.conflict,
+    )
+
+
+@app.post("/v1/memory/backup", response_model=BackupMemoryResponse)
+async def backup_memory() -> BackupMemoryResponse:
+    service = WaveCService(config=_get_config(), db=_get_db())
+    backup = await service.backup_memory()
+    return BackupMemoryResponse(
+        backup_id=backup.backup_id,
+        backup_path=backup.backup_path,
+        item_count=backup.item_count,
+        created_at=backup.created_at,
+    )
+
+
+@app.post("/v1/memory/restore", response_model=RestoreMemoryResponse)
+async def restore_memory(request: RestoreMemoryRequest) -> RestoreMemoryResponse:
+    service = WaveCService(config=_get_config(), db=_get_db())
+    try:
+        restored_count = await service.restore_memory(backup_path=request.backup_path)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return RestoreMemoryResponse(restored_count=restored_count)
+
+
+@app.post("/v1/optimizer/tools-skills", response_model=ToolSkillOptimizeResponse)
+async def optimize_tools_and_skills(
+    request: ToolSkillOptimizeRequest,
+) -> ToolSkillOptimizeResponse:
+    service = WaveCService(config=_get_config(), db=_get_db())
+    result = await service.optimize_tools_and_skills(
+        task_text=request.task_text,
+        available_tools=request.available_tools,
+    )
+    return ToolSkillOptimizeResponse(
+        suggested_tools=result.suggested_tools,
+        suggested_skills=result.suggested_skills,
+        reasons=result.reasons,
+    )
+
+
+@app.get("/v1/budget/profiles", response_model=BudgetProfilesResponse)
+async def get_budget_profiles() -> BudgetProfilesResponse:
+    service = WaveCService(config=_get_config(), db=_get_db())
+    result = await service.get_budget_profiles()
+    return BudgetProfilesResponse(
+        active_profile=result.active_profile,
+        monthly_budget_usd=result.monthly_budget_usd,
+        effective_budget_usd=result.effective_budget_usd,
+        multiplier=result.multiplier,
+        profiles=result.profiles,
+    )
+
+
+@app.post("/v1/budget/profiles", response_model=BudgetProfilesResponse)
+async def set_budget_profile(request: SetBudgetProfileRequest) -> BudgetProfilesResponse:
+    service = WaveCService(config=_get_config(), db=_get_db())
+    try:
+        result = await service.set_budget_profile(request.profile)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return BudgetProfilesResponse(
+        active_profile=result.active_profile,
+        monthly_budget_usd=result.monthly_budget_usd,
+        effective_budget_usd=result.effective_budget_usd,
+        multiplier=result.multiplier,
+        profiles=result.profiles,
+    )
+
+
+@app.post("/v1/investigation/evidence/classify", response_model=EvidenceClassifyResponse)
+async def classify_evidence_source(request: EvidenceClassifyRequest) -> EvidenceClassifyResponse:
+    if not request.evidence_path and not request.source_url:
+        raise HTTPException(
+            status_code=400,
+            detail="Either evidence_path or source_url is required",
+        )
+    service = WaveCService(config=_get_config(), db=_get_db())
+    source_type, trust_level, extraction_method = service.classify_evidence_source(
+        evidence_path=request.evidence_path,
+        source_url=request.source_url,
+    )
+    return EvidenceClassifyResponse(
+        source_type=source_type,
+        trust_level=trust_level,
+        extraction_method=extraction_method,
     )
 
 

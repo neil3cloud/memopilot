@@ -27,6 +27,7 @@ class Config:
     api_version: int = 1
     schema_version: int = 1
     monthly_budget_usd: float = 20.0
+    budget_profile: str = "balanced"
 
     # Derived paths
     db_path: Path = field(init=False)
@@ -73,4 +74,5 @@ def load_config() -> Config:
         global_dir=global_dir,
         log_level=merged.get("log_level", "info"),
         monthly_budget_usd=float(budget_settings.get("monthly_budget_usd", 20.0)),
+        budget_profile=str(budget_settings.get("profile", "balanced")),
     )

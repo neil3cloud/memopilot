@@ -41,11 +41,18 @@ class CostGuardService:
     def __init__(self, *, config: Config, db: DatabaseManager) -> None:
         self._config = config
         self._db = db
+        self._profile_multipliers = {
+            "cost_saver": 0.7,
+            "balanced": 1.0,
+            "frontier": 1.5,
+        }
 
     async def get_budget_status(self) -> BudgetStatus:
         spent_usd = await self._sum_ledger("spend")
         saved_usd = await self._sum_ledger("save")
-        monthly_budget = max(self._config.monthly_budget_usd, 0.0)
+        base_budget = max(self._config.monthly_budget_usd, 0.0)
+        multiplier = self._profile_multipliers.get(self._config.budget_profile, 1.0)
+        monthly_budget = max(base_budget * multiplier, 0.0)
         remaining = max(monthly_budget - spent_usd, 0.0)
         return BudgetStatus(
             monthly_budget_usd=monthly_budget,
