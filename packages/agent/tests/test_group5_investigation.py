@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import openpyxl
 import pytest
 from httpx import AsyncClient
+
+from agent.investigation_service import InvestigationService
 
 
 @pytest.mark.asyncio
@@ -20,11 +23,19 @@ async def test_evidence_source_classification_and_trust_levels(
         ("trace.log", "timeout error", "text_log", 3),
         ("metrics.csv", "name,value\nlatency,12", "csv_data", 3),
         ("payload.json", '{"error":"invalid_token"}', "api_payload", 3),
+        ("specs.xlsx", None, "excel_sheet", 3),
         ("screenshot.png", None, "image", 5),
     ]
     for name, content, expected_type, expected_trust in fixtures:
         file_path = tmp_workspace / name
-        if content is None:
+        if name.endswith(".xlsx"):
+            workbook = openpyxl.Workbook()
+            sheet = workbook.active
+            sheet.append(["title", "steps", "expected"])
+            sheet.append(["Login", "Open app", "Dashboard"])
+            workbook.save(file_path)
+            workbook.close()
+        elif name.endswith(".png"):
             file_path.write_bytes(b"\x89PNG\r\n\x1a\n\x00")
         else:
             file_path.write_text(content, encoding="utf-8")
@@ -123,3 +134,85 @@ async def test_run_investigation_builds_context_pack_and_coverage(
     assert "## Evidence Sources" in payload["context_pack"]
     assert "## Missing Test Coverage" in payload["context_pack"]
     assert "[text_log:" in payload["context_pack"]
+
+
+@pytest.mark.asyncio
+async def test_excel_preview_and_mapping_extracts_test_cases(
+    client: AsyncClient,
+    test_token: str,
+    tmp_workspace,
+):
+    headers = {"X-Agent-Token": test_token}
+    await client.post("/v1/workspace/init", headers=headers)
+
+    workbook_path = tmp_workspace / "test-cases.xlsx"
+    workbook = openpyxl.Workbook()
+    sheet = workbook.active
+    sheet.append(["Case Title", "Procedure", "Expected Result", "Priority"])
+    sheet.append(["Login success", "Use valid creds", "Home page opens", "P1"])
+    sheet.append(["Login fail", "Use bad creds", "Error appears", "P2"])
+    workbook.save(workbook_path)
+    workbook.close()
+
+    preview = await client.post(
+        "/v1/investigation/evidence/columns",
+        headers=headers,
+        json={"evidence_path": str(workbook_path)},
+    )
+    assert preview.status_code == 200
+    preview_payload = preview.json()
+    assert preview_payload["source_type"] == "excel_sheet"
+    assert "Case Title" in preview_payload["columns"]
+    assert preview_payload["requires_confirmation"] is True
+
+    attached = await client.post(
+        "/v1/investigation/evidence/attach",
+        headers=headers,
+        json={
+            "evidence_path": str(workbook_path),
+            "column_mapping": {
+                "title": "Case Title",
+                "steps": "Procedure",
+                "expected": "Expected Result",
+            },
+        },
+    )
+    assert attached.status_code == 200
+    body = attached.json()
+    assert body["source_type"] == "excel_sheet"
+    assert any("Test case:" in finding for finding in body["findings"])
+    assert any("Data dictionary:" in finding for finding in body["findings"])
+
+
+@pytest.mark.asyncio
+async def test_scanned_pdf_forces_trust_level_four(
+    client: AsyncClient,
+    test_token: str,
+    tmp_workspace,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setattr(
+        InvestigationService,
+        "_extract_pdf_findings",
+        lambda self, _path: (
+            ["Scanned PDF detected. OCR is required before reliable extraction."],
+            "requires_ocr",
+            True,
+        ),
+    )
+
+    headers = {"X-Agent-Token": test_token}
+    await client.post("/v1/workspace/init", headers=headers)
+
+    evidence = tmp_workspace / "scan.pdf"
+    evidence.write_text("scanned content placeholder", encoding="utf-8")
+    attached = await client.post(
+        "/v1/investigation/evidence/attach",
+        headers=headers,
+        json={"evidence_path": str(evidence)},
+    )
+    assert attached.status_code == 200
+    payload = attached.json()
+    assert payload["source_type"] == "pdf_doc"
+    assert payload["extraction_status"] == "requires_ocr"
+    assert payload["trust_level"] == 4

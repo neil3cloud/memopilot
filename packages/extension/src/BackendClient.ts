@@ -88,6 +88,13 @@ export interface AttachEvidenceResponse {
     source_path: string | null;
 }
 
+export interface EvidenceColumnsPreviewResponse {
+    source_type: string;
+    columns: string[];
+    suggested_mapping: Record<string, string>;
+    requires_confirmation: boolean;
+}
+
 export interface EvidenceBoardItemResponse {
     evidence_id: string;
     source_type: string;
@@ -111,6 +118,119 @@ export interface RunInvestigationResponse {
     related_tests: string[];
     missing_test_coverage: string[];
     evidence_count: number;
+}
+
+export interface ContextTemplateItemResponse {
+    template_id: string;
+    name: string;
+    scope: string;
+    path: string;
+    selected: boolean;
+}
+
+export interface ContextTemplatesResponse {
+    templates: ContextTemplateItemResponse[];
+}
+
+export interface ContextPackVersionResponse {
+    version_id: string;
+    task_run_id: string | null;
+    pack_path: string;
+    pack_hash: string;
+    token_estimate: number | null;
+    selected_model: string | null;
+    template_id: string | null;
+    created_at: string;
+}
+
+export interface ContextPackVersionsResponse {
+    versions: ContextPackVersionResponse[];
+}
+
+export interface ContextPackDiffResponse {
+    left_version_id: string;
+    right_version_id: string;
+    diff_text: string;
+}
+
+export interface PatchAssessmentResponse {
+    patch_attempt_id: string;
+    risk_level: string;
+    rule_compliance_score: number;
+    reasons: string[];
+}
+
+export interface ProviderCapabilityItemResponse {
+    model_id: string;
+    source: string;
+    max_context_tokens: number | null;
+    supports_tool_calling: boolean;
+    supports_json_mode: boolean;
+    estimated_cost_per_1m_input: number;
+    estimated_cost_per_1m_output: number;
+    privacy_level: string;
+    allowed_task_types: string[];
+    denied_task_types: string[];
+    requires_approval: boolean;
+}
+
+export interface ProviderCapabilitiesResponse {
+    items: ProviderCapabilityItemResponse[];
+}
+
+export interface ReplayAICallResponse {
+    ai_call_id: string;
+    task_run_id: string;
+    provider: string;
+    model: string;
+    purpose: string | null;
+    context_pack_path: string | null;
+    context_pack_text: string;
+    replay_payload: Record<string, string | number | boolean | null>;
+}
+
+export interface SkillStoreItemResponse {
+    skill_id: string;
+    name: string;
+    applies_when: string;
+    enabled: boolean;
+    version: number;
+    conflict: boolean;
+}
+
+export interface SkillStoreListResponse {
+    items: SkillStoreItemResponse[];
+}
+
+export interface BackupMemoryResponse {
+    backup_id: string;
+    backup_path: string;
+    item_count: number;
+    created_at: string;
+}
+
+export interface RestoreMemoryResponse {
+    restored_count: number;
+}
+
+export interface ToolSkillOptimizeResponse {
+    suggested_tools: string[];
+    suggested_skills: string[];
+    reasons: string[];
+}
+
+export interface BudgetProfilesResponse {
+    active_profile: string;
+    monthly_budget_usd: number;
+    effective_budget_usd: number;
+    multiplier: number;
+    profiles: Record<string, number>;
+}
+
+export interface EvidenceClassifyResponse {
+    source_type: string;
+    trust_level: number;
+    extraction_method: string;
 }
 
 export class BackendClient {
@@ -203,9 +323,20 @@ export class BackendClient {
         return result as TaskModesResponse;
     }
 
-    async attachEvidence(evidencePath: string): Promise<AttachEvidenceResponse> {
+    async previewEvidenceColumns(evidencePath: string): Promise<EvidenceColumnsPreviewResponse> {
+        const result = await this.manager.request('POST', '/v1/investigation/evidence/columns', {
+            evidence_path: evidencePath,
+        });
+        return result as EvidenceColumnsPreviewResponse;
+    }
+
+    async attachEvidence(
+        evidencePath: string,
+        columnMapping?: Record<string, string>,
+    ): Promise<AttachEvidenceResponse> {
         const result = await this.manager.request('POST', '/v1/investigation/evidence/attach', {
             evidence_path: evidencePath,
+            column_mapping: columnMapping,
         });
         return result as AttachEvidenceResponse;
     }
@@ -229,5 +360,146 @@ export class BackendClient {
             task_run_id: taskRunId,
         });
         return result as RunInvestigationResponse;
+    }
+
+    async listContextTemplates(): Promise<ContextTemplatesResponse> {
+        const result = await this.manager.request('GET', '/v1/context/templates');
+        return result as ContextTemplatesResponse;
+    }
+
+    async saveContextTemplate(name: string, content: string, scope = 'workspace'): Promise<string> {
+        const result = await this.manager.request('POST', '/v1/context/templates', {
+            name,
+            content,
+            scope,
+        });
+        return (result as { template_id: string }).template_id;
+    }
+
+    async selectContextTemplate(templateId: string): Promise<void> {
+        await this.manager.request('POST', '/v1/context/templates/select', {
+            template_id: templateId,
+        });
+    }
+
+    async storeContextPackVersion(
+        contextPackText: string,
+        taskRunId?: string,
+        selectedModel?: string,
+        templateId?: string,
+    ): Promise<ContextPackVersionResponse> {
+        const result = await this.manager.request('POST', '/v1/context/versions', {
+            task_run_id: taskRunId,
+            context_pack_text: contextPackText,
+            selected_model: selectedModel,
+            template_id: templateId,
+        });
+        return result as ContextPackVersionResponse;
+    }
+
+    async listContextPackVersions(taskRunId?: string): Promise<ContextPackVersionsResponse> {
+        const suffix = taskRunId ? `?task_run_id=${encodeURIComponent(taskRunId)}` : '';
+        const result = await this.manager.request('GET', `/v1/context/versions${suffix}`);
+        return result as ContextPackVersionsResponse;
+    }
+
+    async diffContextPackVersions(
+        leftVersionId: string,
+        rightVersionId: string,
+    ): Promise<ContextPackDiffResponse> {
+        const result = await this.manager.request('POST', '/v1/context/versions/diff', {
+            left_version_id: leftVersionId,
+            right_version_id: rightVersionId,
+        });
+        return result as ContextPackDiffResponse;
+    }
+
+    async assessPatchRiskAndCompliance(
+        taskRunId: string,
+        diffText: string,
+        filesChanged: string[],
+        activeRules: string[],
+    ): Promise<PatchAssessmentResponse> {
+        const result = await this.manager.request('POST', '/v1/patch/assess', {
+            task_run_id: taskRunId,
+            diff_text: diffText,
+            files_changed: filesChanged,
+            active_rules: activeRules,
+        });
+        return result as PatchAssessmentResponse;
+    }
+
+    async listProviderCapabilities(): Promise<ProviderCapabilitiesResponse> {
+        const result = await this.manager.request('GET', '/v1/providers/capabilities');
+        return result as ProviderCapabilitiesResponse;
+    }
+
+    async replayAICall(aiCallId: string): Promise<ReplayAICallResponse> {
+        const result = await this.manager.request('GET', `/v1/ai/replay/${encodeURIComponent(aiCallId)}`);
+        return result as ReplayAICallResponse;
+    }
+
+    async listSkillStore(): Promise<SkillStoreListResponse> {
+        const result = await this.manager.request('GET', '/v1/skills/store');
+        return result as SkillStoreListResponse;
+    }
+
+    async upsertSkillStoreItem(
+        name: string,
+        appliesWhen: string,
+        rules: string[],
+        tools: string[],
+    ): Promise<SkillStoreItemResponse> {
+        const result = await this.manager.request('POST', '/v1/skills/store', {
+            name,
+            applies_when: appliesWhen,
+            rules,
+            tools,
+        });
+        return result as SkillStoreItemResponse;
+    }
+
+    async backupMemory(): Promise<BackupMemoryResponse> {
+        const result = await this.manager.request('POST', '/v1/memory/backup');
+        return result as BackupMemoryResponse;
+    }
+
+    async restoreMemory(backupPath: string): Promise<RestoreMemoryResponse> {
+        const result = await this.manager.request('POST', '/v1/memory/restore', {
+            backup_path: backupPath,
+        });
+        return result as RestoreMemoryResponse;
+    }
+
+    async optimizeToolsAndSkills(
+        taskText: string,
+        availableTools: string[],
+    ): Promise<ToolSkillOptimizeResponse> {
+        const result = await this.manager.request('POST', '/v1/optimizer/tools-skills', {
+            task_text: taskText,
+            available_tools: availableTools,
+        });
+        return result as ToolSkillOptimizeResponse;
+    }
+
+    async getBudgetProfiles(): Promise<BudgetProfilesResponse> {
+        const result = await this.manager.request('GET', '/v1/budget/profiles');
+        return result as BudgetProfilesResponse;
+    }
+
+    async setBudgetProfile(profile: string): Promise<BudgetProfilesResponse> {
+        const result = await this.manager.request('POST', '/v1/budget/profiles', { profile });
+        return result as BudgetProfilesResponse;
+    }
+
+    async classifyEvidenceSource(
+        evidencePath?: string,
+        sourceUrl?: string,
+    ): Promise<EvidenceClassifyResponse> {
+        const result = await this.manager.request('POST', '/v1/investigation/evidence/classify', {
+            evidence_path: evidencePath,
+            source_url: sourceUrl,
+        });
+        return result as EvidenceClassifyResponse;
     }
 }
