@@ -361,7 +361,11 @@ def configure(config: Config, db: DatabaseManager) -> None:
 
 @app.middleware("http")
 async def auth_middleware(request: Request, call_next):
-    """Validate X-Agent-Token on every request."""
+    """Validate X-Agent-Token on every request except health checks."""
+    # Allow health endpoint without authentication
+    if request.url.path == "/v1/health":
+        return await call_next(request)
+
     if _expected_token is None:
         return JSONResponse(status_code=500, content={"detail": "MEMOPILOT_TOKEN not configured"})
 

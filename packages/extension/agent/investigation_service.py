@@ -208,10 +208,14 @@ class InvestigationService:
         if not candidate.is_absolute():
             candidate = self._config.workspace_path / candidate
         resolved = candidate.resolve()
+        workspace_resolved = self._config.workspace_path.resolve()
         try:
-            resolved.relative_to(self._config.workspace_path.resolve())
+            resolved.relative_to(workspace_resolved)
         except ValueError as exc:
             raise ValueError("Evidence path must be within the workspace") from exc
+        # Reject symlinks to prevent traversal via symlink targets outside workspace
+        if candidate.is_symlink():
+            raise ValueError("Symlinked evidence paths are not allowed")
         if not resolved.exists():
             raise ValueError(f"Evidence path not found: {resolved}")
         return resolved
@@ -273,26 +277,46 @@ class InvestigationService:
             return ["No file evidence provided."], "ok"
         if source_type == "image":
             return ["Image evidence attached; OCR interpretation pending."], "requires_ocr"
+
+        # Guard against excessively large files (10 MB limit)
+        max_file_size = 10 * 1024 * 1024
+        try:
+            file_size = evidence_path.stat().st_size
+        except OSError as exc:
+            raise ValueError(f"Cannot access evidence file: {exc}") from exc
+        if file_size > max_file_size:
+            raise ValueError(
+                f"Evidence file too large ({file_size} bytes, max {max_file_size})"
+            )
+
         if source_type == "csv_data":
             return self._extract_csv_findings(evidence_path), "ok"
 
-        text = evidence_path.read_text(encoding="utf-8", errors="replace")
+        try:
+            text = evidence_path.read_text(encoding="utf-8", errors="replace")
+        except OSError as exc:
+            raise ValueError(f"Cannot read evidence file: {exc}") from exc
         lines = [line.strip() for line in text.splitlines() if line.strip()]
         return lines[:30], "ok"
 
     def _extract_csv_findings(self, evidence_path: Path) -> list[str]:
         findings: list[str] = []
-        with evidence_path.open("r", encoding="utf-8", errors="replace", newline="") as file_obj:
-            reader = csv.DictReader(file_obj)
-            headers = reader.fieldnames or []
-            if headers:
-                findings.append(f"CSV headers: {', '.join(headers)}")
-            for index, row in enumerate(reader):
-                if index >= 10:
-                    break
-                pairs = [f"{key}={value}" for key, value in row.items() if value]
-                if pairs:
-                    findings.append("; ".join(pairs))
+        try:
+            with evidence_path.open(
+                "r", encoding="utf-8", errors="replace", newline=""
+            ) as file_obj:
+                reader = csv.DictReader(file_obj)
+                headers = reader.fieldnames or []
+                if headers:
+                    findings.append(f"CSV headers: {', '.join(headers)}")
+                for index, row in enumerate(reader):
+                    if index >= 10:
+                        break
+                    pairs = [f"{key}={value}" for key, value in row.items() if value]
+                    if pairs:
+                        findings.append("; ".join(pairs))
+        except OSError as exc:
+            raise ValueError(f"Cannot read CSV evidence file: {exc}") from exc
         if not findings:
             findings.append("CSV contained no parsed rows.")
         return findings
@@ -314,8 +338,12 @@ class InvestigationService:
             return []
 
         conn = await self._db.connect()
-        file_cursor = await conn.execute("SELECT file_path FROM file_index")
-        symbol_cursor = await conn.execute("SELECT DISTINCT file_path, name FROM symbols")
+        file_cursor = await conn.execute(
+            "SELECT file_path FROM file_index LIMIT 10000"
+        )
+        symbol_cursor = await conn.execute(
+            "SELECT DISTINCT file_path, name FROM symbols LIMIT 10000"
+        )
         file_rows = await file_cursor.fetchall()
         symbol_rows = await symbol_cursor.fetchall()
 

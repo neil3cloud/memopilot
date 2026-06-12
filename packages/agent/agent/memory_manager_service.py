@@ -31,28 +31,27 @@ class MemoryManagerService:
     def __init__(self, *, db: DatabaseManager) -> None:
         self._db = db
 
+    _FILTER_CLAUSES: dict[str, str] = {
+        "all": "1=1",
+        "rules": "type = 'rule'",
+        "symbols": "type = 'symbol'",
+        "file_summaries": "type = 'file_summary'",
+        "stale": "stale = 1",
+        "pending_approval": (
+            "trust_level IN (4, 5) AND ("
+            " json_extract(tags_json, '$.pending_approval') = 1"
+            " OR json_extract(tags_json, '$.pending_approval') = true"
+            ")"
+        ),
+    }
+
     async def list_items(self, *, filter_name: str, limit: int) -> list[MemoryItem]:
         conn = await self._db.connect()
-        where_clause = "1=1"
-        params: list[Any] = []
 
-        if filter_name == "rules":
-            where_clause = "type = 'rule'"
-        elif filter_name == "symbols":
-            where_clause = "type = 'symbol'"
-        elif filter_name == "file_summaries":
-            where_clause = "type = 'file_summary'"
-        elif filter_name == "stale":
-            where_clause = "stale = 1"
-        elif filter_name == "pending_approval":
-            where_clause = """
-            trust_level IN (4, 5) AND (
-                json_extract(tags_json, '$.pending_approval') = 1
-                OR json_extract(tags_json, '$.pending_approval') = true
-            )
-            """
+        where_clause = self._FILTER_CLAUSES.get(filter_name)
+        if where_clause is None:
+            raise ValueError(f"Unknown filter: {filter_name}")
 
-        params.append(limit)
         cursor = await conn.execute(
             f"""
             SELECT
@@ -63,7 +62,7 @@ class MemoryManagerService:
             ORDER BY updated_at DESC
             LIMIT ?
             """,
-            tuple(params),
+            (limit,),
         )
         rows = await cursor.fetchall()
         return [self._row_to_item(row) for row in rows]
