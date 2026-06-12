@@ -110,7 +110,6 @@ docs/          — Product documentation
 | Feature |
 |---------|
 | Image/screenshot analysis (vision model) |
-| AnythingLLM connector |
 | Team Policy Packs |
 | Local Agent Flow Builder |
 | Multi-language Skill Marketplace |
@@ -141,7 +140,16 @@ docs/          — Product documentation
   - Tool/skill selection optimizer
   - Model budget profiles
 
-- Next focus is v2 only.
+## v2 Implementation Plan
+
+| Wave | Scope | Order |
+|---|---|---|
+| 1 | Image/screenshot analysis | First |
+| 2 | Team Policy Packs + Local Agent Flow Builder | Second |
+| 3 | Deferred: Multi-language Skill Marketplace + Team-Shared Memory Server | Deferred |
+| 4 | Multi-workspace support v2 + Word/PowerPoint ingestion | Next active |
+
+Wave 3 is deferred for now; next active V2 scope is Wave 4 after Wave 2.
 
 ## Development
 

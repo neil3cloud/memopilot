@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import csv
+import importlib.util
 import json
 import re
 import uuid
@@ -13,11 +14,17 @@ from typing import Any
 
 import openpyxl
 import pdfplumber
+from docx import Document
+from PIL import Image, UnidentifiedImageError
+from pptx import Presentation
 
 from .config import Config
 from .db import DatabaseManager
 from .evidence_classifier import EvidenceSourceClassifier
 from .security_policy import CredentialRedactor
+from .wave4_service import Wave4Service
+
+MAX_EVIDENCE_FILE_SIZE_BYTES = 10 * 1024 * 1024
 
 
 @dataclass(frozen=True)
@@ -73,7 +80,7 @@ class InvestigationService:
         self._classifier = EvidenceSourceClassifier()
 
     async def preview_columns(self, *, evidence_path: str) -> EvidenceColumnsPreview:
-        resolved_path = self._resolve_evidence_path(evidence_path)
+        resolved_path = await self._resolve_evidence_path(evidence_path)
         source_type = self._classifier.classify(
             evidence_path=resolved_path,
             source_url=None,
@@ -113,7 +120,7 @@ class InvestigationService:
         task_run_id: str | None,
         column_mapping: dict[str, str] | None,
     ) -> AttachedEvidence:
-        resolved_path = self._resolve_evidence_path(evidence_path) if evidence_path else None
+        resolved_path = await self._resolve_evidence_path(evidence_path) if evidence_path else None
         classification = self._classifier.classify(
             evidence_path=resolved_path,
             source_url=source_url,
@@ -259,19 +266,22 @@ class InvestigationService:
             evidence_count=len(evidence_entries),
         )
 
-    def _resolve_evidence_path(self, evidence_path: str) -> Path:
+    async def _resolve_evidence_path(self, evidence_path: str) -> Path:
         candidate = Path(evidence_path)
+        workspace_service = Wave4Service(config=self._config, db=self._db)
+        allowed_roots = await workspace_service.allowed_workspace_paths()
         if not candidate.is_absolute():
-            candidate = self._config.workspace_path / candidate
-        resolved = candidate.resolve()
-        workspace_resolved = self._config.workspace_path.resolve()
-        try:
-            resolved.relative_to(workspace_resolved)
-        except ValueError as exc:
-            raise ValueError("Evidence path must be within the workspace") from exc
-        # Reject symlinks to prevent traversal via symlink targets outside workspace
+            if self._contains_parent_reference(candidate):
+                raise ValueError("Evidence path must not traverse parent directories")
+            active_root = await workspace_service.active_workspace_path()
+            candidate = active_root / candidate
+        if not any(self._is_within_workspace(candidate, root) for root in allowed_roots):
+            raise ValueError("Evidence path must be within a configured workspace root")
         if candidate.is_symlink():
             raise ValueError("Symlinked evidence paths are not allowed")
+        resolved = candidate.resolve()
+        if not any(self._is_within_workspace(resolved, root) for root in allowed_roots):
+            raise ValueError("Evidence path must be within a configured workspace root")
         if not resolved.exists():
             raise ValueError(f"Evidence path not found: {resolved}")
         return resolved
@@ -289,19 +299,18 @@ class InvestigationService:
             ], "ok", False
         if evidence_path is None:
             return ["No file evidence provided."], "ok", False
-        if source_type == "image":
-            return ["Image evidence attached; OCR interpretation pending."], "requires_ocr", True
-
         # Guard against excessively large files (10 MB limit)
-        max_file_size = 10 * 1024 * 1024
         try:
             file_size = evidence_path.stat().st_size
         except OSError as exc:
             raise ValueError(f"Cannot access evidence file: {exc}") from exc
-        if file_size > max_file_size:
+        if file_size > MAX_EVIDENCE_FILE_SIZE_BYTES:
             raise ValueError(
-                f"Evidence file too large ({file_size} bytes, max {max_file_size})"
+                "Evidence file too large "
+                f"({file_size} bytes, max {MAX_EVIDENCE_FILE_SIZE_BYTES})"
             )
+        if source_type in {"image", "screenshot"}:
+            return self._extract_image_findings(evidence_path, source_type)
         if source_type == "csv_data":
             headers, rows = self._extract_csv_rows(evidence_path)
             mapping = self._normalize_column_mapping(column_mapping, headers)
@@ -322,6 +331,10 @@ class InvestigationService:
             ), "ok", False
         if source_type == "pdf_doc":
             return self._extract_pdf_findings(evidence_path)
+        if source_type == "word_doc":
+            return self._extract_word_findings(evidence_path), "ok", False
+        if source_type == "powerpoint_doc":
+            return self._extract_powerpoint_findings(evidence_path), "ok", False
 
         try:
             text = evidence_path.read_text(encoding="utf-8", errors="replace")
@@ -329,6 +342,62 @@ class InvestigationService:
             raise ValueError(f"Cannot read evidence file: {exc}") from exc
         lines = [line.strip() for line in text.splitlines() if line.strip()]
         return lines[:30], "ok", False
+
+    def _extract_image_findings(
+        self,
+        evidence_path: Path,
+        source_type: str,
+    ) -> tuple[list[str], str, bool]:
+        findings: list[str] = []
+        try:
+            with Image.open(evidence_path) as image:
+                findings.append(f"{source_type.title()} evidence: {evidence_path.name}")
+                image_format = image.format or evidence_path.suffix.lstrip(".").upper()
+                findings.append(
+                    f"Image analysis: {image.width}x{image.height}, "
+                    f"mode={image.mode}, format={image_format}"
+                )
+
+                if source_type == "screenshot":
+                    findings.append(
+                        "Screenshot heuristic: filename suggests a captured UI or screen state."
+                    )
+
+                metadata = self._image_metadata(image)
+                if metadata:
+                    findings.append(f"Image metadata keys: {', '.join(metadata)}")
+
+                ocr_lines = self._extract_image_text(image)
+                if ocr_lines:
+                    findings.extend(ocr_lines)
+                    return findings, "ok", False
+
+                findings.append("OCR unavailable; retained metadata-based image analysis.")
+                return findings, "metadata_only", False
+        except UnidentifiedImageError:
+            return [
+                f"Image file could not be decoded: {evidence_path.name}"
+            ], "unreadable_image", False
+
+    def _image_metadata(self, image: Image.Image) -> list[str]:
+        keys = [str(key) for key in image.getexif().keys()][:8]
+        if not keys:
+            return []
+        return sorted(keys)
+
+    def _extract_image_text(self, image: Image.Image) -> list[str]:
+        if importlib.util.find_spec("pytesseract") is None:
+            return []
+
+        import pytesseract
+
+        try:
+            raw_text = pytesseract.image_to_string(image).strip()
+        except Exception:
+            return []
+
+        lines = [line.strip() for line in raw_text.splitlines() if line.strip()]
+        return [f"OCR: {line}" for line in lines[:20]]
 
     def _extract_csv_rows(self, evidence_path: Path) -> tuple[list[str], list[dict[str, str]]]:
         with evidence_path.open("r", encoding="utf-8", errors="replace", newline="") as file_obj:
@@ -389,6 +458,37 @@ class InvestigationService:
                 "Scanned PDF detected. OCR is required before reliable extraction."
             ], "requires_ocr", True
         return findings[:60], "ok", False
+
+    def _extract_word_findings(self, evidence_path: Path) -> list[str]:
+        document = Document(evidence_path)
+        findings = [
+            paragraph.text.strip()
+            for paragraph in document.paragraphs
+            if paragraph.text.strip()
+        ]
+        if not findings:
+            return [f"Word document contains no readable paragraph text: {evidence_path.name}"]
+        return findings[:80]
+
+    def _extract_powerpoint_findings(self, evidence_path: Path) -> list[str]:
+        presentation = Presentation(evidence_path)
+        findings: list[str] = []
+        for slide_index, slide in enumerate(presentation.slides, start=1):
+            for shape in slide.shapes:
+                text = getattr(shape, "text", "")
+                if not text:
+                    continue
+                for line in text.splitlines():
+                    stripped = line.strip()
+                    if stripped:
+                        findings.append(f"Slide {slide_index}: {stripped}")
+                if len(findings) >= 80:
+                    break
+            if len(findings) >= 80:
+                break
+        if not findings:
+            return [f"PowerPoint contains no readable slide text: {evidence_path.name}"]
+        return findings
 
     def _build_tabular_findings(
         self,
@@ -706,9 +806,19 @@ class InvestigationService:
         return 0
 
     def _default_extraction_status(self, source_type: str) -> str:
-        if source_type in {"image", "pdf_doc"}:
+        if source_type in {"image", "screenshot", "pdf_doc"}:
             return "requires_ocr"
         return "ok"
+
+    def _is_within_workspace(self, candidate: Path, root: Path) -> bool:
+        try:
+            candidate.relative_to(root.resolve())
+            return True
+        except ValueError:
+            return False
+
+    def _contains_parent_reference(self, candidate: Path) -> bool:
+        return any(part == ".." for part in candidate.parts)
 
     def _important_tokens(self, findings: list[str]) -> list[str]:
         token_set: set[str] = set()

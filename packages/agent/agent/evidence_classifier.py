@@ -36,6 +36,7 @@ class EvidenceSourceClassifier:
             return "text_note"
 
         suffix = evidence_path.suffix.lower()
+        name = evidence_path.name.lower()
         if suffix == ".md":
             return "markdown_doc"
         if suffix == ".csv":
@@ -48,7 +49,13 @@ class EvidenceSourceClassifier:
             return "excel_sheet"
         if suffix == ".pdf":
             return "pdf_doc"
+        if suffix == ".docx":
+            return "word_doc"
+        if suffix == ".pptx":
+            return "powerpoint_doc"
         if suffix in (".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp"):
+            if self._looks_like_screenshot(name):
+                return "screenshot"
             return "image"
         return "text_note"
 
@@ -60,6 +67,9 @@ class EvidenceSourceClassifier:
             "api_payload": 3,
             "excel_sheet": 3,
             "pdf_doc": 2,
+            "word_doc": 3,
+            "powerpoint_doc": 3,
+            "screenshot": 4,
             "external_work_item": 3,
             "image": 5,
             "text_note": 2,
@@ -74,8 +84,15 @@ class EvidenceSourceClassifier:
             "api_payload": "payload_parsing",
             "excel_sheet": "excel_parsing",
             "pdf_doc": "pdf_text_parsing",
+            "word_doc": "word_text_parsing",
+            "powerpoint_doc": "slide_text_parsing",
+            "screenshot": "image_analysis",
             "external_work_item": "work_item_summary",
             "image": "ocr_required",
             "text_note": "text_parsing",
         }
         return mapping.get(source_type, "text_parsing")
+
+    def _looks_like_screenshot(self, name: str) -> bool:
+        tokens = ("screenshot", "screen", "capture", "snip", "ui", "modal", "dialog")
+        return any(token in name for token in tokens)

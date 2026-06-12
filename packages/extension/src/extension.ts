@@ -539,6 +539,228 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         }
     };
 
+    const managePolicyPacks = async () => {
+        const client = ensureBackendClient();
+        if (!client) { return; }
+        try {
+            const action = await vscode.window.showQuickPick(
+                ['List policy packs', 'Create or update policy pack', 'Activate policy pack'],
+                { title: 'Policy Packs' },
+            );
+            if (!action) { return; }
+
+            if (action === 'List policy packs') {
+                const packs = await client.listPolicyPacks();
+                const doc = await vscode.workspace.openTextDocument({
+                    language: 'markdown',
+                    content: [
+                        '# Team Policy Packs',
+                        '',
+                        '| Name | Mode | Active | Version |',
+                        '|---|---|:---:|---:|',
+                        ...packs.items.map((item) => (
+                            `| ${item.name} | ${item.enforcement_mode} | ${item.active ? 'Y' : 'N'} | ${item.version} |`
+                        )),
+                    ].join('\n'),
+                });
+                await vscode.window.showTextDocument(doc, { preview: false });
+                return;
+            }
+
+            if (action === 'Create or update policy pack') {
+                const name = await vscode.window.showInputBox({ title: 'Policy pack name' });
+                if (!name) { return; }
+                const description = await vscode.window.showInputBox({
+                    title: 'Policy pack description',
+                    value: 'Team governance policy',
+                }) ?? '';
+                const modePick = await vscode.window.showQuickPick(['enforce', 'advisory'], {
+                    title: 'Enforcement mode',
+                });
+                if (!modePick) { return; }
+                const rulesInput = await vscode.window.showInputBox({
+                    title: 'Rules (semicolon separated)',
+                    value: 'deny_model: gpt-4o, opus; require_test_file',
+                });
+                if (!rulesInput) { return; }
+                const rules = rulesInput
+                    .split(';')
+                    .map((item) => item.trim())
+                    .filter((item) => item.length > 0);
+                const saved = await client.savePolicyPack(name, description, modePick as 'enforce' | 'advisory', rules);
+                void vscode.window.showInformationMessage(`Policy pack "${saved.name}" saved (v${saved.version}).`);
+                return;
+            }
+
+            const packs = await client.listPolicyPacks();
+            if (packs.items.length === 0) {
+                void vscode.window.showInformationMessage('No policy packs available.');
+                return;
+            }
+            const picked = await vscode.window.showQuickPick(
+                packs.items.map((item) => ({
+                    label: item.name,
+                    description: `${item.enforcement_mode}${item.active ? ' • active' : ''}`,
+                    detail: item.pack_id,
+                })),
+                { title: 'Activate policy pack' },
+            );
+            if (!picked) { return; }
+            await client.activatePolicyPack(picked.detail ?? '');
+            void vscode.window.showInformationMessage(`Policy pack activated: ${picked.label}`);
+        } catch (err: unknown) {
+            const msg = err instanceof Error ? err.message : String(err);
+            void vscode.window.showErrorMessage(`Policy pack workflow failed: ${msg}`);
+        }
+    };
+
+    const runLocalAgentFlow = async () => {
+        const client = ensureBackendClient();
+        if (!client) { return; }
+        try {
+            const action = await vscode.window.showQuickPick(
+                ['Run existing flow', 'Create default flow and run'],
+                { title: 'Local Agent Flow Builder' },
+            );
+            if (!action) { return; }
+
+            let flowId: string | undefined;
+            if (action === 'Create default flow and run') {
+                const created = await client.saveLocalFlow(
+                    'default-governed-flow',
+                    'Policy check + optimization + approval gate',
+                    [
+                        { id: 'policy-1', title: 'Policy gate', action: 'policy_check', stage: 'model_call' },
+                        {
+                            id: 'opt-1',
+                            title: 'Tool optimizer',
+                            action: 'tool_recommend',
+                            available_tools: ['Ask', 'Plan', 'Patch', 'Test', 'Review', 'Investigate'],
+                        },
+                        { id: 'approval-1', title: 'Approval gate', action: 'approval_gate' },
+                    ],
+                );
+                flowId = created.flow_id;
+            } else {
+                const flows = await client.listLocalFlows();
+                if (flows.items.length === 0) {
+                    void vscode.window.showInformationMessage('No local flows available.');
+                    return;
+                }
+                const pickedFlow = await vscode.window.showQuickPick(
+                    flows.items.map((item) => ({
+                        label: item.name,
+                        description: item.description || undefined,
+                        detail: item.flow_id,
+                    })),
+                    { title: 'Select local flow to run' },
+                );
+                if (!pickedFlow) { return; }
+                flowId = pickedFlow.detail;
+            }
+
+            if (!flowId) { return; }
+            const taskText = await vscode.window.showInputBox({
+                title: 'Flow task text',
+                value: 'Investigate failing tests and propose a patch plan',
+            });
+            if (!taskText) { return; }
+            const selectedModel = await vscode.window.showInputBox({
+                title: 'Selected model (optional)',
+                value: 'gpt-4o-mini',
+            });
+
+            const run = await client.runLocalFlow(flowId, taskText, [], selectedModel || undefined);
+            const doc = await vscode.workspace.openTextDocument({
+                language: 'markdown',
+                content: [
+                    `# Local Flow Run: ${run.flow_name}`,
+                    '',
+                    `- Status: ${run.status}`,
+                    `- Run ID: ${run.run_id}`,
+                    `- Blocked reason: ${run.blocked_reason ?? 'none'}`,
+                    '',
+                    '## Steps',
+                    ...run.steps.map((step) => `- ${String(step.title ?? step.action)} => ${String(step.status ?? 'n/a')}`),
+                ].join('\n'),
+            });
+            await vscode.window.showTextDocument(doc, { preview: false });
+        } catch (err: unknown) {
+            const msg = err instanceof Error ? err.message : String(err);
+            void vscode.window.showErrorMessage(`Local flow run failed: ${msg}`);
+        }
+    };
+
+    const manageWorkspaces = async () => {
+        const client = ensureBackendClient();
+        if (!client) { return; }
+        try {
+            const action = await vscode.window.showQuickPick(
+                ['List workspace roots', 'Add workspace root', 'Activate workspace root'],
+                { title: 'Multi-workspace Manager' },
+            );
+            if (!action) { return; }
+
+            if (action === 'List workspace roots') {
+                const roots = await client.listWorkspaceRoots();
+                const doc = await vscode.workspace.openTextDocument({
+                    language: 'markdown',
+                    content: [
+                        '# Workspace Roots',
+                        '',
+                        '| Label | Path | Active |',
+                        '|---|---|:---:|',
+                        ...roots.items.map((item) => (
+                            `| ${item.label} | ${item.root_path} | ${item.active ? 'Y' : 'N'} |`
+                        )),
+                    ].join('\n'),
+                });
+                await vscode.window.showTextDocument(doc, { preview: false });
+                return;
+            }
+
+            if (action === 'Add workspace root') {
+                const rootPath = await vscode.window.showInputBox({
+                    title: 'Workspace root path',
+                    value: vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ?? '',
+                });
+                if (!rootPath) { return; }
+                const label = await vscode.window.showInputBox({
+                    title: 'Workspace label (optional)',
+                });
+                const activateChoice = await vscode.window.showQuickPick(
+                    ['Yes', 'No'],
+                    { title: 'Activate this workspace now?' },
+                );
+                const added = await client.addWorkspaceRoot(rootPath, label, activateChoice === 'Yes');
+                void vscode.window.showInformationMessage(
+                    `Workspace added: ${added.label}${added.active ? ' (active)' : ''}`,
+                );
+                return;
+            }
+
+            const roots = await client.listWorkspaceRoots();
+            if (roots.items.length === 0) {
+                void vscode.window.showInformationMessage('No workspace roots configured.');
+                return;
+            }
+            const picked = await vscode.window.showQuickPick(
+                roots.items.map((item) => ({
+                    label: item.label,
+                    description: item.active ? 'active' : undefined,
+                    detail: item.workspace_id,
+                })),
+                { title: 'Activate workspace root' },
+            );
+            if (!picked || !picked.detail) { return; }
+            const activated = await client.activateWorkspaceRoot(picked.detail);
+            void vscode.window.showInformationMessage(`Active workspace is now "${activated.label}".`);
+        } catch (err: unknown) {
+            const msg = err instanceof Error ? err.message : String(err);
+            void vscode.window.showErrorMessage(`Workspace management failed: ${msg}`);
+        }
+    };
+
     const confirmExcelColumnMapping = async (
         columns: string[],
         suggestedMapping: Record<string, string>,
@@ -621,6 +843,9 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         vscode.commands.registerCommand('memopilot.optimizeToolsAndSkills', optimizeToolsAndSkills),
         vscode.commands.registerCommand('memopilot.selectBudgetProfile', selectBudgetProfile),
         vscode.commands.registerCommand('memopilot.classifyEvidenceSource', classifyEvidenceSource),
+        vscode.commands.registerCommand('memopilot.managePolicyPacks', managePolicyPacks),
+        vscode.commands.registerCommand('memopilot.runLocalAgentFlow', runLocalAgentFlow),
+        vscode.commands.registerCommand('memopilot.manageWorkspaces', manageWorkspaces),
         vscode.commands.registerCommand('memopilot.attachEvidence', attachEvidence),
         vscode.commands.registerCommand('memopilot.runInvestigation', runInvestigation),
         vscode.commands.registerCommand('memopilot.showPanel', () => {

@@ -58,6 +58,8 @@ export class BackendManager {
         this.outputChannel.appendLine(`[MemoPilot] Agent parent (cwd): ${agentParent}`);
         this.outputChannel.appendLine(`[MemoPilot] Workspace: ${this.workspacePath}`);
 
+        await this.ensureBackendDependencies(pythonPath);
+
         this.stderrBuffer = '';
         this.stdoutBuffer = '';
 
@@ -178,6 +180,77 @@ export class BackendManager {
         return isWindows ? 'python' : 'python3';
     }
 
+    private async ensureBackendDependencies(pythonPath: string): Promise<void> {
+        const requiredModules: Array<{ module: string; packageName: string }> = [
+            { module: 'fastapi', packageName: 'fastapi>=0.109.0' },
+            { module: 'uvicorn', packageName: 'uvicorn[standard]>=0.27.0' },
+            { module: 'pydantic', packageName: 'pydantic>=2.5.0' },
+            { module: 'aiosqlite', packageName: 'aiosqlite>=0.19.0' },
+            { module: 'detect_secrets', packageName: 'detect-secrets>=1.5.0' },
+            { module: 'openpyxl', packageName: 'openpyxl>=3.1.5' },
+            { module: 'pdfplumber', packageName: 'pdfplumber>=0.11.4' },
+            { module: 'yaml', packageName: 'pyyaml>=6.0' },
+            { module: 'PIL', packageName: 'pillow>=11.0.0' },
+            { module: 'docx', packageName: 'python-docx>=1.1.2' },
+            { module: 'pptx', packageName: 'python-pptx>=1.0.2' },
+        ];
+
+        const moduleScript = [
+            'import importlib.util, json',
+            `required = ${JSON.stringify(requiredModules.map((item) => item.module))}`,
+            'missing = [name for name in required if importlib.util.find_spec(name) is None]',
+            'print(json.dumps(missing))',
+        ].join(';');
+        const check = await this.runPythonCommand(pythonPath, ['-c', moduleScript]);
+        if (check.exitCode !== 0) {
+            throw new Error(`Failed to verify backend dependencies: ${check.stderr || check.stdout}`);
+        }
+
+        const missingModules = this.parseMissingModules(check.stdout);
+        if (missingModules.length === 0) {
+            return;
+        }
+
+        const packagesToInstall = requiredModules
+            .filter((item) => missingModules.includes(item.module))
+            .map((item) => item.packageName);
+        if (packagesToInstall.length === 0) {
+            return;
+        }
+
+        this.outputChannel.appendLine(
+            `[MemoPilot] Installing backend dependencies: ${packagesToInstall.join(', ')}`
+        );
+        await this.ensurePipAvailable(pythonPath);
+        const install = await this.runPythonCommand(
+            pythonPath,
+            ['-m', 'pip', 'install', '--disable-pip-version-check', ...packagesToInstall],
+        );
+        if (install.exitCode !== 0) {
+            throw new Error(
+                `Failed to install backend dependencies: ${install.stderr || install.stdout}`
+            );
+        }
+    }
+
+    private async ensurePipAvailable(pythonPath: string): Promise<void> {
+        const pipVersion = await this.runPythonCommand(pythonPath, ['-m', 'pip', '--version']);
+        if (pipVersion.exitCode === 0) {
+            return;
+        }
+        if (!this.hasNoModuleNamedPip(pipVersion.stderr + pipVersion.stdout)) {
+            throw new Error(`Failed to check pip: ${pipVersion.stderr || pipVersion.stdout}`);
+        }
+
+        this.outputChannel.appendLine('[MemoPilot] pip not found; bootstrapping with ensurepip.');
+        const ensure = await this.runPythonCommand(pythonPath, ['-m', 'ensurepip', '--upgrade']);
+        if (ensure.exitCode !== 0) {
+            throw new Error(
+                `Failed to bootstrap pip with ensurepip: ${ensure.stderr || ensure.stdout}`
+            );
+        }
+    }
+
     private resolveAgentDir(): string {
         // Look for agent dir relative to extension
         // In dev: the agent is at packages/agent/agent/
@@ -198,6 +271,52 @@ export class BackendManager {
             `Cannot find MemoPilot agent directory. Looked at:\n` +
             `  ${monoRepoAgent}\n  ${bundledAgent}`
         );
+    }
+
+    private parseMissingModules(stdout: string): string[] {
+        const lines = stdout
+            .split(/\r?\n/)
+            .map((line) => line.trim())
+            .filter((line) => line.length > 0);
+        const jsonLine = lines.length > 0 ? lines[lines.length - 1] : '[]';
+        try {
+            const parsed = JSON.parse(jsonLine);
+            if (Array.isArray(parsed)) {
+                return parsed.filter((item): item is string => typeof item === 'string');
+            }
+        } catch {
+            // Fall through and treat as no missing modules.
+        }
+        return [];
+    }
+
+    private hasNoModuleNamedPip(output: string): boolean {
+        return /No module named pip/i.test(output);
+    }
+
+    private runPythonCommand(
+        pythonPath: string,
+        args: string[],
+    ): Promise<{ exitCode: number; stdout: string; stderr: string }> {
+        return new Promise((resolve, reject) => {
+            const child = spawn(pythonPath, args, {
+                cwd: this.workspacePath,
+                env: process.env,
+                stdio: ['ignore', 'pipe', 'pipe'],
+            });
+            let stdout = '';
+            let stderr = '';
+            child.stdout?.on('data', (data: Buffer) => {
+                stdout += data.toString();
+            });
+            child.stderr?.on('data', (data: Buffer) => {
+                stderr += data.toString();
+            });
+            child.on('error', reject);
+            child.on('close', (code) => {
+                resolve({ exitCode: code ?? 1, stdout, stderr });
+            });
+        });
     }
 
     private async waitForPort(timeoutMs: number): Promise<number> {

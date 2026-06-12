@@ -46,6 +46,11 @@ async def test_migrations_apply_on_fresh_db():
         "cost_ledger",
         "skill_store_versions",
         "optimizer_runs",
+        "policy_packs",
+        "policy_pack_versions",
+        "local_flows",
+        "local_flow_runs",
+        "workspace_roots",
     ]
 
     for table in expected_tables:
