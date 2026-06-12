@@ -270,6 +270,8 @@ class InvestigationService:
         if not candidate.is_absolute():
             active_root = await workspace_service.active_workspace_path()
             candidate = active_root / candidate
+        if candidate.is_symlink():
+            raise ValueError("Symlinked evidence paths are not allowed")
         resolved = candidate.resolve()
         allowed_roots = await workspace_service.allowed_workspace_paths()
         if not any(self._is_within_workspace(resolved, root) for root in allowed_roots):
@@ -291,6 +293,16 @@ class InvestigationService:
             ], "ok", False
         if evidence_path is None:
             return ["No file evidence provided."], "ok", False
+        # Guard against excessively large files (10 MB limit)
+        max_file_size = 10 * 1024 * 1024
+        try:
+            file_size = evidence_path.stat().st_size
+        except OSError as exc:
+            raise ValueError(f"Cannot access evidence file: {exc}") from exc
+        if file_size > max_file_size:
+            raise ValueError(
+                f"Evidence file too large ({file_size} bytes, max {max_file_size})"
+            )
         if source_type in {"image", "screenshot"}:
             return self._extract_image_findings(evidence_path, source_type)
         if source_type == "csv_data":
@@ -318,7 +330,10 @@ class InvestigationService:
         if source_type == "powerpoint_doc":
             return self._extract_powerpoint_findings(evidence_path), "ok", False
 
-        text = evidence_path.read_text(encoding="utf-8", errors="replace")
+        try:
+            text = evidence_path.read_text(encoding="utf-8", errors="replace")
+        except OSError as exc:
+            raise ValueError(f"Cannot read evidence file: {exc}") from exc
         lines = [line.strip() for line in text.splitlines() if line.strip()]
         return lines[:30], "ok", False
 
@@ -577,8 +592,12 @@ class InvestigationService:
             return []
 
         conn = await self._db.connect()
-        file_cursor = await conn.execute("SELECT file_path FROM file_index")
-        symbol_cursor = await conn.execute("SELECT DISTINCT file_path, name FROM symbols")
+        file_cursor = await conn.execute(
+            "SELECT file_path FROM file_index LIMIT 10000"
+        )
+        symbol_cursor = await conn.execute(
+            "SELECT DISTINCT file_path, name FROM symbols LIMIT 10000"
+        )
         file_rows = await file_cursor.fetchall()
         symbol_rows = await symbol_cursor.fetchall()
 

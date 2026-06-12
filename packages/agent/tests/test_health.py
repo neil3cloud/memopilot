@@ -21,17 +21,9 @@ async def test_health_returns_ok(client: AsyncClient, test_token: str):
 
 
 @pytest.mark.asyncio
-async def test_health_without_token_returns_401(client: AsyncClient):
-    """Health endpoint rejects requests without token."""
+async def test_health_accessible_without_token(client: AsyncClient):
+    """Health endpoint is accessible without authentication for probes."""
     response = await client.get("/v1/health")
-    assert response.status_code == 401
-
-
-@pytest.mark.asyncio
-async def test_health_with_invalid_token_returns_401(client: AsyncClient):
-    """Health endpoint rejects requests with wrong token."""
-    response = await client.get(
-        "/v1/health",
-        headers={"X-Agent-Token": "wrong-token"},
-    )
-    assert response.status_code == 401
+    assert response.status_code == 200
+    data = response.json()
+    assert data["status"] == "ok"
