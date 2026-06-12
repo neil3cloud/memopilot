@@ -11,6 +11,8 @@ export class BackendManager {
     private workspacePath: string;
     private outputChannel: vscode.OutputChannel;
     private lockFilePath: string;
+    private stderrBuffer: string = '';
+    private stdoutBuffer: string = '';
 
     constructor(workspacePath: string, outputChannel: vscode.OutputChannel) {
         this.workspacePath = workspacePath;
@@ -56,6 +58,9 @@ export class BackendManager {
         this.outputChannel.appendLine(`[MemoPilot] Agent parent (cwd): ${agentParent}`);
         this.outputChannel.appendLine(`[MemoPilot] Workspace: ${this.workspacePath}`);
 
+        this.stderrBuffer = '';
+        this.stdoutBuffer = '';
+
         this.process = spawn(pythonPath, ['-m', 'agent.main'], {
             cwd: agentParent,
             env: {
@@ -68,11 +73,15 @@ export class BackendManager {
         });
 
         this.process.stdout?.on('data', (data: Buffer) => {
-            this.outputChannel.appendLine(`[Backend] ${data.toString().trim()}`);
+            const text = data.toString();
+            this.stdoutBuffer += text;
+            this.outputChannel.appendLine(`[Backend] ${text.trim()}`);
         });
 
         this.process.stderr?.on('data', (data: Buffer) => {
-            this.outputChannel.appendLine(`[Backend:err] ${data.toString().trim()}`);
+            const text = data.toString();
+            this.stderrBuffer += text;
+            this.outputChannel.appendLine(`[Backend:err] ${text.trim()}`);
         });
 
         this.process.on('exit', (code) => {
@@ -191,17 +200,9 @@ export class BackendManager {
         );
     }
 
-    private stderrBuffer: string = '';
-
     private async waitForPort(timeoutMs: number): Promise<number> {
         const start = Date.now();
         const pollInterval = 200;
-
-        // Capture stderr for error reporting
-        this.stderrBuffer = '';
-        this.process?.stderr?.on('data', (data: Buffer) => {
-            this.stderrBuffer += data.toString();
-        });
 
         while (Date.now() - start < timeoutMs) {
             // Check if process already exited
@@ -221,6 +222,11 @@ export class BackendManager {
                     // Lockfile not ready yet, keep polling
                 }
             }
+
+            const portFromLogs = this.extractPortFromLogs();
+            if (portFromLogs && await this.isBackendHealthy(portFromLogs)) {
+                return portFromLogs;
+            }
             await this.sleep(pollInterval);
         }
 
@@ -230,6 +236,33 @@ export class BackendManager {
             ? `\nLast stderr:\n${this.stderrBuffer.slice(-500)}`
             : '';
         throw new Error(`Backend failed to start within 10 seconds (no lockfile)${hint}`);
+    }
+
+    private extractPortFromLogs(): number | undefined {
+        const combined = `${this.stdoutBuffer}\n${this.stderrBuffer}`;
+        const listeningMatch = combined.match(/Backend listening on 127\.0\.0\.1:(\d+)/i);
+        if (listeningMatch) {
+            return Number(listeningMatch[1]);
+        }
+        const startedMatch = combined.match(/MemoPilot backend started on port (\d+)/i);
+        if (startedMatch) {
+            return Number(startedMatch[1]);
+        }
+        return undefined;
+    }
+
+    private async isBackendHealthy(port: number): Promise<boolean> {
+        try {
+            const response = await fetch(`http://127.0.0.1:${port}/v1/health`, {
+                method: 'GET',
+                headers: {
+                    'X-Agent-Token': this.token,
+                },
+            });
+            return response.ok;
+        } catch {
+            return false;
+        }
     }
 
     private sleep(ms: number): Promise<void> {

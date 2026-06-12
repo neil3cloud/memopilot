@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-from pathlib import Path
-
 import aiosqlite
 import pytest
 
@@ -44,6 +42,8 @@ async def test_migrations_apply_on_fresh_db():
         "workspace_profile",
         "provider_capabilities",
         "schema_version",
+        "response_cache",
+        "cost_ledger",
     ]
 
     for table in expected_tables:

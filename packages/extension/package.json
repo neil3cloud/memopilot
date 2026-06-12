@@ -5,6 +5,10 @@
   "version": "0.1.0",
   "publisher": "memopilot",
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/neil3cloud/memopilot.git"
+  },
   "engines": {
     "vscode": "^1.85.0"
   },
@@ -28,6 +32,14 @@
           "name": "Status"
         },
         {
+          "id": "memopilot-profile",
+          "name": "Workspace Profile"
+        },
+        {
+          "id": "memopilot-memory",
+          "name": "Memory Manager"
+        },
+        {
           "id": "memopilot-rules",
           "name": "Rules & Skills"
         },
@@ -38,6 +50,14 @@
         {
           "id": "memopilot-cost",
           "name": "Cost Guard"
+        },
+        {
+          "id": "memopilot-privacy",
+          "name": "Privacy Dashboard"
+        },
+        {
+          "id": "memopilot-evidence",
+          "name": "Evidence Board"
         }
       ]
     },
@@ -65,6 +85,38 @@
       {
         "command": "memopilot.rebuildMemory",
         "title": "MemoPilot: Rebuild Memory"
+      },
+      {
+        "command": "memopilot.openWorkspaceProfile",
+        "title": "MemoPilot: Open Workspace Profile"
+      },
+      {
+        "command": "memopilot.rebuildWorkspaceProfile",
+        "title": "MemoPilot: Rebuild Workspace Profile"
+      },
+      {
+        "command": "memopilot.validateWorkspaceProfile",
+        "title": "MemoPilot: Validate Workspace Profile"
+      },
+      {
+        "command": "memopilot.exportWorkspaceProfile",
+        "title": "MemoPilot: Export Workspace Profile"
+      },
+      {
+        "command": "memopilot.reviewMemory",
+        "title": "MemoPilot: Review Memory"
+      },
+      {
+        "command": "memopilot.showPrivacyDashboard",
+        "title": "MemoPilot: Show Privacy Dashboard"
+      },
+      {
+        "command": "memopilot.attachEvidence",
+        "title": "MemoPilot: Attach Evidence"
+      },
+      {
+        "command": "memopilot.runInvestigation",
+        "title": "MemoPilot: Run Investigation"
       },
       {
         "command": "memopilot.showPanel",
@@ -96,17 +148,19 @@
     "build": "esbuild ./src/extension.ts --bundle --outfile=out/extension.js --external:vscode --format=cjs --platform=node --sourcemap",
     "watch": "esbuild ./src/extension.ts --bundle --outfile=out/extension.js --external:vscode --format=cjs --platform=node --sourcemap --watch",
     "lint": "eslint src --ext ts",
-    "test": "tsc -p . --noEmit && node ./out/test/runTests.js",
+    "test": "pnpm run build && tsc -p . && node ./out/test/runTests.js",
     "prebundle-agent": "node -e \"const fs=require('fs');fs.rmSync('agent',{recursive:true,force:true});fs.cpSync('../agent/agent','agent',{recursive:true})\"",
     "package": "pnpm run build && pnpm run prebundle-agent && vsce package --no-dependencies"
   },
   "devDependencies": {
     "@types/node": "^20.11.0",
+    "@types/mocha": "^10.0.10",
     "@types/vscode": "^1.85.0",
-    "@vscode/test-electron": "^2.3.8",
+    "@vscode/test-electron": "^3.0.0",
     "@vscode/vsce": "^2.22.0",
     "esbuild": "^0.20.0",
     "eslint": "^8.56.0",
+    "mocha": "^10.8.2",
     "typescript": "^5.3.3"
   }
 }
