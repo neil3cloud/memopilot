@@ -10,7 +10,7 @@
 2. [The 5 Ws](#2-the-5-ws)  
 3. [Guiding Principles](#3-guiding-principles)  
 4. [Product Capabilities](#4-product-capabilities)  
-5. [AnythingLLM Comparison and Lessons](#5-anythingllm-comparison-and-lessons)  
+5. [Workspace Platform Comparison and Lessons](#5-workspace-platform-comparison-and-lessons)  
 6. [High-Level Architecture](#6-high-level-architecture)  
 7. [Extension Responsibilities](#7-extension-responsibilities)  
 8. [Python Backend Responsibilities](#8-python-backend-responsibilities)  
@@ -98,7 +98,7 @@ The problem is not the lack of AI tools. The problem is **uncontrolled, inaccura
 - A system that blindly sends full repositories to cloud AI  
 - A system that silently applies patches  
 - A general-purpose RAG application  
-- A clone of AnythingLLM
+- A generic document AI platform
 
 ### Core Value Proposition
 
@@ -108,9 +108,9 @@ Local application memory \+ rule enforcement \+ cost-aware model routing \+ expl
 
 Generic assistants dump context and call the most powerful model available. MemoPilot builds a governed memory layer, resolves project rules, selects the cheapest capable model, generates inspectable context, and requires developer approval before touching any code.
 
-### Differentiator vs. AnythingLLM
+### Differentiator vs. Broad Document AI Platforms
 
-AnythingLLM is a broad RAG and AI workspace platform. MemoPilot is narrower and sharper: it is an AI coding governance layer inside VS Code/Cursor. See [Section 5](#5-anythingllm-comparison-and-lessons) for a full comparison.
+Broad document AI and workspace platforms are general-purpose knowledge systems. MemoPilot is narrower and sharper: it is an AI coding governance layer inside VS Code/Cursor. See [Section 5](#5-workspace-platform-comparison-and-lessons) for a full comparison.
 
 ### Primary Use Cases
 
@@ -418,11 +418,11 @@ No patch is ever applied automatically. No memory is updated before validation.
 
 ---
 
-## 5\. AnythingLLM Comparison and Lessons
+## 5\. Workspace Platform Comparison and Lessons
 
-### 5.1 What AnythingLLM Is
+### 5.1 What Broad Document AI Platforms Do
 
-AnythingLLM is a broad AI workspace and RAG platform. Its capabilities include:
+Broad document AI and workspace platforms typically include:
 
 - Multi-workspace document management  
 - RAG over uploaded documents  
@@ -439,7 +439,7 @@ AnythingLLM is a broad AI workspace and RAG platform. Its capabilities include:
 
 MemoPilot is narrower and sharper: it is an AI coding governance layer inside VS Code/Cursor. It does not try to be a general-purpose document AI platform.
 
-| Dimension | AnythingLLM | MemoPilot |
+| Dimension | Broad document AI platform | MemoPilot |
 | :---- | :---- | :---- |
 | Primary interface | Web app | VS Code/Cursor extension |
 | Memory scope | Documents and conversations | Codebase, rules, symbols, decisions |
@@ -454,7 +454,7 @@ MemoPilot is narrower and sharper: it is an AI coding governance layer inside VS
 | Rule system | None | Hierarchical rules with conflict detection |
 | Skills | None | Task-specific YAML-based skills |
 
-### 5.3 What MemoPilot Should Borrow from AnythingLLM
+### 5.3 What MemoPilot Should Borrow from External Connectors
 
 - **Workspaces**: Per-project memory scopes (MemoPilot's Workspace Profiles)  
 - **Local-first philosophy**: Memory stays on disk; external calls are opt-in  
@@ -2002,7 +2002,7 @@ Validation Requirements
 | Architecture diagrams | Vision model description | 5 (requires approval) | Context only |
 | Word (`.docx`) | python-docx text extraction | 3 | Requirements, specs |
 | PowerPoint (`.pptx`) | python-pptx slide text | 3 | Architecture presentations |
-| AnythingLLM connector | REST API retrieval | 3 (external) | Supplemental doc context |
+| External connector pattern | REST API retrieval | 3 (external) | Supplemental doc context |
 
 ---
 
@@ -3138,8 +3138,6 @@ Pass: `all-MiniLM-L6-v2` embeds a 500-line Python file in \< 2 seconds on a mid-
 ### v2
 
 \- Image and UI screenshot analysis (vision model)
-
-\- AnythingLLM connector
 
 \- Team Policy Packs
 
