@@ -11,6 +11,7 @@ Security:
 
 from __future__ import annotations
 
+import hmac
 import logging
 import os
 from pathlib import Path
@@ -667,7 +668,7 @@ async def auth_middleware(request: Request, call_next):
         return JSONResponse(status_code=500, content={"detail": "MEMOPILOT_TOKEN not configured"})
 
     token = request.headers.get("X-Agent-Token")
-    if not token or token != _expected_token:
+    if not token or not hmac.compare_digest(token, _expected_token):
         return JSONResponse(status_code=401, content={"detail": "Unauthorized"})
 
     response = await call_next(request)
