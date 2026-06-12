@@ -3143,10 +3143,9 @@ Pass: `all-MiniLM-L6-v2` embeds a 500-line Python file in \< 2 seconds on a mid-
 
 \- Local Agent Flow Builder
 
-\- Multi-language Skill Marketplace
+\- Deferred: Multi-language Skill Marketplace
 
-\- Team-Shared Memory Server
-
+\- Deferred: Team-Shared Memory Server
 \- Multi-workspace support v2
 
 \- Word/PowerPoint ingestion

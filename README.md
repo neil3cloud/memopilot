@@ -146,10 +146,10 @@ docs/          — Product documentation
 |---|---|---|
 | 1 | Image/screenshot analysis | First |
 | 2 | Team Policy Packs + Local Agent Flow Builder | Second |
-| 3 | Multi-language Skill Marketplace + Team-Shared Memory Server | Third |
-| 4 | Multi-workspace support v2 + Word/PowerPoint ingestion | Fourth |
+| 3 | Deferred: Multi-language Skill Marketplace + Team-Shared Memory Server | Deferred |
+| 4 | Multi-workspace support v2 + Word/PowerPoint ingestion | Next active |
 
-Next focus is v2 only.
+Wave 3 is deferred for now; next active V2 scope is Wave 4 after Wave 2.
 
 ## Development
 

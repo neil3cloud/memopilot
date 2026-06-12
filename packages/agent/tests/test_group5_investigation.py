@@ -4,7 +4,10 @@ from __future__ import annotations
 
 import openpyxl
 import pytest
+from docx import Document
 from httpx import AsyncClient
+from PIL import Image
+from pptx import Presentation
 
 from agent.investigation_service import InvestigationService
 
@@ -24,7 +27,10 @@ async def test_evidence_source_classification_and_trust_levels(
         ("metrics.csv", "name,value\nlatency,12", "csv_data", 3),
         ("payload.json", '{"error":"invalid_token"}', "api_payload", 3),
         ("specs.xlsx", None, "excel_sheet", 3),
-        ("screenshot.png", None, "image", 5),
+        ("requirements.docx", None, "word_doc", 3),
+        ("slides.pptx", None, "powerpoint_doc", 3),
+        ("screenshot.png", None, "screenshot", 4),
+        ("diagram.png", None, "image", 5),
     ]
     for name, content, expected_type, expected_trust in fixtures:
         file_path = tmp_workspace / name
@@ -35,8 +41,19 @@ async def test_evidence_source_classification_and_trust_levels(
             sheet.append(["Login", "Open app", "Dashboard"])
             workbook.save(file_path)
             workbook.close()
+        elif name.endswith(".docx"):
+            document = Document()
+            document.add_paragraph("Wave 4 doc ingestion")
+            document.save(file_path)
+        elif name.endswith(".pptx"):
+            presentation = Presentation()
+            slide = presentation.slides.add_slide(presentation.slide_layouts[1])
+            slide.shapes.title.text = "Wave 4 slides"
+            slide.placeholders[1].text = "PowerPoint text extraction"
+            presentation.save(file_path)
         elif name.endswith(".png"):
-            file_path.write_bytes(b"\x89PNG\r\n\x1a\n\x00")
+            image = Image.new("RGB", (16, 16), color=(255, 255, 255))
+            image.save(file_path)
         else:
             file_path.write_text(content, encoding="utf-8")
 
@@ -49,8 +66,11 @@ async def test_evidence_source_classification_and_trust_levels(
         body = attached.json()
         assert body["source_type"] == expected_type
         assert body["trust_level"] == expected_trust
-        if expected_type == "image":
-            assert body["extraction_status"] == "requires_ocr"
+        if expected_type in {"image", "screenshot"}:
+            assert body["extraction_status"] in {"metadata_only", "ok"}
+            assert any("Image analysis:" in finding for finding in body["findings"])
+            if expected_type == "screenshot":
+                assert any("Screenshot heuristic:" in finding for finding in body["findings"])
 
 
 @pytest.mark.asyncio
@@ -216,3 +236,29 @@ async def test_scanned_pdf_forces_trust_level_four(
     assert payload["source_type"] == "pdf_doc"
     assert payload["extraction_status"] == "requires_ocr"
     assert payload["trust_level"] == 4
+
+
+@pytest.mark.asyncio
+async def test_image_analysis_extracts_metadata(
+    client: AsyncClient,
+    test_token: str,
+    tmp_workspace,
+):
+    headers = {"X-Agent-Token": test_token}
+    await client.post("/v1/workspace/init", headers=headers)
+
+    image_path = tmp_workspace / "error-dialog.png"
+    image = Image.new("RGB", (800, 600), color=(250, 250, 250))
+    image.save(image_path)
+
+    attached = await client.post(
+        "/v1/investigation/evidence/attach",
+        headers=headers,
+        json={"evidence_path": str(image_path)},
+    )
+    assert attached.status_code == 200
+    body = attached.json()
+    assert body["source_type"] == "screenshot"
+    assert body["trust_level"] == 4
+    assert body["extraction_status"] in {"metadata_only", "ok"}
+    assert any("Image analysis: 800x600" in finding for finding in body["findings"])

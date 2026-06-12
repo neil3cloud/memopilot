@@ -233,6 +233,70 @@ export interface EvidenceClassifyResponse {
     extraction_method: string;
 }
 
+export interface PolicyPackItemResponse {
+    pack_id: string;
+    name: string;
+    description: string;
+    enforcement_mode: string;
+    rules: string[];
+    active: boolean;
+    version: number;
+}
+
+export interface PolicyPacksResponse {
+    items: PolicyPackItemResponse[];
+}
+
+export interface PolicyEvaluateResponse {
+    allowed: boolean;
+    decision: string;
+    stage: string;
+    active_pack_id: string | null;
+    active_pack_name: string | null;
+    violations: string[];
+    applied_policies: string[];
+}
+
+export interface LocalFlowStep {
+    id?: string;
+    title?: string;
+    action: string;
+    stage?: string;
+    available_tools?: string[];
+}
+
+export interface LocalFlowItemResponse {
+    flow_id: string;
+    name: string;
+    description: string;
+    enabled: boolean;
+    steps: Record<string, string | string[] | boolean>[];
+}
+
+export interface LocalFlowsResponse {
+    items: LocalFlowItemResponse[];
+}
+
+export interface RunLocalFlowResponse {
+    run_id: string;
+    flow_id: string;
+    flow_name: string;
+    status: string;
+    steps: Record<string, string | boolean | string[]>[];
+    blocked_reason: string | null;
+}
+
+export interface WorkspaceRootItemResponse {
+    workspace_id: string;
+    root_path: string;
+    label: string;
+    active: boolean;
+}
+
+export interface WorkspaceRootsResponse {
+    items: WorkspaceRootItemResponse[];
+}
+
 export class BackendClient {
     private manager: BackendManager;
 
@@ -501,5 +565,102 @@ export class BackendClient {
             source_url: sourceUrl,
         });
         return result as EvidenceClassifyResponse;
+    }
+
+    async listPolicyPacks(): Promise<PolicyPacksResponse> {
+        const result = await this.manager.request('GET', '/v1/policies/packs');
+        return result as PolicyPacksResponse;
+    }
+
+    async savePolicyPack(
+        name: string,
+        description: string,
+        enforcementMode: 'enforce' | 'advisory',
+        rules: string[],
+    ): Promise<PolicyPackItemResponse> {
+        const result = await this.manager.request('POST', '/v1/policies/packs', {
+            name,
+            description,
+            enforcement_mode: enforcementMode,
+            rules,
+        });
+        return result as PolicyPackItemResponse;
+    }
+
+    async activatePolicyPack(packId: string): Promise<void> {
+        await this.manager.request('POST', '/v1/policies/packs/activate', { pack_id: packId });
+    }
+
+    async evaluatePolicy(
+        stage: string,
+        taskText: string,
+        filesChanged: string[],
+        selectedModel?: string,
+    ): Promise<PolicyEvaluateResponse> {
+        const result = await this.manager.request('POST', '/v1/policies/evaluate', {
+            stage,
+            task_text: taskText,
+            files_changed: filesChanged,
+            selected_model: selectedModel,
+        });
+        return result as PolicyEvaluateResponse;
+    }
+
+    async listLocalFlows(): Promise<LocalFlowsResponse> {
+        const result = await this.manager.request('GET', '/v1/flows/local');
+        return result as LocalFlowsResponse;
+    }
+
+    async saveLocalFlow(
+        name: string,
+        description: string,
+        steps: LocalFlowStep[],
+    ): Promise<LocalFlowItemResponse> {
+        const result = await this.manager.request('POST', '/v1/flows/local', {
+            name,
+            description,
+            steps,
+        });
+        return result as LocalFlowItemResponse;
+    }
+
+    async runLocalFlow(
+        flowId: string,
+        taskText: string,
+        filesChanged: string[],
+        selectedModel?: string,
+    ): Promise<RunLocalFlowResponse> {
+        const result = await this.manager.request('POST', '/v1/flows/local/run', {
+            flow_id: flowId,
+            task_text: taskText,
+            files_changed: filesChanged,
+            selected_model: selectedModel,
+        });
+        return result as RunLocalFlowResponse;
+    }
+
+    async listWorkspaceRoots(): Promise<WorkspaceRootsResponse> {
+        const result = await this.manager.request('GET', '/v1/workspaces');
+        return result as WorkspaceRootsResponse;
+    }
+
+    async addWorkspaceRoot(
+        rootPath: string,
+        label?: string,
+        activate = false,
+    ): Promise<WorkspaceRootItemResponse> {
+        const result = await this.manager.request('POST', '/v1/workspaces', {
+            root_path: rootPath,
+            label,
+            activate,
+        });
+        return result as WorkspaceRootItemResponse;
+    }
+
+    async activateWorkspaceRoot(workspaceId: string): Promise<WorkspaceRootItemResponse> {
+        const result = await this.manager.request('POST', '/v1/workspaces/activate', {
+            workspace_id: workspaceId,
+        });
+        return result as WorkspaceRootItemResponse;
     }
 }

@@ -30,6 +30,8 @@ from .privacy_dashboard_service import PrivacyDashboardService
 from .provider_resilience import ProviderCallError, ProviderResilienceService
 from .response_cache import ResponseCacheService
 from .security_policy import CredentialRedactor, DatabaseWriteBlocker
+from .wave2_service import Wave2Service
+from .wave4_service import Wave4Service
 from .waveb_service import (
     ProviderCapabilityRecord,
     WaveBService,
@@ -541,6 +543,111 @@ class EvidenceClassifyResponse(BaseModel):
     extraction_method: str
 
 
+class PolicyPackItemResponse(BaseModel):
+    pack_id: str
+    name: str
+    description: str
+    enforcement_mode: str
+    rules: list[str]
+    active: bool
+    version: int
+
+
+class PolicyPacksResponse(BaseModel):
+    items: list[PolicyPackItemResponse]
+
+
+class PolicyPackUpsertRequest(BaseModel):
+    name: str
+    description: str = ""
+    enforcement_mode: str = "enforce"
+    rules: list[str] = Field(default_factory=list)
+
+
+class ActivatePolicyPackRequest(BaseModel):
+    pack_id: str
+
+
+class PolicyEvaluateRequest(BaseModel):
+    stage: str
+    task_text: str = ""
+    files_changed: list[str] = Field(default_factory=list)
+    selected_model: str | None = None
+
+
+class PolicyEvaluateResponse(BaseModel):
+    allowed: bool
+    decision: str
+    stage: str
+    active_pack_id: str | None = None
+    active_pack_name: str | None = None
+    violations: list[str]
+    applied_policies: list[str]
+
+
+class LocalFlowStepRequest(BaseModel):
+    id: str | None = None
+    title: str | None = None
+    action: str
+    stage: str | None = None
+    available_tools: list[str] = Field(default_factory=list)
+
+
+class SaveLocalFlowRequest(BaseModel):
+    name: str
+    description: str = ""
+    steps: list[LocalFlowStepRequest] = Field(default_factory=list)
+
+
+class LocalFlowItemResponse(BaseModel):
+    flow_id: str
+    name: str
+    description: str
+    enabled: bool
+    steps: list[dict[str, str | list[str] | bool]]
+
+
+class LocalFlowsResponse(BaseModel):
+    items: list[LocalFlowItemResponse]
+
+
+class RunLocalFlowRequest(BaseModel):
+    flow_id: str
+    task_text: str
+    files_changed: list[str] = Field(default_factory=list)
+    selected_model: str | None = None
+
+
+class RunLocalFlowResponse(BaseModel):
+    run_id: str
+    flow_id: str
+    flow_name: str
+    status: str
+    steps: list[dict[str, str | bool | list[str]]]
+    blocked_reason: str | None = None
+
+
+class WorkspaceRootItemResponse(BaseModel):
+    workspace_id: str
+    root_path: str
+    label: str
+    active: bool
+
+
+class WorkspaceRootsResponse(BaseModel):
+    items: list[WorkspaceRootItemResponse]
+
+
+class AddWorkspaceRootRequest(BaseModel):
+    root_path: str
+    label: str | None = None
+    activate: bool = False
+
+
+class ActivateWorkspaceRootRequest(BaseModel):
+    workspace_id: str
+
+
 def configure(config: Config, db: DatabaseManager) -> None:
     """Configure the app with resolved config and database manager."""
     global _config, _db, _expected_token
@@ -605,6 +712,8 @@ async def init_workspace() -> InitWorkspaceResponse:
     conn = await db.connect()
     schema_version = await run_migrations(conn)
     config.schema_version = schema_version
+    wave4_service = Wave4Service(config=config, db=db)
+    await wave4_service.ensure_default_workspace_root()
 
     logger.info(
         f"Workspace initialized: {config.memopilot_dir} (schema v{schema_version})"
@@ -687,6 +796,23 @@ async def check_budget(request: BudgetCheckRequest) -> BudgetCheckResponse:
 
 @app.post("/v1/task-runs/start", response_model=StartTaskRunResponse)
 async def start_task_run(request: StartTaskRunRequest) -> StartTaskRunResponse:
+    policy_service = Wave2Service(config=_get_config(), db=_get_db())
+    policy_result = await policy_service.evaluate_policy(
+        stage="model_call",
+        task_text=request.user_request,
+        files_changed=[],
+        selected_model=request.selected_model,
+    )
+    if not policy_result.allowed:
+        raise HTTPException(
+            status_code=403,
+            detail=(
+                policy_result.violations[0]
+                if policy_result.violations
+                else "Policy blocked model call."
+            ),
+        )
+
     service = CostGuardService(config=_get_config(), db=_get_db())
     task_run_id = await service.create_task_run(
         user_request=request.user_request,
@@ -1214,6 +1340,23 @@ async def diff_context_pack_versions(
 async def assess_patch_risk_and_compliance(
     request: PatchAssessmentRequest,
 ) -> PatchAssessmentResponse:
+    policy_service = Wave2Service(config=_get_config(), db=_get_db())
+    policy_result = await policy_service.evaluate_policy(
+        stage="patch_execution",
+        task_text="",
+        files_changed=request.files_changed,
+        selected_model=None,
+    )
+    if not policy_result.allowed:
+        raise HTTPException(
+            status_code=403,
+            detail=(
+                policy_result.violations[0]
+                if policy_result.violations
+                else "Policy blocked patch execution."
+            ),
+        )
+
     service = WaveBService(config=_get_config(), db=_get_db())
     result = await service.assess_patch(
         task_run_id=request.task_run_id,
@@ -1421,6 +1564,192 @@ async def classify_evidence_source(request: EvidenceClassifyRequest) -> Evidence
         source_type=source_type,
         trust_level=trust_level,
         extraction_method=extraction_method,
+    )
+
+
+@app.get("/v1/policies/packs", response_model=PolicyPacksResponse)
+async def list_policy_packs(limit: int = 100) -> PolicyPacksResponse:
+    service = Wave2Service(config=_get_config(), db=_get_db())
+    items = await service.list_policy_packs(limit=limit)
+    return PolicyPacksResponse(
+        items=[
+            PolicyPackItemResponse(
+                pack_id=item.pack_id,
+                name=item.name,
+                description=item.description,
+                enforcement_mode=item.enforcement_mode,
+                rules=item.rules,
+                active=item.active,
+                version=item.version,
+            )
+            for item in items
+        ]
+    )
+
+
+@app.post("/v1/policies/packs", response_model=PolicyPackItemResponse)
+async def upsert_policy_pack(request: PolicyPackUpsertRequest) -> PolicyPackItemResponse:
+    service = Wave2Service(config=_get_config(), db=_get_db())
+    try:
+        item = await service.save_policy_pack(
+            name=request.name,
+            description=request.description,
+            enforcement_mode=request.enforcement_mode,
+            rules=request.rules,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return PolicyPackItemResponse(
+        pack_id=item.pack_id,
+        name=item.name,
+        description=item.description,
+        enforcement_mode=item.enforcement_mode,
+        rules=item.rules,
+        active=item.active,
+        version=item.version,
+    )
+
+
+@app.post("/v1/policies/packs/activate")
+async def activate_policy_pack(request: ActivatePolicyPackRequest) -> MemoryActionResponse:
+    service = Wave2Service(config=_get_config(), db=_get_db())
+    try:
+        await service.activate_policy_pack(pack_id=request.pack_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    return MemoryActionResponse(success=True)
+
+
+@app.post("/v1/policies/evaluate", response_model=PolicyEvaluateResponse)
+async def evaluate_policy_pack(request: PolicyEvaluateRequest) -> PolicyEvaluateResponse:
+    service = Wave2Service(config=_get_config(), db=_get_db())
+    result = await service.evaluate_policy(
+        stage=request.stage,
+        task_text=request.task_text,
+        files_changed=request.files_changed,
+        selected_model=request.selected_model,
+    )
+    return PolicyEvaluateResponse(
+        allowed=result.allowed,
+        decision=result.decision,
+        stage=result.stage,
+        active_pack_id=result.active_pack_id,
+        active_pack_name=result.active_pack_name,
+        violations=result.violations,
+        applied_policies=result.applied_policies,
+    )
+
+
+@app.get("/v1/flows/local", response_model=LocalFlowsResponse)
+async def list_local_flows(limit: int = 100) -> LocalFlowsResponse:
+    service = Wave2Service(config=_get_config(), db=_get_db())
+    items = await service.list_flows(limit=limit)
+    return LocalFlowsResponse(
+        items=[
+            LocalFlowItemResponse(
+                flow_id=item.flow_id,
+                name=item.name,
+                description=item.description,
+                enabled=item.enabled,
+                steps=item.steps,
+            )
+            for item in items
+        ]
+    )
+
+
+@app.post("/v1/flows/local", response_model=LocalFlowItemResponse)
+async def save_local_flow(request: SaveLocalFlowRequest) -> LocalFlowItemResponse:
+    service = Wave2Service(config=_get_config(), db=_get_db())
+    try:
+        item = await service.save_flow(
+            name=request.name,
+            description=request.description,
+            steps=[step.model_dump(exclude_none=True) for step in request.steps],
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return LocalFlowItemResponse(
+        flow_id=item.flow_id,
+        name=item.name,
+        description=item.description,
+        enabled=item.enabled,
+        steps=item.steps,
+    )
+
+
+@app.post("/v1/flows/local/run", response_model=RunLocalFlowResponse)
+async def run_local_flow(request: RunLocalFlowRequest) -> RunLocalFlowResponse:
+    service = Wave2Service(config=_get_config(), db=_get_db())
+    try:
+        result = await service.run_flow(
+            flow_id=request.flow_id,
+            task_text=request.task_text,
+            files_changed=request.files_changed,
+            selected_model=request.selected_model,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return RunLocalFlowResponse(
+        run_id=result.run_id,
+        flow_id=result.flow_id,
+        flow_name=result.flow_name,
+        status=result.status,
+        steps=result.steps,
+        blocked_reason=result.blocked_reason,
+    )
+
+
+@app.get("/v1/workspaces", response_model=WorkspaceRootsResponse)
+async def list_workspace_roots(limit: int = 100) -> WorkspaceRootsResponse:
+    service = Wave4Service(config=_get_config(), db=_get_db())
+    items = await service.list_workspace_roots(limit=limit)
+    return WorkspaceRootsResponse(
+        items=[
+            WorkspaceRootItemResponse(
+                workspace_id=item.workspace_id,
+                root_path=item.root_path,
+                label=item.label,
+                active=item.active,
+            )
+            for item in items
+        ]
+    )
+
+
+@app.post("/v1/workspaces", response_model=WorkspaceRootItemResponse)
+async def add_workspace_root(request: AddWorkspaceRootRequest) -> WorkspaceRootItemResponse:
+    service = Wave4Service(config=_get_config(), db=_get_db())
+    try:
+        item = await service.add_workspace_root(
+            root_path=request.root_path,
+            label=request.label,
+            activate=request.activate,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return WorkspaceRootItemResponse(
+        workspace_id=item.workspace_id,
+        root_path=item.root_path,
+        label=item.label,
+        active=item.active,
+    )
+
+
+@app.post("/v1/workspaces/activate", response_model=WorkspaceRootItemResponse)
+async def activate_workspace_root(
+    request: ActivateWorkspaceRootRequest,
+) -> WorkspaceRootItemResponse:
+    service = Wave4Service(config=_get_config(), db=_get_db())
+    try:
+        item = await service.activate_workspace_root(workspace_id=request.workspace_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    return WorkspaceRootItemResponse(
+        workspace_id=item.workspace_id,
+        root_path=item.root_path,
+        label=item.label,
+        active=item.active,
     )
 
 

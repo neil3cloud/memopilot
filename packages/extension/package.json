@@ -143,6 +143,18 @@
         "title": "MemoPilot: Classify Evidence Source"
       },
       {
+        "command": "memopilot.managePolicyPacks",
+        "title": "MemoPilot: Manage Policy Packs"
+      },
+      {
+        "command": "memopilot.runLocalAgentFlow",
+        "title": "MemoPilot: Run Local Agent Flow"
+      },
+      {
+        "command": "memopilot.manageWorkspaces",
+        "title": "MemoPilot: Manage Workspaces"
+      },
+      {
         "command": "memopilot.attachEvidence",
         "title": "MemoPilot: Attach Evidence"
       },
