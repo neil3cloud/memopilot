@@ -9,7 +9,7 @@ from httpx import AsyncClient
 @pytest.mark.asyncio
 async def test_missing_token_returns_401(client: AsyncClient):
     """Requests without X-Agent-Token header are rejected."""
-    response = await client.get("/v1/health")
+    response = await client.get("/v1/cost/budget/status")
     assert response.status_code == 401
     assert "Unauthorized" in response.text
 
@@ -18,7 +18,7 @@ async def test_missing_token_returns_401(client: AsyncClient):
 async def test_invalid_token_returns_401(client: AsyncClient):
     """Requests with incorrect token are rejected."""
     response = await client.get(
-        "/v1/health",
+        "/v1/cost/budget/status",
         headers={"X-Agent-Token": "invalid-token-value"},
     )
     assert response.status_code == 401
@@ -38,7 +38,14 @@ async def test_valid_token_allows_request(client: AsyncClient, test_token: str):
 async def test_empty_token_returns_401(client: AsyncClient):
     """Empty token string is rejected."""
     response = await client.get(
-        "/v1/health",
+        "/v1/cost/budget/status",
         headers={"X-Agent-Token": ""},
     )
     assert response.status_code == 401
+
+
+@pytest.mark.asyncio
+async def test_health_endpoint_does_not_require_auth(client: AsyncClient):
+    """Health endpoint is accessible without authentication for deployment probes."""
+    response = await client.get("/v1/health")
+    assert response.status_code == 200
