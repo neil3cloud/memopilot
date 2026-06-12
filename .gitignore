@@ -1,0 +1,34 @@
+# Node
+node_modules/
+*.vsix
+out/
+dist/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# MemoPilot runtime (workspace-specific)
+.memopilot/memory/
+.memopilot/logs/
+.memopilot/agent.lock
+.memopilot/snapshots/
+.memopilot/context-packs/
+
+# IDE
+.vscode/settings.json
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Environment
+.env
+*.env

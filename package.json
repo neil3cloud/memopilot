@@ -1,0 +1,15 @@
+{
+  "name": "memopilot-monorepo",
+  "private": true,
+  "version": "0.1.0",
+  "description": "MemoPilot — Rule-Aware, Local-Memory, Cost-Governed AI Development Agent Extension",
+  "scripts": {
+    "ext:build": "pnpm --filter memopilot build",
+    "ext:watch": "pnpm --filter memopilot watch",
+    "ext:test": "pnpm --filter memopilot test",
+    "ext:package": "pnpm --filter memopilot package"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}

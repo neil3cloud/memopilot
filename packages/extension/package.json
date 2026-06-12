@@ -1,0 +1,112 @@
+{
+  "name": "memopilot",
+  "displayName": "MemoPilot",
+  "description": "Rule-Aware, Local-Memory, Cost-Governed AI Development Agent",
+  "version": "0.1.0",
+  "publisher": "memopilot",
+  "license": "MIT",
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": ["Other"],
+  "activationEvents": ["onStartupFinished"],
+  "main": "./out/extension.js",
+  "contributes": {
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "memopilot",
+          "title": "MemoPilot",
+          "icon": "resources/icon.svg"
+        }
+      ]
+    },
+    "views": {
+      "memopilot": [
+        {
+          "id": "memopilot-status",
+          "name": "Status"
+        },
+        {
+          "id": "memopilot-rules",
+          "name": "Rules & Skills"
+        },
+        {
+          "id": "memopilot-context",
+          "name": "Context Pack"
+        },
+        {
+          "id": "memopilot-cost",
+          "name": "Cost Guard"
+        }
+      ]
+    },
+    "commands": [
+      {
+        "command": "memopilot.indexWorkspace",
+        "title": "MemoPilot: Index Workspace Memory"
+      },
+      {
+        "command": "memopilot.analyzeTask",
+        "title": "MemoPilot: Analyze Current Task"
+      },
+      {
+        "command": "memopilot.generateContextPack",
+        "title": "MemoPilot: Generate Context Pack"
+      },
+      {
+        "command": "memopilot.showCostReport",
+        "title": "MemoPilot: Show Cost Report"
+      },
+      {
+        "command": "memopilot.openRules",
+        "title": "MemoPilot: Open Rules"
+      },
+      {
+        "command": "memopilot.rebuildMemory",
+        "title": "MemoPilot: Rebuild Memory"
+      },
+      {
+        "command": "memopilot.showPanel",
+        "title": "MemoPilot: Open Panel"
+      },
+      {
+        "command": "memopilot.restartBackend",
+        "title": "MemoPilot: Restart Backend"
+      }
+    ],
+    "configuration": {
+      "title": "MemoPilot",
+      "properties": {
+        "memopilot.pythonPath": {
+          "type": "string",
+          "default": "",
+          "description": "Path to the Python interpreter for the MemoPilot backend. If empty, auto-detects from workspace .venv or PATH."
+        },
+        "memopilot.backendLogLevel": {
+          "type": "string",
+          "enum": ["debug", "info", "warning", "error"],
+          "default": "info",
+          "description": "Log level for the Python backend."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "build": "esbuild ./src/extension.ts --bundle --outfile=out/extension.js --external:vscode --format=cjs --platform=node --sourcemap",
+    "watch": "esbuild ./src/extension.ts --bundle --outfile=out/extension.js --external:vscode --format=cjs --platform=node --sourcemap --watch",
+    "lint": "eslint src --ext ts",
+    "test": "tsc -p . --noEmit && node ./out/test/runTests.js",
+    "prebundle-agent": "node -e \"const fs=require('fs');fs.rmSync('agent',{recursive:true,force:true});fs.cpSync('../agent/agent','agent',{recursive:true})\"",
+    "package": "pnpm run build && pnpm run prebundle-agent && vsce package --no-dependencies"
+  },
+  "devDependencies": {
+    "@types/node": "^20.11.0",
+    "@types/vscode": "^1.85.0",
+    "@vscode/test-electron": "^2.3.8",
+    "@vscode/vsce": "^2.22.0",
+    "esbuild": "^0.20.0",
+    "eslint": "^8.56.0",
+    "typescript": "^5.3.3"
+  }
+}
