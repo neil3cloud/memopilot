@@ -9,9 +9,14 @@ import uuid
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any
+
+import openpyxl
+import pdfplumber
 
 from .config import Config
 from .db import DatabaseManager
+from .evidence_classifier import EvidenceSourceClassifier
 from .security_policy import CredentialRedactor
 
 
@@ -41,6 +46,14 @@ class EvidenceBoardEntry:
 
 
 @dataclass(frozen=True)
+class EvidenceColumnsPreview:
+    source_type: str
+    columns: list[str]
+    suggested_mapping: dict[str, str]
+    requires_confirmation: bool
+
+
+@dataclass(frozen=True)
 class InvestigationResult:
     context_pack: str
     context_pack_path: str
@@ -57,6 +70,40 @@ class InvestigationService:
         self._config = config
         self._db = db
         self._redactor = CredentialRedactor()
+        self._classifier = EvidenceSourceClassifier()
+
+    async def preview_columns(self, *, evidence_path: str) -> EvidenceColumnsPreview:
+        resolved_path = self._resolve_evidence_path(evidence_path)
+        source_type = self._classifier.classify(
+            evidence_path=resolved_path,
+            source_url=None,
+        ).source_type
+
+        if source_type == "csv_data":
+            headers, _rows = self._extract_csv_rows(resolved_path)
+            mapping = self._suggest_column_mapping(headers)
+            return EvidenceColumnsPreview(
+                source_type=source_type,
+                columns=headers,
+                suggested_mapping=mapping,
+                requires_confirmation=True,
+            )
+        if source_type == "excel_sheet":
+            headers, _rows, _sheet = self._extract_excel_rows(resolved_path)
+            mapping = self._suggest_column_mapping(headers)
+            return EvidenceColumnsPreview(
+                source_type=source_type,
+                columns=headers,
+                suggested_mapping=mapping,
+                requires_confirmation=True,
+            )
+
+        return EvidenceColumnsPreview(
+            source_type=source_type,
+            columns=[],
+            suggested_mapping={},
+            requires_confirmation=False,
+        )
 
     async def attach_evidence(
         self,
@@ -64,16 +111,25 @@ class InvestigationService:
         evidence_path: str | None,
         source_url: str | None,
         task_run_id: str | None,
+        column_mapping: dict[str, str] | None,
     ) -> AttachedEvidence:
         resolved_path = self._resolve_evidence_path(evidence_path) if evidence_path else None
-        source_type = self._classify_source_type(resolved_path, source_url)
-        trust_level = self._trust_level_for_source(source_type)
-        extraction_method = self._extraction_method_for_source(source_type)
+        classification = self._classifier.classify(
+            evidence_path=resolved_path,
+            source_url=source_url,
+        )
+        source_type = classification.source_type
+        extraction_method = classification.extraction_method
+        trust_level = classification.trust_level
 
-        findings, extraction_status = self._extract_findings(
+        findings, extraction_status, ocr_required = self._extract_findings(
             source_type=source_type,
             evidence_path=resolved_path,
+            column_mapping=column_mapping or {},
         )
+        if ocr_required and source_type == "pdf_doc":
+            trust_level = 4
+
         redacted_findings, redacted_values = self._redact_findings(findings)
 
         evidence_id = uuid.uuid4().hex
@@ -216,86 +272,196 @@ class InvestigationService:
             raise ValueError(f"Evidence path not found: {resolved}")
         return resolved
 
-    def _classify_source_type(self, evidence_path: Path | None, source_url: str | None) -> str:
-        if source_url:
-            return "external_work_item"
-        if evidence_path is None:
-            return "text_note"
-
-        suffix = evidence_path.suffix.lower()
-        if suffix == ".md":
-            return "markdown_doc"
-        if suffix == ".csv":
-            return "csv_data"
-        if suffix in (".txt", ".log"):
-            return "text_log"
-        if suffix in (".json", ".xml"):
-            return "api_payload"
-        if suffix in (".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp"):
-            return "image"
-        return "text_note"
-
-    def _trust_level_for_source(self, source_type: str) -> int:
-        mapping = {
-            "markdown_doc": 2,
-            "text_log": 3,
-            "csv_data": 3,
-            "api_payload": 3,
-            "external_work_item": 3,
-            "image": 5,
-            "text_note": 2,
-        }
-        return mapping.get(source_type, 3)
-
-    def _extraction_method_for_source(self, source_type: str) -> str:
-        mapping = {
-            "markdown_doc": "text_parsing",
-            "text_log": "text_parsing",
-            "csv_data": "column_parsing",
-            "api_payload": "payload_parsing",
-            "external_work_item": "work_item_summary",
-            "image": "ocr_required",
-            "text_note": "text_parsing",
-        }
-        return mapping.get(source_type, "text_parsing")
-
     def _extract_findings(
         self,
         *,
         source_type: str,
         evidence_path: Path | None,
-    ) -> tuple[list[str], str]:
+        column_mapping: dict[str, str],
+    ) -> tuple[list[str], str, bool]:
         if source_type == "external_work_item":
             return [
                 "External work item attached. Fetch details via MCP in future iterations."
-            ], "ok"
+            ], "ok", False
         if evidence_path is None:
-            return ["No file evidence provided."], "ok"
+            return ["No file evidence provided."], "ok", False
         if source_type == "image":
-            return ["Image evidence attached; OCR interpretation pending."], "requires_ocr"
+            return ["Image evidence attached; OCR interpretation pending."], "requires_ocr", True
         if source_type == "csv_data":
-            return self._extract_csv_findings(evidence_path), "ok"
+            headers, rows = self._extract_csv_rows(evidence_path)
+            mapping = self._normalize_column_mapping(column_mapping, headers)
+            return self._build_tabular_findings(
+                source_label=f"CSV:{evidence_path.name}",
+                headers=headers,
+                rows=rows,
+                mapping=mapping,
+            ), "ok", False
+        if source_type == "excel_sheet":
+            headers, rows, sheet_name = self._extract_excel_rows(evidence_path)
+            mapping = self._normalize_column_mapping(column_mapping, headers)
+            return self._build_tabular_findings(
+                source_label=f"Excel:{evidence_path.name}:{sheet_name}",
+                headers=headers,
+                rows=rows,
+                mapping=mapping,
+            ), "ok", False
+        if source_type == "pdf_doc":
+            return self._extract_pdf_findings(evidence_path)
 
         text = evidence_path.read_text(encoding="utf-8", errors="replace")
         lines = [line.strip() for line in text.splitlines() if line.strip()]
-        return lines[:30], "ok"
+        return lines[:30], "ok", False
 
-    def _extract_csv_findings(self, evidence_path: Path) -> list[str]:
-        findings: list[str] = []
+    def _extract_csv_rows(self, evidence_path: Path) -> tuple[list[str], list[dict[str, str]]]:
         with evidence_path.open("r", encoding="utf-8", errors="replace", newline="") as file_obj:
             reader = csv.DictReader(file_obj)
-            headers = reader.fieldnames or []
-            if headers:
-                findings.append(f"CSV headers: {', '.join(headers)}")
+            headers = [header for header in (reader.fieldnames or []) if header]
+            rows: list[dict[str, str]] = []
             for index, row in enumerate(reader):
-                if index >= 10:
+                if index >= 50:
                     break
-                pairs = [f"{key}={value}" for key, value in row.items() if value]
-                if pairs:
-                    findings.append("; ".join(pairs))
-        if not findings:
-            findings.append("CSV contained no parsed rows.")
+                rows.append({str(key): str(value) for key, value in row.items() if key and value})
+        return headers, rows
+
+    def _extract_excel_rows(
+        self,
+        evidence_path: Path,
+    ) -> tuple[list[str], list[dict[str, str]], str]:
+        workbook = openpyxl.load_workbook(evidence_path, read_only=True, data_only=True)
+        worksheet = workbook.active
+        rows_iter = worksheet.iter_rows(values_only=True)
+        first_row = next(rows_iter, None)
+        headers = [str(value).strip() for value in (first_row or []) if value is not None]
+
+        rows: list[dict[str, str]] = []
+        for index, row in enumerate(rows_iter):
+            if index >= 50:
+                break
+            entry: dict[str, str] = {}
+            for column_index, value in enumerate(row):
+                if column_index >= len(headers):
+                    continue
+                if value is None:
+                    continue
+                entry[headers[column_index]] = str(value).strip()
+            if entry:
+                rows.append(entry)
+        workbook.close()
+        return headers, rows, worksheet.title
+
+    def _extract_pdf_findings(self, evidence_path: Path) -> tuple[list[str], str, bool]:
+        findings: list[str] = []
+        saw_text = False
+        with pdfplumber.open(evidence_path) as pdf_doc:
+            for index, page in enumerate(pdf_doc.pages):
+                if index >= 20:
+                    break
+                page_text = (page.extract_text() or "").strip()
+                if not page_text:
+                    continue
+                saw_text = True
+                for line in page_text.splitlines():
+                    stripped = line.strip()
+                    if stripped:
+                        findings.append(stripped)
+                if len(findings) >= 60:
+                    break
+        if not saw_text:
+            return [
+                "Scanned PDF detected. OCR is required before reliable extraction."
+            ], "requires_ocr", True
+        return findings[:60], "ok", False
+
+    def _build_tabular_findings(
+        self,
+        *,
+        source_label: str,
+        headers: list[str],
+        rows: list[dict[str, str]],
+        mapping: dict[str, str],
+    ) -> list[str]:
+        findings: list[str] = []
+        findings.append(f"Tabular source: {source_label}")
+        if headers:
+            findings.append(f"Columns: {', '.join(headers)}")
+
+        for column in headers:
+            values = [row[column] for row in rows if column in row and row[column]]
+            sample_type = self._infer_value_type(values)
+            findings.append(
+                f"Data dictionary: {column} (type={sample_type}, sample_count={len(values[:20])})"
+            )
+
+        if not mapping and headers:
+            mapping = self._suggest_column_mapping(headers)
+
+        title_col = mapping.get("title")
+        steps_col = mapping.get("steps")
+        expected_col = mapping.get("expected")
+        if title_col:
+            for row in rows[:15]:
+                title = row.get(title_col, "").strip()
+                steps = row.get(steps_col, "").strip() if steps_col else ""
+                expected = row.get(expected_col, "").strip() if expected_col else ""
+                if not title:
+                    continue
+                findings.append(
+                    "Test case: "
+                    f"title={title}; steps={steps or 'n/a'}; expected={expected or 'n/a'}"
+                )
+
+        if not rows:
+            findings.append("No non-empty tabular rows were parsed.")
         return findings
+
+    def _suggest_column_mapping(self, headers: list[str]) -> dict[str, str]:
+        lowered = {header.lower(): header for header in headers}
+
+        def pick(candidates: tuple[str, ...]) -> str | None:
+            for candidate in candidates:
+                for lower, original in lowered.items():
+                    if candidate in lower:
+                        return original
+            return None
+
+        mapping: dict[str, str] = {}
+        title = pick(("title", "name", "summary", "test case"))
+        steps = pick(("steps", "procedure", "action", "input"))
+        expected = pick(("expected", "result", "assert", "outcome"))
+        if title:
+            mapping["title"] = title
+        if steps:
+            mapping["steps"] = steps
+        if expected:
+            mapping["expected"] = expected
+        return mapping
+
+    def _normalize_column_mapping(
+        self,
+        mapping: dict[str, str],
+        headers: list[str],
+    ) -> dict[str, str]:
+        if not mapping:
+            return {}
+        index = {header.lower(): header for header in headers}
+        normalized: dict[str, str] = {}
+        for role, column in mapping.items():
+            resolved = index.get(column.lower())
+            if resolved:
+                normalized[role] = resolved
+        return normalized
+
+    def _infer_value_type(self, values: list[str]) -> str:
+        sample = [value for value in values[:20] if value]
+        if not sample:
+            return "empty"
+        if all(re.fullmatch(r"-?\d+(\.\d+)?", value) for value in sample):
+            return "number"
+        if all(re.fullmatch(r"\d{4}-\d{2}-\d{2}", value) for value in sample):
+            return "date"
+        if all(value.lower() in {"true", "false", "yes", "no"} for value in sample):
+            return "boolean"
+        return "text"
 
     def _redact_findings(self, findings: list[str]) -> tuple[list[str], int]:
         total = 0
@@ -420,14 +586,14 @@ class InvestigationService:
     ) -> str:
         evidence_lines = [
             "- "
-            f"{entry.source_type} (trust={entry.trust_level}) — "
+            f"{entry.source_type} (trust={entry.trust_level}) "
+            f"[{entry.extraction_status}] — "
             f"{entry.source_path or entry.source_url or 'n/a'}"
             for entry in evidence_entries
         ] or ["- none"]
         findings_lines = [
             "- "
-            f"[{entry.source_type}"
-            f":{entry.source_path or entry.source_url or 'n/a'}] {finding}"
+            f"[{entry.source_type}:{entry.source_path or entry.source_url or 'n/a'}] {finding}"
             for entry in evidence_entries
             for finding in entry.findings
         ] or ["- none"]
@@ -487,7 +653,7 @@ class InvestigationService:
     def _parse_findings(self, raw: str | None) -> list[str]:
         if not raw:
             return []
-        value = json.loads(raw)
+        value: Any = json.loads(raw)
         if isinstance(value, dict):
             findings = value.get("findings", [])
             if isinstance(findings, list):
@@ -500,7 +666,7 @@ class InvestigationService:
     def _parse_extraction_status(self, source_type: str, raw: str | None) -> str:
         if not raw:
             return self._default_extraction_status(source_type)
-        value = json.loads(raw)
+        value: Any = json.loads(raw)
         if isinstance(value, dict):
             status = value.get("extraction_status")
             if isinstance(status, str) and status:
@@ -510,7 +676,7 @@ class InvestigationService:
     def _parse_redacted_values(self, raw: str | None) -> int:
         if not raw:
             return 0
-        value = json.loads(raw)
+        value: Any = json.loads(raw)
         if isinstance(value, dict):
             redacted = value.get("redacted_values")
             if isinstance(redacted, int) and redacted >= 0:
@@ -518,7 +684,7 @@ class InvestigationService:
         return 0
 
     def _default_extraction_status(self, source_type: str) -> str:
-        if source_type == "image":
+        if source_type in {"image", "pdf_doc"}:
             return "requires_ocr"
         return "ok"
 

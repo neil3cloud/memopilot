@@ -44,6 +44,8 @@ async def test_migrations_apply_on_fresh_db():
         "schema_version",
         "response_cache",
         "cost_ledger",
+        "skill_store_versions",
+        "optimizer_runs",
     ]
 
     for table in expected_tables:

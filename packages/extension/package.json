@@ -111,6 +111,38 @@
         "title": "MemoPilot: Show Privacy Dashboard"
       },
       {
+        "command": "memopilot.showProviderCapabilities",
+        "title": "MemoPilot: Show Provider Capabilities"
+      },
+      {
+        "command": "memopilot.replayAICall",
+        "title": "MemoPilot: Replay AI Call"
+      },
+      {
+        "command": "memopilot.manageSkillStore",
+        "title": "MemoPilot: Manage Skill Store"
+      },
+      {
+        "command": "memopilot.backupMemory",
+        "title": "MemoPilot: Backup Memory"
+      },
+      {
+        "command": "memopilot.restoreMemory",
+        "title": "MemoPilot: Restore Memory"
+      },
+      {
+        "command": "memopilot.optimizeToolsAndSkills",
+        "title": "MemoPilot: Optimize Tools and Skills"
+      },
+      {
+        "command": "memopilot.selectBudgetProfile",
+        "title": "MemoPilot: Select Budget Profile"
+      },
+      {
+        "command": "memopilot.classifyEvidenceSource",
+        "title": "MemoPilot: Classify Evidence Source"
+      },
+      {
         "command": "memopilot.attachEvidence",
         "title": "MemoPilot: Attach Evidence"
       },

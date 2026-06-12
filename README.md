@@ -120,7 +120,7 @@ docs/          — Product documentation
 
 ## Current Implementation Status
 
-**Completed:** Phases 1–15 (MVP + v1 production scope)
+**Completed:** Phases 1–17 (MVP + v1 production + v1.5)
 
 - Workspace indexing delivered (`/v1/workspace/index`, stale-file handling, symbol extraction, rebuild-memory flow)
 - Cost guard and cache delivered (budget checks, task run + usage ledger, savings report, response cache)
@@ -133,8 +133,15 @@ docs/          — Product documentation
   - Evidence attach endpoint (`/v1/investigation/evidence/attach`) with source classification and trust scoring
   - Evidence board endpoint (`/v1/investigation/evidence`) with extraction status and redaction metadata
   - Investigation run endpoint (`/v1/investigation/run`) generating context packs with extracted/redacted findings, impacted file discovery, related test discovery, and missing test coverage detection
+  - PDF/Excel artifact extraction, Excel column mapping, and dedicated evidence classification
+- v1.5 delivered:
+  - Context Pack diffing and version history
+  - Skill Store versioning and conflict detection
+  - Memory backup/restore
+  - Tool/skill selection optimizer
+  - Model budget profiles
 
-**Next (Post-v1, excluding v2):** Phase 16 → Phase 17(v1 core) → Phase 17(v1.5 add-ons), starting with non-code artifact analysis (PDF/Excel extraction).
+- Next focus is v2 only.
 
 ## Development
 
