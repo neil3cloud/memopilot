@@ -24,6 +24,8 @@ from .evidence_classifier import EvidenceSourceClassifier
 from .security_policy import CredentialRedactor
 from .wave4_service import Wave4Service
 
+MAX_EVIDENCE_FILE_SIZE_BYTES = 10 * 1024 * 1024
+
 
 @dataclass(frozen=True)
 class AttachedEvidence:
@@ -267,13 +269,17 @@ class InvestigationService:
     async def _resolve_evidence_path(self, evidence_path: str) -> Path:
         candidate = Path(evidence_path)
         workspace_service = Wave4Service(config=self._config, db=self._db)
+        allowed_roots = await workspace_service.allowed_workspace_paths()
         if not candidate.is_absolute():
+            if self._contains_parent_reference(candidate):
+                raise ValueError("Evidence path must not traverse parent directories")
             active_root = await workspace_service.active_workspace_path()
             candidate = active_root / candidate
+        if not any(self._is_within_workspace(candidate, root) for root in allowed_roots):
+            raise ValueError("Evidence path must be within a configured workspace root")
         if candidate.is_symlink():
             raise ValueError("Symlinked evidence paths are not allowed")
         resolved = candidate.resolve()
-        allowed_roots = await workspace_service.allowed_workspace_paths()
         if not any(self._is_within_workspace(resolved, root) for root in allowed_roots):
             raise ValueError("Evidence path must be within a configured workspace root")
         if not resolved.exists():
@@ -294,14 +300,14 @@ class InvestigationService:
         if evidence_path is None:
             return ["No file evidence provided."], "ok", False
         # Guard against excessively large files (10 MB limit)
-        max_file_size = 10 * 1024 * 1024
         try:
             file_size = evidence_path.stat().st_size
         except OSError as exc:
             raise ValueError(f"Cannot access evidence file: {exc}") from exc
-        if file_size > max_file_size:
+        if file_size > MAX_EVIDENCE_FILE_SIZE_BYTES:
             raise ValueError(
-                f"Evidence file too large ({file_size} bytes, max {max_file_size})"
+                "Evidence file too large "
+                f"({file_size} bytes, max {MAX_EVIDENCE_FILE_SIZE_BYTES})"
             )
         if source_type in {"image", "screenshot"}:
             return self._extract_image_findings(evidence_path, source_type)
@@ -810,6 +816,9 @@ class InvestigationService:
             return True
         except ValueError:
             return False
+
+    def _contains_parent_reference(self, candidate: Path) -> bool:
+        return any(part == ".." for part in candidate.parts)
 
     def _important_tokens(self, findings: list[str]) -> list[str]:
         token_set: set[str] = set()

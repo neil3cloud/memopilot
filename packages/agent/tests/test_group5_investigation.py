@@ -102,6 +102,26 @@ async def test_attach_evidence_redacts_secrets(
 
 
 @pytest.mark.asyncio
+async def test_attach_evidence_rejects_parent_traversal(
+    client: AsyncClient,
+    test_token: str,
+    tmp_workspace,
+):
+    headers = {"X-Agent-Token": test_token}
+    await client.post("/v1/workspace/init", headers=headers)
+
+    outside_evidence = tmp_workspace.parent / "outside.txt"
+    outside_evidence.write_text("outside workspace", encoding="utf-8")
+    attached = await client.post(
+        "/v1/investigation/evidence/attach",
+        headers=headers,
+        json={"evidence_path": "../outside.txt"},
+    )
+    assert attached.status_code == 400
+    assert "must not traverse parent directories" in attached.json()["detail"]
+
+
+@pytest.mark.asyncio
 async def test_run_investigation_builds_context_pack_and_coverage(
     client: AsyncClient,
     test_token: str,
