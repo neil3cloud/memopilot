@@ -8,10 +8,21 @@ import { WorkspaceProfileTreeProvider } from './views/WorkspaceProfileTreeProvid
 import { MemoryManagerTreeProvider, MEMORY_FILTERS, MemoryFilter } from './views/MemoryManagerTreeProvider';
 import { PrivacyDashboardTreeProvider } from './views/PrivacyDashboardTreeProvider';
 import { EvidenceBoardTreeProvider } from './views/EvidenceBoardTreeProvider';
+import { RulesSkillsTreeProvider } from './views/RulesSkillsTreeProvider';
+import { CostGuardTreeProvider } from './views/CostGuardTreeProvider';
+import { ContextPackTreeProvider } from './views/ContextPackTreeProvider';
+import { TaskHistoryTreeProvider } from './views/TaskHistoryTreeProvider';
+import { McpToolsTreeProvider } from './views/McpToolsTreeProvider';
 import { MemoPilotPanel } from './panels/MemoPilotPanel';
+import { TaskEntryPanel } from './panels/TaskEntryPanel';
+import { PatchPreviewPanel } from './panels/PatchPreviewPanel';
+import { CostDashboardPanel } from './panels/CostDashboardPanel';
+import { ProviderMatrixPanel } from './panels/ProviderMatrixPanel';
+import { TaskFlowController } from './controllers/TaskFlowController';
 
 let backendManager: BackendManager | undefined;
 let backendClient: BackendClient | undefined;
+let taskFlowController: TaskFlowController | undefined;
 let statusBarItem: vscode.StatusBarItem;
 
 export async function activate(context: vscode.ExtensionContext): Promise<void> {
@@ -30,11 +41,13 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     const statusProvider = new StatusTreeProvider();
     const profileProvider = new WorkspaceProfileTreeProvider();
     const memoryProvider = new MemoryManagerTreeProvider();
-    const rulesProvider = new PlaceholderTreeProvider('Rules & Skills will appear here after indexing.');
-    const contextProvider = new PlaceholderTreeProvider('Context Pack preview will appear here.');
-    const costProvider = new PlaceholderTreeProvider('Cost Guard data will appear here.');
+    const rulesProvider = new RulesSkillsTreeProvider();
+    const contextProvider = new ContextPackTreeProvider();
+    const costProvider = new CostGuardTreeProvider();
     const privacyProvider = new PrivacyDashboardTreeProvider();
     const evidenceProvider = new EvidenceBoardTreeProvider();
+    const historyProvider = new TaskHistoryTreeProvider();
+    const mcpProvider = new McpToolsTreeProvider();
 
     context.subscriptions.push(
         vscode.window.registerTreeDataProvider('memopilot-status', statusProvider),
@@ -45,6 +58,8 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         vscode.window.registerTreeDataProvider('memopilot-cost', costProvider),
         vscode.window.registerTreeDataProvider('memopilot-privacy', privacyProvider),
         vscode.window.registerTreeDataProvider('memopilot-evidence', evidenceProvider),
+        vscode.window.registerTreeDataProvider('memopilot-history', historyProvider),
+        vscode.window.registerTreeDataProvider('memopilot-mcp', mcpProvider),
     );
 
     // Commands
@@ -82,11 +97,27 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         memoryProvider.setClient(backendClient);
         privacyProvider.setClient(backendClient);
         evidenceProvider.setClient(backendClient);
+        rulesProvider.setClient(backendClient);
+        costProvider.setClient(backendClient);
+        historyProvider.setClient(backendClient);
+        mcpProvider.setClient(backendClient);
+        // Update the main panel if it's open
+        if (MemoPilotPanel.currentPanel) {
+            MemoPilotPanel.currentPanel.setClient(backendClient);
+        }
+        // Recreate task flow controller with new client
+        if (backendClient) {
+            taskFlowController = new TaskFlowController(backendClient);
+        }
         await Promise.all([
             profileProvider.refresh(),
             memoryProvider.refresh(),
             privacyProvider.refresh(),
             evidenceProvider.refresh(),
+            rulesProvider.refresh(),
+            costProvider.refresh(),
+            historyProvider.refresh(),
+            mcpProvider.refresh(),
         ]);
     };
 
@@ -311,30 +342,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     };
 
     const showProviderCapabilities = async () => {
-        const client = ensureBackendClient();
-        if (!client) { return; }
-        try {
-            const result = await client.listProviderCapabilities();
-            const lines = [
-                '# Provider Capability Matrix',
-                '',
-                '| Model | Source | Max Context | Tools | JSON | Privacy | Approval |',
-                '|---|---|---:|:---:|:---:|---|:---:|',
-                ...result.items.map((item) => (
-                    `| ${item.model_id} | ${item.source} | ${item.max_context_tokens ?? 0} | `
-                    + `${item.supports_tool_calling ? 'Y' : 'N'} | ${item.supports_json_mode ? 'Y' : 'N'} | `
-                    + `${item.privacy_level} | ${item.requires_approval ? 'Y' : 'N'} |`
-                )),
-            ];
-            const document = await vscode.workspace.openTextDocument({
-                language: 'markdown',
-                content: lines.join('\n'),
-            });
-            await vscode.window.showTextDocument(document, { preview: false });
-        } catch (err: unknown) {
-            const msg = err instanceof Error ? err.message : String(err);
-            void vscode.window.showErrorMessage(`Provider matrix failed: ${msg}`);
-        }
+        ProviderMatrixPanel.createOrShow(context.extensionUri, backendClient);
     };
 
     const replayAICall = async () => {
@@ -824,10 +832,33 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 
     context.subscriptions.push(
         vscode.commands.registerCommand('memopilot.indexWorkspace', notImplemented('Index Workspace Memory')),
-        vscode.commands.registerCommand('memopilot.analyzeTask', notImplemented('Analyze Current Task')),
+        vscode.commands.registerCommand('memopilot.analyzeTask', () => {
+            TaskEntryPanel.createOrShow(context.extensionUri, backendClient);
+        }),
+        vscode.commands.registerCommand('memopilot.approvePatch', async () => {
+            if (taskFlowController) {
+                await taskFlowController.approve();
+                const state = taskFlowController.getState();
+                if (state.stage === 'applying') {
+                    vscode.window.showInformationMessage('MemoPilot: Patch approved. Applying changes...');
+                    taskFlowController.complete();
+                }
+            }
+        }),
+        vscode.commands.registerCommand('memopilot.rejectPatch', () => {
+            if (taskFlowController) {
+                taskFlowController.reject();
+                vscode.window.showInformationMessage('MemoPilot: Patch rejected.');
+            }
+        }),
         vscode.commands.registerCommand('memopilot.generateContextPack', manageContextTemplates),
-        vscode.commands.registerCommand('memopilot.showCostReport', notImplemented('Show Cost Report')),
-        vscode.commands.registerCommand('memopilot.openRules', notImplemented('Open Rules')),
+        vscode.commands.registerCommand('memopilot.showCostReport', () => {
+            CostDashboardPanel.createOrShow(context.extensionUri, backendClient);
+        }),
+        vscode.commands.registerCommand('memopilot.openRules', async () => {
+            rulesProvider.setClient(backendClient);
+            await rulesProvider.refresh();
+        }),
         vscode.commands.registerCommand('memopilot.rebuildMemory', rebuildMemory),
         vscode.commands.registerCommand('memopilot.openWorkspaceProfile', openWorkspaceProfile),
         vscode.commands.registerCommand('memopilot.rebuildWorkspaceProfile', rebuildWorkspaceProfile),

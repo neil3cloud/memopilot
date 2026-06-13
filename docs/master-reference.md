@@ -1,6 +1,6 @@
 # MemoPilot: Master Product and Implementation Reference
 
-**Document Version:** 2.0 (Merged Master) **Target Product:** MemoPilot — Rule-Aware, Local-Memory, Cost-Governed AI Development Agent Extension for VS Code/Cursor **Status:** Production Reference
+**Document Version:** 2.1 (UI Implementation Complete) **Target Product:** MemoPilot — Rule-Aware, Local-Memory, Cost-Governed AI Development Agent Extension for VS Code/Cursor **Status:** Production Reference
 
 ---
 
@@ -32,6 +32,7 @@
 24. [MVP Scope](#24-mvp-scope)  
 25. [Risks and Mitigations](#25-risks-and-mitigations)  
 26. [Final Product Positioning](#26-final-product-positioning)
+27. [UI Implementation Progress (v2.1)](#27-ui-implementation-progress-v21--june-2025)
 
 ---
 
@@ -3217,4 +3218,113 @@ This is not AI-assisted development with guardrails bolted on. This is **AI-assi
 
 ---
 
-*End of MemoPilot Master Product and Implementation Reference — Document Version 2.0*  
+*End of MemoPilot Master Product and Implementation Reference — Document Version 2.1*
+
+---
+
+## 27\. UI Implementation Progress (v2.1 — June 2025)
+
+### Overview
+
+The MemoPilot extension UI has been expanded from basic tree views and static panels to a **full end-to-end task flow UI** covering all 17 target scenario views. The UI now supports the complete developer workflow:
+
+```
+Workspace indexing → Rules/Skills resolution → Task entry → Context pack preview
+→ Model routing & cost guard → AI patch preview → Approval gate → Validation
+→ Memory/history update → Cost reporting
+```
+
+### New Extension Architecture
+
+```
+packages/extension/src/
+├── controllers/
+│   └── TaskFlowController.ts        — State machine orchestrating full task flow
+├── panels/
+│   ├── MemoPilotPanelBase.ts         — Abstract base (CSP, nonce, theme, message bridge)
+│   ├── MemoPilotPanel.ts             — Shell with navigation sidebar + workspace status
+│   ├── TaskEntryPanel.ts             — Task form with constraints, mode picker, analysis
+│   ├── PatchPreviewPanel.ts          — Colored diff viewer with approve/reject + validation
+│   ├── CostDashboardPanel.ts         — Metrics cards, daily chart, model breakdown table
+│   ├── ProviderMatrixPanel.ts        — Provider capability comparison table
+│   ├── types.ts                      — Shared DTOs, message types, AsyncState<T>
+│   └── navigationItems.ts            — 17 navigation entries for sidebar
+├── views/
+│   ├── RulesSkillsTreeProvider.ts    — Collapsible tree: Global Rules → Project Rules → Skills
+│   ├── ContextPackTreeProvider.ts    — File list with tokens, rules/skills counts, cost
+│   ├── CostGuardTreeProvider.ts      — Budget bar with spend/saved/remaining
+│   ├── TaskHistoryTreeProvider.ts    — Recent tasks with status, time, cost
+│   └── McpToolsTreeProvider.ts       — MCP servers with collapsible tool lists
+└── controllers/
+    └── TaskFlowController.ts         — analyze→context→route→patch→approve→validate
+```
+
+### New Backend Endpoints (9 total)
+
+| Endpoint | Method | Purpose |
+|----------|--------|---------|
+| `/v1/rules/active` | GET | Merged rules from policy packs + YAML files + detected skills |
+| `/v1/task/analyze` | POST | Parse NL intent, auto-detect mode, estimate complexity |
+| `/v1/context/build` | POST | Build context pack with per-file token estimates |
+| `/v1/model/route` | POST | Select optimal model based on context/task/privacy/budget |
+| `/v1/task/generate-patch` | POST | Generate code patches (mock for UI development) |
+| `/v1/task/validate` | POST | Run syntax/lint/test_impact/security checks |
+| `/v1/task/history` | GET | Recent task runs with status, model, cost, duration |
+| `/v1/cost/dashboard` | GET | Aggregated cost by day/model with totals and savings |
+| `/v1/mcp/tools` | GET | List configured MCP servers and available tools |
+
+### UI Views — Coverage Matrix
+
+| Target View | Implementation | Type |
+|-------------|---------------|------|
+| Workspace Status / Indexing | MemoPilotPanel (shell) | Webview ✅ |
+| Local App Memory | MemoryManagerTreeProvider | Tree ✅ |
+| Rules & Skills | RulesSkillsTreeProvider | Tree ✅ |
+| Task Entry | TaskEntryPanel | Webview ✅ |
+| Context Pack Preview | ContextPackTreeProvider | Tree ✅ |
+| Model Routing & Cost Guard | CostGuardTreeProvider + routeModel() | Tree ✅ |
+| AI Patch / Diff Preview | PatchPreviewPanel | Webview ✅ |
+| Approval Gate | PatchPreviewPanel (approve/reject) | Webview ✅ |
+| Validation Results | PatchPreviewPanel (inline) | Webview ✅ |
+| Memory / Task History | TaskHistoryTreeProvider | Tree ✅ |
+| Cost Dashboard | CostDashboardPanel | Webview ✅ |
+| Evidence Board | EvidenceBoardTreeProvider | Tree ✅ |
+| Privacy Boundary Dashboard | PrivacyDashboardTreeProvider | Tree ✅ |
+| Provider Capability Matrix | ProviderMatrixPanel | Webview ✅ |
+| Memory Manager | MemoryManagerTreeProvider | Tree ✅ |
+| Workspace Profile | WorkspaceProfileTreeProvider | Tree ✅ |
+| MCP / External Context | McpToolsTreeProvider | Tree ✅ |
+
+**All 17 target views now have live implementations** (zero remaining placeholders).
+
+### TaskFlowController State Machine
+
+```
+idle → analyzing → context_building → routing → generating_patch
+  → awaiting_approval (STOP — developer must approve)
+    → validating → applying → done
+    → reject → idle
+```
+
+The flow automatically proceeds through analysis, context building, model routing, and patch generation, then **stops at the approval gate**. No code is applied without explicit developer consent.
+
+### Test Coverage
+
+| Test File | Tests | Scope |
+|-----------|-------|-------|
+| test_rules_active.py | 5 | Rules aggregation endpoint |
+| test_task_analyze.py | 7 | Task analysis + mode detection |
+| test_context_build.py | 5 | Context pack building |
+| test_model_route.py | 6 | Model selection + budget check |
+| test_patch_validate.py | 8 | Patch generation + validation |
+| test_history_dashboard.py | 5 | Task history + cost dashboard |
+| test_mcp_tools.py | 2 | MCP tools listing |
+| **Total** | **38** | All new endpoints covered |
+
+### Key Design Decisions
+
+1. **Hybrid Tree + Webview**: Tree views for glanceable sidebar data, webview panels for rich interaction
+2. **MemoPilotPanelBase**: All webview panels inherit CSP nonce injection, VS Code theme CSS vars, and typed message bridge
+3. **Mock-first backend**: Patch generation and validation use deterministic mocks to enable UI development ahead of AI integration
+4. **Developer-in-control**: TaskFlowController always stops at approval gate; cost visibility is first-class throughout
+5. **Incremental delivery**: Each phase ships independently; no big-bang rewrites  

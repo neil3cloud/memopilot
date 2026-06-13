@@ -59,6 +59,14 @@
         {
           "id": "memopilot-evidence",
           "name": "Evidence Board"
+        },
+        {
+          "id": "memopilot-history",
+          "name": "Task History"
+        },
+        {
+          "id": "memopilot-mcp",
+          "name": "MCP Tools"
         }
       ]
     },

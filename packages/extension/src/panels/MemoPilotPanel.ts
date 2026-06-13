@@ -1,21 +1,27 @@
 import * as vscode from 'vscode';
-import * as crypto from 'crypto';
 import { BackendClient } from '../BackendClient';
+import { MemoPilotPanelBase } from './MemoPilotPanelBase';
+import { NAVIGATION_ITEMS } from './navigationItems';
+import type { WebviewOutboundMessage, WorkspaceStatusDTO, NavigationItemDTO } from './types';
 
-export class MemoPilotPanel {
+/**
+ * Main MemoPilot panel — shell with navigation sidebar and content area.
+ * Handles view switching, backend status display, and message routing.
+ */
+export class MemoPilotPanel extends MemoPilotPanelBase {
     public static currentPanel: MemoPilotPanel | undefined;
     private static readonly viewType = 'memopilotPanel';
 
-    private readonly panel: vscode.WebviewPanel;
-    private readonly extensionUri: vscode.Uri;
-    private readonly client: BackendClient | undefined;
-    private disposables: vscode.Disposable[] = [];
+    private client: BackendClient | undefined;
+    private activeViewId: string = 'workspace-status';
 
     public static createOrShow(extensionUri: vscode.Uri, client: BackendClient | undefined): void {
         const column = vscode.window.activeTextEditor?.viewColumn ?? vscode.ViewColumn.One;
 
         if (MemoPilotPanel.currentPanel) {
+            MemoPilotPanel.currentPanel.client = client;
             MemoPilotPanel.currentPanel.panel.reveal(column);
+            MemoPilotPanel.currentPanel.refresh();
             return;
         }
 
@@ -25,6 +31,7 @@ export class MemoPilotPanel {
             column,
             {
                 enableScripts: true,
+                retainContextWhenHidden: true,
                 localResourceRoots: [vscode.Uri.joinPath(extensionUri, 'resources')],
             },
         );
@@ -33,92 +40,246 @@ export class MemoPilotPanel {
     }
 
     private constructor(panel: vscode.WebviewPanel, extensionUri: vscode.Uri, client: BackendClient | undefined) {
-        this.panel = panel;
-        this.extensionUri = extensionUri;
+        super(panel, extensionUri);
         this.client = client;
 
-        this.update();
-
-        this.panel.onDidDispose(() => this.dispose(), null, this.disposables);
-        this.panel.onDidChangeViewState(() => {
-            if (this.panel.visible) {
-                this.update();
-            }
+        this.panel.onDidDispose(() => {
+            MemoPilotPanel.currentPanel = undefined;
         }, null, this.disposables);
+
+        this.render();
     }
 
-    private async update(): Promise<void> {
-        const webview = this.panel.webview;
-        const nonce = crypto.randomBytes(16).toString('hex');
+    /** Update client reference (e.g., after backend reconnect) */
+    public setClient(client: BackendClient | undefined): void {
+        this.client = client;
+        this.refresh();
+    }
 
-        let statusHtml = '<p class="status error">Backend not connected</p>';
-        if (this.client) {
-            try {
-                const health = await this.client.health();
-                statusHtml = `<p class="status ok">Backend connected — API v${health.api_version}, Schema v${health.schema_version}</p>`;
-            } catch {
-                statusHtml = '<p class="status error">Backend unavailable</p>';
+    /** Re-render the full panel */
+    public refresh(): void {
+        this.render();
+    }
+
+    protected handleMessage(message: WebviewOutboundMessage): void {
+        switch (message.type) {
+            case 'ready':
+                this.sendNavigationItems();
+                this.sendActiveView();
+                this.sendWorkspaceStatus();
+                break;
+            case 'navigate':
+                this.activeViewId = message.payload.viewId;
+                this.sendActiveView();
+                this.sendViewContent(message.payload.viewId);
+                break;
+            case 'request-workspace-status':
+                this.sendWorkspaceStatus();
+                break;
+            case 'restart-backend':
+                void vscode.commands.executeCommand('memopilot.restartBackend');
+                break;
+            default:
+                break;
+        }
+    }
+
+    protected onDidBecomeVisible(): void {
+        this.sendWorkspaceStatus();
+    }
+
+    private render(): void {
+        this.panel.webview.html = this.renderHtml(this.buildShellHtml(), this.buildExtraScript());
+    }
+
+    private async sendWorkspaceStatus(): Promise<void> {
+        const status = await this.getWorkspaceStatus();
+        this.postMessage({ type: 'workspace-status', payload: status });
+    }
+
+    private sendNavigationItems(): void {
+        this.postMessage({ type: 'navigation-items', payload: NAVIGATION_ITEMS });
+    }
+
+    private sendActiveView(): void {
+        this.postMessage({ type: 'active-view', payload: { viewId: this.activeViewId } });
+    }
+
+    private sendViewContent(viewId: string): void {
+        const html = this.getViewContentHtml(viewId);
+        this.postMessage({ type: 'view-content', payload: { viewId, html } });
+    }
+
+    private async getWorkspaceStatus(): Promise<WorkspaceStatusDTO> {
+        const workspaceFolder = vscode.workspace.workspaceFolders?.[0];
+        const base: WorkspaceStatusDTO = {
+            connected: false,
+            apiVersion: null,
+            schemaVersion: null,
+            workspaceName: workspaceFolder?.name ?? 'No workspace',
+            workspaceRoot: workspaceFolder?.uri.fsPath ?? '',
+            indexed: false,
+            indexingPhase: 'idle',
+            filesScanned: 0,
+            totalFiles: 0,
+            symbolsExtracted: 0,
+        };
+
+        if (!this.client) {
+            return base;
+        }
+
+        try {
+            const health = await this.client.health();
+            base.connected = health.status === 'ok';
+            base.apiVersion = health.api_version;
+            base.schemaVersion = health.schema_version;
+            base.indexed = true;
+        } catch {
+            base.connected = false;
+        }
+
+        return base;
+    }
+
+    private getViewContentHtml(viewId: string): string {
+        const item = NAVIGATION_ITEMS.find(n => n.id === viewId);
+        if (!item) { return ''; }
+
+        if (!item.enabled) {
+            return `
+                <div class="mp-placeholder">
+                    <h3>${this.escapeHtml(item.label)}</h3>
+                    <p>Coming soon — ${this.escapeHtml(item.description)}</p>
+                </div>`;
+        }
+
+        // Enabled views get content rendered based on viewId
+        switch (viewId) {
+            case 'workspace-status':
+                return this.getWorkspaceStatusHtml();
+            case 'local-memory':
+                return this.getSimpleRedirectHtml('Memory Manager', 'Use the Memory Manager tree view in the sidebar, or run "MemoPilot: Review Memory" from the command palette.');
+            case 'rules-skills':
+                return this.getSimpleRedirectHtml('Rules & Skills', 'Use the Rules & Skills tree view in the sidebar, or run "MemoPilot: Open Rules" from the command palette.');
+            case 'memory-manager':
+                return this.getSimpleRedirectHtml('Memory Manager', 'Use the Memory Manager tree view in the sidebar for full CRUD operations.');
+            case 'workspace-profile':
+                return this.getSimpleRedirectHtml('Workspace Profile', 'Use the Workspace Profile tree view in the sidebar, or run "MemoPilot: Open Workspace Profile" from the command palette.');
+            case 'privacy-boundary':
+                return this.getSimpleRedirectHtml('Privacy Dashboard', 'Use the Privacy Dashboard tree view in the sidebar, or run "MemoPilot: Show Privacy Dashboard" from the command palette.');
+            case 'evidence-board':
+                return this.getSimpleRedirectHtml('Evidence Board', 'Use the Evidence Board tree view in the sidebar, or run "MemoPilot: Attach Evidence" from the command palette.');
+            default:
+                return `<div class="mp-placeholder"><p>View not implemented yet.</p></div>`;
+        }
+    }
+
+    private getWorkspaceStatusHtml(): string {
+        return `
+            <div class="mp-status-panel" id="status-content">
+                <p style="color: var(--mp-muted);">Loading workspace status...</p>
+            </div>`;
+    }
+
+    private getSimpleRedirectHtml(title: string, message: string): string {
+        return `
+            <div class="mp-placeholder">
+                <h3>${this.escapeHtml(title)}</h3>
+                <p>${this.escapeHtml(message)}</p>
+            </div>`;
+    }
+
+    private buildShellHtml(): string {
+        const navItemsHtml = NAVIGATION_ITEMS.map((item) => {
+            const classes = ['mp-nav-item'];
+            if (item.id === this.activeViewId) { classes.push('active'); }
+            if (!item.enabled) { classes.push('disabled'); }
+            const badge = item.badge ? `<span class="badge">${this.escapeHtml(item.badge)}</span>` : '';
+            return `<div class="${classes.join(' ')}" data-view-id="${this.escapeHtml(item.id)}" onclick="navigate('${this.escapeHtml(item.id)}')">
+                <span class="icon">${this.escapeHtml(item.icon)}</span>
+                <span>${this.escapeHtml(item.label)}</span>
+                ${badge}
+            </div>`;
+        }).join('\n');
+
+        return `
+        <div class="mp-shell">
+            <nav class="mp-nav">
+                <div style="padding: 8px 12px; font-weight: bold; font-size: 13px; border-bottom: 1px solid var(--mp-border); margin-bottom: 4px;">
+                    MemoPilot
+                </div>
+                ${navItemsHtml}
+            </nav>
+            <main class="mp-content" id="mp-content">
+                ${this.getViewContentHtml(this.activeViewId)}
+            </main>
+        </div>`;
+    }
+
+    private buildExtraScript(): string {
+        return `<script nonce="REPLACED_BY_BASE">
+        window.handleMessage = function(msg) {
+            switch (msg.type) {
+                case 'workspace-status':
+                    renderWorkspaceStatus(msg.payload);
+                    break;
+                case 'active-view':
+                    setActiveNav(msg.payload.viewId);
+                    break;
+                case 'view-content':
+                    document.getElementById('mp-content').innerHTML = msg.payload.html;
+                    if (msg.payload.viewId === 'workspace-status') {
+                        postMsg('request-workspace-status');
+                    }
+                    break;
+                case 'navigation-items':
+                    break;
             }
+        };
+
+        function setActiveNav(viewId) {
+            document.querySelectorAll('.mp-nav-item').forEach(function(el) {
+                el.classList.toggle('active', el.dataset.viewId === viewId);
+            });
         }
 
-        const workspaceName = vscode.workspace.workspaceFolders?.[0]?.name ?? 'No workspace';
-
-        webview.html = `<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'nonce-${nonce}';">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>MemoPilot</title>
-    <style nonce="${nonce}">
-        body { font-family: var(--vscode-font-family); padding: 16px; color: var(--vscode-foreground); }
-        h1 { font-size: 1.4em; margin-bottom: 0.5em; }
-        .status { padding: 8px 12px; border-radius: 4px; margin: 8px 0; }
-        .status.ok { background: var(--vscode-testing-iconPassed); color: #fff; }
-        .status.error { background: var(--vscode-testing-iconFailed); color: #fff; }
-        .section { margin: 16px 0; padding: 12px; border: 1px solid var(--vscode-widget-border); border-radius: 4px; }
-        .section h2 { font-size: 1.1em; margin: 0 0 8px 0; }
-        .placeholder { color: var(--vscode-descriptionForeground); font-style: italic; }
-    </style>
-</head>
-<body>
-    <h1>MemoPilot</h1>
-    <p><strong>Workspace:</strong> ${this.escapeHtml(workspaceName)}</p>
-    ${statusHtml}
-    <div class="section">
-        <h2>Context Pack</h2>
-        <p class="placeholder">Context pack preview will appear here when a task is analyzed.</p>
-    </div>
-    <div class="section">
-        <h2>Rules & Skills</h2>
-        <p class="placeholder">Active rules and skills will be displayed after workspace indexing.</p>
-    </div>
-    <div class="section">
-        <h2>Cost Guard</h2>
-        <p class="placeholder">Cost estimation and model routing info will appear here.</p>
-    </div>
-    <div class="section">
-        <h2>Approval Controls</h2>
-        <p class="placeholder">Patch approval workflow will be available when patches are generated.</p>
-    </div>
-</body>
-</html>`;
-    }
-
-    private escapeHtml(text: string): string {
-        return text
-            .replace(/&/g, '&amp;')
-            .replace(/</g, '&lt;')
-            .replace(/>/g, '&gt;')
-            .replace(/"/g, '&quot;');
-    }
-
-    private dispose(): void {
-        MemoPilotPanel.currentPanel = undefined;
-        this.panel.dispose();
-        for (const d of this.disposables) {
-            d.dispose();
+        function renderWorkspaceStatus(status) {
+            var el = document.getElementById('status-content');
+            if (!el) return;
+            var dot = status.connected ? 'connected' : 'disconnected';
+            var statusText = status.connected
+                ? 'Connected — API v' + status.apiVersion + ', Schema v' + status.schemaVersion
+                : 'Backend unavailable';
+            var html = '<div class="mp-header" style="border: none; padding: 0; margin-bottom: 12px;">'
+                + '<span class="status-dot ' + dot + '"></span>'
+                + '<span class="status-text">' + statusText + '</span>'
+                + '</div>';
+            html += '<div class="info-row"><span class="info-label">Workspace</span><span class="info-value">' + escHtml(status.workspaceName) + '</span></div>';
+            html += '<div class="info-row"><span class="info-label">Root</span><span class="info-value" style="font-size:11px; word-break:break-all;">' + escHtml(status.workspaceRoot) + '</span></div>';
+            if (status.connected) {
+                html += '<div class="info-row"><span class="info-label">API Version</span><span class="info-value">' + status.apiVersion + '</span></div>';
+                html += '<div class="info-row"><span class="info-label">Schema Version</span><span class="info-value">' + status.schemaVersion + '</span></div>';
+                html += '<div class="info-row"><span class="info-label">Indexed</span><span class="info-value">' + (status.indexed ? 'Yes' : 'No') + '</span></div>';
+            }
+            if (status.indexingPhase === 'scanning' || status.indexingPhase === 'extracting') {
+                var pct = status.totalFiles > 0 ? Math.round((status.filesScanned / status.totalFiles) * 100) : 0;
+                html += '<div style="margin-top:12px;"><strong>Indexing: </strong>' + status.indexingPhase + ' (' + pct + '%)</div>';
+                html += '<div class="mp-progress"><div class="mp-progress-bar" style="width:' + pct + '%;"></div></div>';
+                html += '<div style="font-size:11px;color:var(--mp-muted);">' + status.filesScanned + ' / ' + status.totalFiles + ' files • ' + status.symbolsExtracted + ' symbols</div>';
+            }
+            if (!status.connected) {
+                html += '<div style="margin-top:12px;"><button onclick="postMsg(\\'restart-backend\\')" style="background:var(--mp-button-bg);color:var(--mp-button-fg);border:none;padding:6px 12px;border-radius:4px;cursor:pointer;">Restart Backend</button></div>';
+            }
+            el.innerHTML = html;
         }
-        this.disposables = [];
+
+        function escHtml(t) {
+            var d = document.createElement('div');
+            d.textContent = t || '';
+            return d.innerHTML;
+        }
+        </script>`;
     }
 }
+

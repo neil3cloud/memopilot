@@ -77,6 +77,152 @@ export interface TaskModesResponse {
     modes: string[];
 }
 
+export interface TaskAnalyzeRequest {
+    description: string;
+    constraints?: string[];
+    mode?: string | null;
+    notes?: string | null;
+}
+
+export interface TaskAnalyzeResponse {
+    intent_summary: string;
+    suggested_files: string[];
+    applicable_rules: string[];
+    estimated_complexity: string;
+    suggested_mode: string;
+}
+
+export interface ContextBuildRequest {
+    task_description: string;
+    suggested_files?: string[];
+    file_overrides?: string[];
+    mode?: string;
+}
+
+export interface ContextFileEntry {
+    path: string;
+    tokens: number;
+    content?: string;
+}
+
+export interface ContextBuildResponse {
+    files: ContextFileEntry[];
+    rules: string[];
+    skills: string[];
+    total_tokens: number;
+    estimated_cost_usd: number;
+}
+
+export interface ModelRouteRequest {
+    context_tokens: number;
+    task_type?: string;
+    privacy_level?: string;
+    preferred_model?: string;
+}
+
+export interface ModelChoice {
+    model_id: string;
+    provider: string;
+    cost_estimate_usd: number;
+    reasons: string[];
+    fits_context: boolean;
+}
+
+export interface ModelRouteResponse {
+    recommended: ModelChoice;
+    alternatives: ModelChoice[];
+    budget_check: { allowed: boolean; remaining_usd: number };
+}
+
+export interface GeneratePatchRequest {
+    task_description: string;
+    context_files?: string[];
+    mode?: string;
+    model_id?: string;
+    dry_run?: boolean;
+}
+
+export interface FilePatch {
+    path: string;
+    action: 'modify' | 'create' | 'delete';
+    original_content: string | null;
+    new_content: string | null;
+    diff: string;
+}
+
+export interface GeneratePatchResponse {
+    patches: FilePatch[];
+    total_files_changed: number;
+    summary: string;
+    estimated_risk: string;
+    model_used: string;
+    tokens_used: number;
+    cost_usd: number;
+}
+
+export interface ValidateRequest {
+    patches: Array<{ path: string; action: string; diff: string }>;
+    checks?: string[];
+}
+
+export interface ValidationCheck {
+    name: string;
+    status: 'pass' | 'fail' | 'warn' | 'skipped';
+    message: string;
+}
+
+export interface ValidateResponse {
+    overall_status: 'pass' | 'fail' | 'warn';
+    checks: ValidationCheck[];
+    can_apply: boolean;
+}
+
+export interface TaskHistoryEntry {
+    task_id: string;
+    description: string;
+    mode: string;
+    status: string;
+    model_used: string | null;
+    files_changed: number;
+    cost_usd: number;
+    created_at: string;
+    duration_ms: number;
+}
+
+export interface TaskHistoryResponse {
+    entries: TaskHistoryEntry[];
+    total_count: number;
+}
+
+export interface CostDashboardEntry {
+    date: string;
+    provider: string;
+    model: string;
+    calls: number;
+    tokens: number;
+    cost_usd: number;
+}
+
+export interface CostDashboardResponse {
+    period_days: number;
+    total_cost_usd: number;
+    total_calls: number;
+    total_tokens: number;
+    saved_usd: number;
+    by_day: CostDashboardEntry[];
+    by_model: CostDashboardEntry[];
+}
+
+export interface McpServer {
+    name: string;
+    status: string;
+    tools: string[];
+}
+
+export interface McpToolsResponse {
+    servers: McpServer[];
+}
+
 export interface AttachEvidenceResponse {
     evidence_id: string;
     source_type: string;
@@ -202,6 +348,29 @@ export interface SkillStoreListResponse {
     items: SkillStoreItemResponse[];
 }
 
+// --- Active Rules & Skills (merged view) ---
+
+export interface ActiveRuleItem {
+    rule_id: string;
+    text: string;
+    source_file: string;
+    enabled: boolean;
+    category: string;
+}
+
+export interface ActiveSkillItem {
+    skill_id: string;
+    name: string;
+    framework: string | null;
+    enabled: boolean;
+}
+
+export interface ActiveRulesResponse {
+    global_rules: ActiveRuleItem[];
+    project_rules: ActiveRuleItem[];
+    detected_skills: ActiveSkillItem[];
+}
+
 export interface BackupMemoryResponse {
     backup_id: string;
     backup_path: string;
@@ -225,6 +394,13 @@ export interface BudgetProfilesResponse {
     effective_budget_usd: number;
     multiplier: number;
     profiles: Record<string, number>;
+}
+
+export interface BudgetStatusResponse {
+    monthly_budget_usd: number;
+    spent_usd: number;
+    saved_usd: number;
+    remaining_usd: number;
 }
 
 export interface EvidenceClassifyResponse {
@@ -382,9 +558,54 @@ export class BackendClient {
         return result as PrivacyDashboardResponse;
     }
 
+    async getActiveRules(): Promise<ActiveRulesResponse> {
+        const result = await this.manager.request('GET', '/v1/rules/active');
+        return result as ActiveRulesResponse;
+    }
+
     async getTaskModes(): Promise<TaskModesResponse> {
         const result = await this.manager.request('GET', '/v1/task/modes');
         return result as TaskModesResponse;
+    }
+
+    async analyzeTask(request: TaskAnalyzeRequest): Promise<TaskAnalyzeResponse> {
+        const result = await this.manager.request('POST', '/v1/task/analyze', request);
+        return result as TaskAnalyzeResponse;
+    }
+
+    async buildContextPack(request: ContextBuildRequest): Promise<ContextBuildResponse> {
+        const result = await this.manager.request('POST', '/v1/context/build', request);
+        return result as ContextBuildResponse;
+    }
+
+    async routeModel(request: ModelRouteRequest): Promise<ModelRouteResponse> {
+        const result = await this.manager.request('POST', '/v1/model/route', request);
+        return result as ModelRouteResponse;
+    }
+
+    async generatePatch(request: GeneratePatchRequest): Promise<GeneratePatchResponse> {
+        const result = await this.manager.request('POST', '/v1/task/generate-patch', request);
+        return result as GeneratePatchResponse;
+    }
+
+    async validatePatches(request: ValidateRequest): Promise<ValidateResponse> {
+        const result = await this.manager.request('POST', '/v1/task/validate', request);
+        return result as ValidateResponse;
+    }
+
+    async getTaskHistory(limit = 20): Promise<TaskHistoryResponse> {
+        const result = await this.manager.request('GET', `/v1/task/history?limit=${limit}`);
+        return result as TaskHistoryResponse;
+    }
+
+    async getCostDashboard(days = 30): Promise<CostDashboardResponse> {
+        const result = await this.manager.request('GET', `/v1/cost/dashboard?days=${days}`);
+        return result as CostDashboardResponse;
+    }
+
+    async listMcpTools(): Promise<McpToolsResponse> {
+        const result = await this.manager.request('GET', '/v1/mcp/tools');
+        return result as McpToolsResponse;
     }
 
     async previewEvidenceColumns(evidencePath: string): Promise<EvidenceColumnsPreviewResponse> {
@@ -549,6 +770,11 @@ export class BackendClient {
     async getBudgetProfiles(): Promise<BudgetProfilesResponse> {
         const result = await this.manager.request('GET', '/v1/budget/profiles');
         return result as BudgetProfilesResponse;
+    }
+
+    async getBudgetStatus(): Promise<BudgetStatusResponse> {
+        const result = await this.manager.request('GET', '/v1/cost/budget/status');
+        return result as BudgetStatusResponse;
     }
 
     async setBudgetProfile(profile: string): Promise<BudgetProfilesResponse> {
