@@ -1,9 +1,11 @@
-"""Cost guard, budget tracking, and savings reporting services."""
+"""Cost guard, budget tracking, savings reporting, and budget profiles."""
 
 from __future__ import annotations
 
 import uuid
 from dataclasses import dataclass
+
+import yaml
 
 from .config import Config
 from .db import DatabaseManager
@@ -33,6 +35,15 @@ class SavingsReport:
     cache_savings_usd: float
     month_spend_usd: float
     month_net_usd: float
+
+
+@dataclass(frozen=True)
+class BudgetProfileResult:
+    active_profile: str
+    monthly_budget_usd: float
+    effective_budget_usd: float
+    multiplier: float
+    profiles: dict[str, float]
 
 
 class CostGuardService:
@@ -233,3 +244,57 @@ class CostGuardService:
             """,
             (uuid.uuid4().hex, entry_type, amount, source, reference_id),
         )
+
+    # ------------------------------------------------------------------
+    # Budget Profiles (v1.5)
+    # ------------------------------------------------------------------
+
+    async def get_budget_profiles(self) -> BudgetProfileResult:
+        active = self._active_budget_profile()
+        multiplier = self._profile_multipliers.get(active, 1.0)
+        monthly = max(self._config.monthly_budget_usd, 0.0)
+        return BudgetProfileResult(
+            active_profile=active,
+            monthly_budget_usd=monthly,
+            effective_budget_usd=round(monthly * multiplier, 4),
+            multiplier=multiplier,
+            profiles=self._profile_multipliers.copy(),
+        )
+
+    async def set_budget_profile(self, profile: str) -> BudgetProfileResult:
+        if profile not in self._profile_multipliers:
+            raise ValueError(f"Unknown profile: {profile}")
+        settings = self._read_workspace_settings()
+        budget = settings.get("budget")
+        if not isinstance(budget, dict):
+            budget = {}
+        budget["profile"] = profile
+        settings["budget"] = budget
+        budget_settings_path = self._config.memopilot_dir / "settings.yaml"
+        budget_settings_path.parent.mkdir(parents=True, exist_ok=True)
+        budget_settings_path.write_text(
+            yaml.safe_dump(settings, sort_keys=False),
+            encoding="utf-8",
+        )
+        self._config.budget_profile = profile
+        return await self.get_budget_profiles()
+
+    def _active_budget_profile(self) -> str:
+        settings = self._read_workspace_settings()
+        budget = settings.get("budget")
+        if isinstance(budget, dict):
+            profile = budget.get("profile")
+            if isinstance(profile, str) and profile in self._profile_multipliers:
+                return profile
+        if self._config.budget_profile in self._profile_multipliers:
+            return self._config.budget_profile
+        return "balanced"
+
+    def _read_workspace_settings(self) -> dict:
+        budget_settings_path = self._config.memopilot_dir / "settings.yaml"
+        if not budget_settings_path.exists():
+            return {}
+        loaded = yaml.safe_load(budget_settings_path.read_text(encoding="utf-8"))
+        if isinstance(loaded, dict):
+            return loaded
+        return {}

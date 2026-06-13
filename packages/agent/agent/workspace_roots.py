@@ -1,4 +1,4 @@
-"""Wave 4 services for multi-workspace root support."""
+"""Multi-workspace root management (v2 capability)."""
 
 from __future__ import annotations
 
@@ -18,7 +18,7 @@ class WorkspaceRootItem:
     active: bool
 
 
-class Wave4Service:
+class WorkspaceRootsService:
     """Tracks known workspace roots and active workspace selection."""
 
     def __init__(self, *, config: Config, db: DatabaseManager) -> None:

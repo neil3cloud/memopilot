@@ -12,8 +12,10 @@ from pathlib import Path
 from typing import Any
 
 WRITE_SQL_PATTERN = re.compile(
-    r"^\s*(insert|update|delete|drop|alter|create|replace|truncate|attach|vacuum|reindex)\b",
-    re.IGNORECASE,
+    r"^\s*(?:/\*.*?\*/\s*)*(insert|update|delete|drop|alter|create|replace|truncate|attach|vacuum|reindex)\b"
+    r"|"
+    r"\bWITH\b.*\b(insert|update|delete)\b",
+    re.IGNORECASE | re.DOTALL,
 )
 
 
@@ -79,6 +81,7 @@ class CredentialRedactor:
                 capture_output=True,
                 text=True,
                 check=False,
+                timeout=10,
             )
             if result.returncode != 0:
                 raise RuntimeError(result.stderr.strip() or result.stdout.strip())
