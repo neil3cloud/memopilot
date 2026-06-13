@@ -31,6 +31,7 @@ class MemoryManagerService:
     def __init__(self, *, db: DatabaseManager) -> None:
         self._db = db
 
+    # Allowed filter names mapped to safe WHERE clauses (no user input interpolated)
     _FILTER_CLAUSES: dict[str, str] = {
         "all": "1=1",
         "rules": "type = 'rule'",
@@ -39,9 +40,8 @@ class MemoryManagerService:
         "stale": "stale = 1",
         "pending_approval": (
             "trust_level IN (4, 5) AND ("
-            " json_extract(tags_json, '$.pending_approval') = 1"
-            " OR json_extract(tags_json, '$.pending_approval') = true"
-            ")"
+            "json_extract(tags_json, '$.pending_approval') = 1"
+            " OR json_extract(tags_json, '$.pending_approval') = true)"
         ),
     }
 
@@ -50,7 +50,10 @@ class MemoryManagerService:
 
         where_clause = self._FILTER_CLAUSES.get(filter_name)
         if where_clause is None:
-            raise ValueError(f"Unknown filter: {filter_name}")
+            raise ValueError(
+                f"Invalid filter_name '{filter_name}'. "
+                f"Allowed: {', '.join(self._FILTER_CLAUSES.keys())}"
+            )
 
         cursor = await conn.execute(
             f"""

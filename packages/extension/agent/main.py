@@ -6,21 +6,85 @@ Writes the assigned port and PID to <workspace>/.memopilot/agent.lock.
 
 from __future__ import annotations
 
+import importlib.util
 import json
 import logging
 import os
 import signal
+import subprocess
 import sys
 from pathlib import Path
 
-import uvicorn
-
-from .api import app, configure
-from .config import load_config
-from .db import DatabaseManager
-from .logger import setup_logging
-
 logger = logging.getLogger(__name__)
+
+_RUNTIME_DEPENDENCIES: tuple[tuple[str, str], ...] = (
+    ("uvicorn", "uvicorn[standard]>=0.27.0"),
+    ("fastapi", "fastapi>=0.109.0"),
+    ("pydantic", "pydantic>=2.5.0"),
+    ("aiosqlite", "aiosqlite>=0.19.0"),
+    ("detect_secrets", "detect-secrets>=1.5.0"),
+    ("openpyxl", "openpyxl>=3.1.5"),
+    ("pdfplumber", "pdfplumber>=0.11.4"),
+    ("yaml", "pyyaml>=6.0"),
+    ("PIL", "pillow>=11.0.0"),
+    ("docx", "python-docx>=1.1.2"),
+    ("pptx", "python-pptx>=1.0.2"),
+)
+
+
+def ensure_runtime_dependencies() -> None:
+    """Install missing runtime dependencies into the selected interpreter."""
+    missing = [
+        module_name
+        for module_name, _package_name in _RUNTIME_DEPENDENCIES
+        if importlib.util.find_spec(module_name) is None
+    ]
+    if not missing:
+        return
+
+    packages = [
+        package_name
+        for module_name, package_name in _RUNTIME_DEPENDENCIES
+        if module_name in missing
+    ]
+    _ensure_pip_available()
+    install = subprocess.run(
+        [sys.executable, "-m", "pip", "install", "--disable-pip-version-check", *packages],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if install.returncode != 0:
+        raise RuntimeError(
+            "Failed to install backend dependencies:\n"
+            f"{(install.stderr or install.stdout).strip()}"
+        )
+
+
+def _ensure_pip_available() -> None:
+    check = subprocess.run(
+        [sys.executable, "-m", "pip", "--version"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if check.returncode == 0:
+        return
+    output = (check.stderr or check.stdout).strip()
+    if "No module named pip" not in output:
+        raise RuntimeError(f"Failed to verify pip availability:\n{output}")
+
+    ensure = subprocess.run(
+        [sys.executable, "-m", "ensurepip", "--upgrade"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if ensure.returncode != 0:
+        raise RuntimeError(
+            "Failed to bootstrap pip with ensurepip:\n"
+            f"{(ensure.stderr or ensure.stdout).strip()}"
+        )
 
 
 def write_lockfile(lock_path: Path, port: int, pid: int) -> None:
@@ -39,31 +103,37 @@ def cleanup_lockfile(lock_path: Path) -> None:
         pass
 
 
-class LockfileServer(uvicorn.Server):
-    """Custom uvicorn server that writes lockfile after binding."""
-
-    def __init__(self, config: uvicorn.Config, lock_path: Path) -> None:
-        super().__init__(config)
-        self.lock_path = lock_path
-
-    async def startup(self, sockets=None) -> None:
-        await super().startup(sockets)
-        # After startup, extract the bound port
-        if self.servers:
-            for server in self.servers:
-                socks = server.sockets
-                if socks:
-                    addr = socks[0].getsockname()
-                    port = addr[1]
-                    write_lockfile(self.lock_path, port, os.getpid())
-                    logger.info(f"Backend listening on 127.0.0.1:{port}")
-                    # Also print to stdout for debugging
-                    print(f"MemoPilot backend started on port {port}", flush=True)
-                    break
-
-
 def main() -> None:
     """Main entry point for the MemoPilot agent backend."""
+    ensure_runtime_dependencies()
+
+    import uvicorn
+
+    from .api import app, configure
+    from .config import load_config
+    from .db import DatabaseManager
+    from .logger import setup_logging
+
+    class LockfileServer(uvicorn.Server):
+        """Custom uvicorn server that writes lockfile after binding."""
+
+        def __init__(self, config: uvicorn.Config, lock_path: Path) -> None:
+            super().__init__(config)
+            self.lock_path = lock_path
+
+        async def startup(self, sockets=None) -> None:
+            await super().startup(sockets)
+            if self.servers:
+                for server in self.servers:
+                    socks = server.sockets
+                    if socks:
+                        addr = socks[0].getsockname()
+                        port = addr[1]
+                        write_lockfile(self.lock_path, port, os.getpid())
+                        logger.info(f"Backend listening on 127.0.0.1:{port}")
+                        print(f"MemoPilot backend started on port {port}", flush=True)
+                        break
+
     # Load configuration
     config = load_config()
 
@@ -101,6 +171,7 @@ def main() -> None:
 
     try:
         import asyncio
+
         asyncio.run(server.serve())
     finally:
         cleanup_lockfile(lock_path)

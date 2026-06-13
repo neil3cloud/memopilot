@@ -25,6 +25,9 @@ export class BackendManager {
         if (!this.port) {
             throw new Error('Backend not started');
         }
+        // Security invariant: HMAC token is transmitted over plaintext HTTP, which is
+        // acceptable ONLY because the backend binds exclusively to 127.0.0.1.
+        // If binding changes to 0.0.0.0 or a remote host, HTTPS MUST be enforced.
         return `http://127.0.0.1:${this.port}`;
     }
 

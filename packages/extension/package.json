@@ -5,6 +5,7 @@
   "version": "0.1.0",
   "publisher": "memopilot",
   "license": "MIT",
+  "icon": "resources/marketplace-icon.png",
   "repository": {
     "type": "git",
     "url": "https://github.com/neil3cloud/memopilot.git"
