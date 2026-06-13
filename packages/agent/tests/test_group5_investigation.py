@@ -22,11 +22,19 @@ async def test_evidence_source_classification_and_trust_levels(
     await client.post("/v1/workspace/init", headers=headers)
 
     fixtures = [
-        ("notes.md", "# title\nInvestigation note", "markdown_doc", 2),
-        ("trace.log", "timeout error", "text_log", 3),
+        ("notes.md", "# title\nInvestigation note", "markdown_doc", 4),
+        (
+            "trace.log",
+            "Traceback (most recent call last):\n  File \"main.py\", line 1, in <module>\nValueError: boom",
+            "stack_trace",
+            4,
+        ),
+        ("incident.txt", "timeout error without stack frames", "text_log", 3),
         ("metrics.csv", "name,value\nlatency,12", "csv_data", 3),
         ("payload.json", '{"error":"invalid_token"}', "api_payload", 3),
-        ("specs.xlsx", None, "excel_sheet", 3),
+        ("schema.sql", "CREATE TABLE users(id INTEGER);", "database_schema", 4),
+        ("service.py", "def run():\n    return None\n", "existing_code", 5),
+        ("specs.xlsx", None, "spreadsheet", 3),
         ("requirements.docx", None, "word_doc", 3),
         ("slides.pptx", None, "powerpoint_doc", 3),
         ("screenshot.png", None, "screenshot", 4),
@@ -201,7 +209,7 @@ async def test_excel_preview_and_mapping_extracts_test_cases(
     )
     assert preview.status_code == 200
     preview_payload = preview.json()
-    assert preview_payload["source_type"] == "excel_sheet"
+    assert preview_payload["source_type"] == "spreadsheet"
     assert "Case Title" in preview_payload["columns"]
     assert preview_payload["requires_confirmation"] is True
 
@@ -219,7 +227,7 @@ async def test_excel_preview_and_mapping_extracts_test_cases(
     )
     assert attached.status_code == 200
     body = attached.json()
-    assert body["source_type"] == "excel_sheet"
+    assert body["source_type"] == "spreadsheet"
     assert any("Test case:" in finding for finding in body["findings"])
     assert any("Data dictionary:" in finding for finding in body["findings"])
 
@@ -282,3 +290,73 @@ async def test_image_analysis_extracts_metadata(
     assert body["trust_level"] == 4
     assert body["extraction_status"] in {"metadata_only", "ok"}
     assert any("Image analysis: 800x600" in finding for finding in body["findings"])
+
+
+@pytest.mark.asyncio
+async def test_investigation_session_endpoints_manage_evidence(
+    client: AsyncClient,
+    test_token: str,
+    tmp_workspace,
+):
+    headers = {"X-Agent-Token": test_token}
+    await client.post("/v1/workspace/init", headers=headers)
+
+    evidence = tmp_workspace / "investigation-notes.txt"
+    evidence.write_text("login retry timeout observed", encoding="utf-8")
+
+    started = await client.post(
+        "/v1/investigation/start",
+        headers=headers,
+        json={"title": "Retry timeout", "description": "Investigate login retries"},
+    )
+    assert started.status_code == 200
+    session = started.json()
+    session_id = session["id"]
+    assert session["status"] == "open"
+    assert session["evidence_count"] == 0
+
+    fetched = await client.get(f"/v1/investigation/{session_id}", headers=headers)
+    assert fetched.status_code == 200
+    assert fetched.json()["id"] == session_id
+
+    attached = await client.post(
+        f"/v1/investigation/{session_id}/evidence",
+        headers=headers,
+        json={"evidence_path": str(evidence)},
+    )
+    assert attached.status_code == 200
+    attached_body = attached.json()
+    evidence_id = attached_body["evidence_id"]
+    assert attached_body["investigation_session_id"] == session_id
+
+    board = await client.get(
+        "/v1/investigation/evidence",
+        headers=headers,
+        params={"investigation_session_id": session_id},
+    )
+    assert board.status_code == 200
+    assert board.json()["items"][0]["evidence_id"] == evidence_id
+
+    with_evidence = await client.get(f"/v1/investigation/{session_id}", headers=headers)
+    assert with_evidence.status_code == 200
+    with_evidence_body = with_evidence.json()
+    assert with_evidence_body["evidence_count"] == 1
+    assert with_evidence_body["evidence"][0]["evidence_id"] == evidence_id
+
+    transitioned = await client.post(
+        f"/v1/investigation/{session_id}/transition-to-patch",
+        headers=headers,
+    )
+    assert transitioned.status_code == 200
+    assert transitioned.json()["status"] == "patch_generated"
+
+    deleted = await client.delete(
+        f"/v1/investigation/{session_id}/evidence/{evidence_id}",
+        headers=headers,
+    )
+    assert deleted.status_code == 200
+    assert deleted.json() == {"evidence_id": evidence_id, "removed": True}
+
+    after_delete = await client.get(f"/v1/investigation/{session_id}", headers=headers)
+    assert after_delete.status_code == 200
+    assert after_delete.json()["evidence_count"] == 0

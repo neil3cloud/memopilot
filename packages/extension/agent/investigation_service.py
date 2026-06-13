@@ -7,16 +7,17 @@ import importlib.util
 import json
 import re
 import uuid
-from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+import aiosqlite
 import openpyxl
 import pdfplumber
 from docx import Document
 from PIL import Image, UnidentifiedImageError
 from pptx import Presentation
+from pydantic import BaseModel, Field
 
 from .config import Config
 from .db import DatabaseManager
@@ -27,20 +28,19 @@ from .workspace_roots import WorkspaceRootsService
 MAX_EVIDENCE_FILE_SIZE_BYTES = 10 * 1024 * 1024
 
 
-@dataclass(frozen=True)
-class AttachedEvidence:
+class AttachedEvidence(BaseModel):
     evidence_id: str
     source_type: str
     trust_level: int
     extraction_method: str
     extraction_status: str
-    findings: list[str]
+    findings: list[str] = Field(default_factory=list)
     redacted_values: int
     source_path: str | None
+    investigation_session_id: str | None = None
 
 
-@dataclass(frozen=True)
-class EvidenceBoardEntry:
+class EvidenceBoardEntry(BaseModel):
     evidence_id: str
     source_type: str
     source_path: str | None
@@ -49,25 +49,48 @@ class EvidenceBoardEntry:
     extraction_method: str
     extraction_status: str
     redacted_values: int
-    findings: list[str]
+    findings: list[str] = Field(default_factory=list)
+    investigation_session_id: str | None = None
 
 
-@dataclass(frozen=True)
-class EvidenceColumnsPreview:
+class EvidenceColumnsPreview(BaseModel):
     source_type: str
     columns: list[str]
     suggested_mapping: dict[str, str]
     requires_confirmation: bool
 
 
-@dataclass(frozen=True)
-class InvestigationResult:
+class InvestigationResult(BaseModel):
     context_pack: str
     context_pack_path: str
     impacted_files: list[str]
     related_tests: list[str]
     missing_test_coverage: list[str]
     evidence_count: int
+
+
+class InvestigationSessionCreate(BaseModel):
+    title: str
+    description: str = ""
+    mode: str = "investigation"
+
+
+class InvestigationSession(BaseModel):
+    id: str
+    title: str
+    description: str | None = None
+    mode: str
+    status: str
+    workspace_root: str
+    created_at: str
+    updated_at: str
+    evidence_count: int = 0
+    evidence: list[EvidenceBoardEntry] = Field(default_factory=list)
+
+
+class RemovedEvidence(BaseModel):
+    evidence_id: str
+    removed: bool = True
 
 
 class InvestigationService:
@@ -79,8 +102,15 @@ class InvestigationService:
         self._redactor = CredentialRedactor()
         self._classifier = EvidenceSourceClassifier()
 
-    async def preview_columns(self, *, evidence_path: str) -> EvidenceColumnsPreview:
-        resolved_path = await self._resolve_evidence_path(evidence_path)
+    async def preview_columns(
+        self,
+        *,
+        evidence_path: str,
+        workspace_root: str | None = None,
+    ) -> EvidenceColumnsPreview:
+        resolved_path = await self._resolve_evidence_path(
+            evidence_path, workspace_root=workspace_root
+        )
         source_type = self._classifier.classify(
             evidence_path=resolved_path,
             source_url=None,
@@ -95,7 +125,7 @@ class InvestigationService:
                 suggested_mapping=mapping,
                 requires_confirmation=True,
             )
-        if source_type == "excel_sheet":
+        if source_type == "spreadsheet":
             headers, _rows, _sheet = self._extract_excel_rows(resolved_path)
             mapping = self._suggest_column_mapping(headers)
             return EvidenceColumnsPreview(
@@ -112,18 +142,87 @@ class InvestigationService:
             requires_confirmation=False,
         )
 
+    async def start_session(
+        self,
+        *,
+        title: str,
+        description: str = "",
+        mode: str = "investigation",
+        workspace_root: str | None = None,
+    ) -> InvestigationSession:
+        clean_title = title.strip()
+        if not clean_title:
+            raise ValueError("Investigation title is required")
+        clean_mode = mode.strip() if mode and mode.strip() else "investigation"
+        workspace_service = WorkspaceRootsService(config=self._config, db=self._db)
+        workspace_root = str(await workspace_service.resolve_workspace_root(workspace_root))
+        session_id = uuid.uuid4().hex
+        conn = await self._db.connect()
+        await conn.execute(
+            """
+            INSERT INTO investigation_sessions
+            (
+                id,
+                title,
+                description,
+                mode,
+                status,
+                workspace_root,
+                created_at,
+                updated_at
+            )
+            VALUES (?, ?, ?, ?, 'open', ?, datetime('now'), datetime('now'))
+            """,
+            (session_id, clean_title, description.strip(), clean_mode, workspace_root),
+        )
+        await conn.commit()
+        return await self.get_session(session_id=session_id, conn=conn)
+
+    async def get_session(
+        self,
+        *,
+        session_id: str,
+        conn: aiosqlite.Connection | None = None,
+    ) -> InvestigationSession:
+        connection = conn or await self._db.connect()
+        row = await self._fetch_session_row(connection, session_id=session_id)
+        if row is None:
+            raise ValueError(f"Investigation session not found: {session_id}")
+        evidence = await self.list_evidence_board(
+            investigation_session_id=session_id,
+            task_run_id=None,
+            workspace_root=str(row["workspace_root"]),
+            conn=connection,
+        )
+        return self._build_session(row, evidence)
+
     async def attach_evidence(
         self,
         *,
         evidence_path: str | None,
         source_url: str | None,
         task_run_id: str | None,
-        column_mapping: dict[str, str] | None,
+        investigation_session_id: str | None = None,
+        column_mapping: dict[str, str] | None = None,
+        workspace_root: str | None = None,
     ) -> AttachedEvidence:
-        resolved_path = await self._resolve_evidence_path(evidence_path) if evidence_path else None
+        conn = await self._db.connect()
+        session_root: str | None = None
+        if investigation_session_id is not None:
+            session_row = await self._require_session(conn, session_id=investigation_session_id)
+            session_root = str(session_row["workspace_root"])
+        effective_workspace_root = workspace_root or session_root
+        resolved_path = (
+            await self._resolve_evidence_path(
+                evidence_path, workspace_root=effective_workspace_root
+            )
+            if evidence_path
+            else None
+        )
         classification = self._classifier.classify(
             evidence_path=resolved_path,
             source_url=source_url,
+            content_preview=self._read_content_preview(resolved_path),
         )
         source_type = classification.source_type
         extraction_method = classification.extraction_method
@@ -140,26 +239,28 @@ class InvestigationService:
         redacted_findings, redacted_values = self._redact_findings(findings)
 
         evidence_id = uuid.uuid4().hex
-        conn = await self._db.connect()
         await conn.execute(
             """
             INSERT INTO evidence_sources
             (
                 id,
                 task_run_id,
+                investigation_session_id,
                 source_type,
                 source_path,
                 source_url,
                 trust_level,
                 extraction_method,
                 extracted_findings_json,
-                approved
+                approved,
+                workspace_root
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?)
             """,
             (
                 evidence_id,
                 task_run_id,
+                investigation_session_id,
                 source_type,
                 str(resolved_path) if resolved_path else None,
                 source_url,
@@ -172,6 +273,7 @@ class InvestigationService:
                         "redacted_values": redacted_values,
                     }
                 ),
+                effective_workspace_root,
             ),
         )
         await conn.commit()
@@ -185,33 +287,90 @@ class InvestigationService:
             findings=redacted_findings,
             redacted_values=redacted_values,
             source_path=str(resolved_path) if resolved_path else None,
+            investigation_session_id=investigation_session_id,
         )
 
-    async def list_evidence_board(self, *, task_run_id: str | None) -> list[EvidenceBoardEntry]:
+    async def remove_evidence(
+        self,
+        *,
+        session_id: str,
+        evidence_id: str,
+    ) -> RemovedEvidence:
         conn = await self._db.connect()
+        await self._require_session(conn, session_id=session_id)
+        cursor = await conn.execute(
+            """
+            SELECT id
+            FROM evidence_sources
+            WHERE id = ? AND investigation_session_id = ?
+            LIMIT 1
+            """,
+            (evidence_id, session_id),
+        )
+        row = await cursor.fetchone()
+        if row is None:
+            raise ValueError(f"Evidence not found for investigation session: {evidence_id}")
+        await conn.execute(
+            "DELETE FROM evidence_sources WHERE id = ? AND investigation_session_id = ?",
+            (evidence_id, session_id),
+        )
+        await conn.commit()
+        return RemovedEvidence(evidence_id=evidence_id)
+
+    async def transition_to_patch(self, *, session_id: str) -> InvestigationSession:
+        conn = await self._db.connect()
+        await self._require_session(conn, session_id=session_id)
+        await conn.execute(
+            """
+            UPDATE investigation_sessions
+            SET status = 'patch_generated', updated_at = datetime('now')
+            WHERE id = ?
+            """,
+            (session_id,),
+        )
+        await conn.commit()
+        return await self.get_session(session_id=session_id, conn=conn)
+
+    async def list_evidence_board(
+        self,
+        *,
+        task_run_id: str | None,
+        investigation_session_id: str | None = None,
+        workspace_root: str | None = None,
+        conn: aiosqlite.Connection | None = None,
+    ) -> list[EvidenceBoardEntry]:
+        connection = conn or await self._db.connect()
+        params: list[str] = []
+        where_clauses: list[str] = []
+        if investigation_session_id:
+            where_clauses.append("investigation_session_id = ?")
+            params.append(investigation_session_id)
         if task_run_id:
-            cursor = await conn.execute(
-                """
-                SELECT
-                    id, source_type, source_path, source_url,
-                    trust_level, extraction_method, extracted_findings_json
-                FROM evidence_sources
-                WHERE task_run_id = ?
-                ORDER BY created_at DESC
-                """,
-                (task_run_id,),
-            )
-        else:
-            cursor = await conn.execute(
-                """
-                SELECT
-                    id, source_type, source_path, source_url,
-                    trust_level, extraction_method, extracted_findings_json
-                FROM evidence_sources
-                ORDER BY created_at DESC
-                LIMIT 100
-                """
-            )
+            where_clauses.append("task_run_id = ?")
+            params.append(task_run_id)
+        if workspace_root:
+            where_clauses.append("COALESCE(workspace_root, ?) = ?")
+            params.extend([workspace_root, workspace_root])
+
+        query = """
+            SELECT
+                id,
+                investigation_session_id,
+                source_type,
+                source_path,
+                source_url,
+                trust_level,
+                extraction_method,
+                extracted_findings_json
+            FROM evidence_sources
+        """
+        if where_clauses:
+            query += " WHERE " + " AND ".join(where_clauses)
+        query += " ORDER BY created_at DESC"
+        if not where_clauses:
+            query += " LIMIT 100"
+
+        cursor = await connection.execute(query, tuple(params))
         rows = await cursor.fetchall()
         return [
             EvidenceBoardEntry(
@@ -227,6 +386,7 @@ class InvestigationService:
                 ),
                 redacted_values=self._parse_redacted_values(row["extracted_findings_json"]),
                 findings=self._parse_findings(row["extracted_findings_json"]),
+                investigation_session_id=row["investigation_session_id"],
             )
             for row in rows
         ]
@@ -238,8 +398,12 @@ class InvestigationService:
         description: str,
         acceptance_criteria: list[str],
         task_run_id: str | None,
+        workspace_root: str | None = None,
     ) -> InvestigationResult:
-        evidence_entries = await self.list_evidence_board(task_run_id=task_run_id)
+        evidence_entries = await self.list_evidence_board(
+            task_run_id=task_run_id,
+            workspace_root=workspace_root,
+        )
         combined_findings = [finding for entry in evidence_entries for finding in entry.findings]
         impacted_files = await self._discover_impacted_files(combined_findings)
         related_tests = await self._discover_related_tests(impacted_files)
@@ -266,15 +430,76 @@ class InvestigationService:
             evidence_count=len(evidence_entries),
         )
 
-    async def _resolve_evidence_path(self, evidence_path: str) -> Path:
+    async def _fetch_session_row(
+        self,
+        conn: aiosqlite.Connection,
+        *,
+        session_id: str,
+    ) -> aiosqlite.Row | None:
+        cursor = await conn.execute(
+            """
+            SELECT
+                id,
+                title,
+                description,
+                mode,
+                status,
+                workspace_root,
+                created_at,
+                updated_at
+            FROM investigation_sessions
+            WHERE id = ?
+            LIMIT 1
+            """,
+            (session_id,),
+        )
+        return await cursor.fetchone()
+
+    async def _require_session(
+        self,
+        conn: aiosqlite.Connection,
+        *,
+        session_id: str,
+    ) -> aiosqlite.Row:
+        row = await self._fetch_session_row(conn, session_id=session_id)
+        if row is None:
+            raise ValueError(f"Investigation session not found: {session_id}")
+        return row
+
+    def _build_session(
+        self,
+        row: aiosqlite.Row,
+        evidence: list[EvidenceBoardEntry],
+    ) -> InvestigationSession:
+        return InvestigationSession(
+            id=row["id"],
+            title=row["title"],
+            description=row["description"],
+            mode=row["mode"],
+            status=row["status"],
+            workspace_root=row["workspace_root"],
+            created_at=row["created_at"],
+            updated_at=row["updated_at"],
+            evidence_count=len(evidence),
+            evidence=evidence,
+        )
+
+    async def _resolve_evidence_path(
+        self,
+        evidence_path: str,
+        *,
+        workspace_root: str | None = None,
+    ) -> Path:
         candidate = Path(evidence_path)
         workspace_service = WorkspaceRootsService(config=self._config, db=self._db)
-        allowed_roots = await workspace_service.allowed_workspace_paths()
+        scoped_root = await workspace_service.resolve_workspace_root(workspace_root)
+        allowed_roots = (
+            [scoped_root] if workspace_root else await workspace_service.allowed_workspace_paths()
+        )
         if not candidate.is_absolute():
             if self._contains_parent_reference(candidate):
                 raise ValueError("Evidence path must not traverse parent directories")
-            active_root = await workspace_service.active_workspace_path()
-            candidate = active_root / candidate
+            candidate = scoped_root / candidate
         if not any(self._is_within_workspace(candidate, root) for root in allowed_roots):
             raise ValueError("Evidence path must be within a configured workspace root")
         if candidate.is_symlink():
@@ -294,9 +519,11 @@ class InvestigationService:
         column_mapping: dict[str, str],
     ) -> tuple[list[str], str, bool]:
         if source_type == "external_work_item":
-            return [
-                "External work item attached. Fetch details via MCP in future iterations."
-            ], "ok", False
+            return (
+                ["External work item attached. Fetch details via MCP in future iterations."],
+                "ok",
+                False,
+            )
         if evidence_path is None:
             return ["No file evidence provided."], "ok", False
         # Guard against excessively large files (10 MB limit)
@@ -306,29 +533,36 @@ class InvestigationService:
             raise ValueError(f"Cannot access evidence file: {exc}") from exc
         if file_size > MAX_EVIDENCE_FILE_SIZE_BYTES:
             raise ValueError(
-                "Evidence file too large "
-                f"({file_size} bytes, max {MAX_EVIDENCE_FILE_SIZE_BYTES})"
+                f"Evidence file too large ({file_size} bytes, max {MAX_EVIDENCE_FILE_SIZE_BYTES})"
             )
         if source_type in {"image", "screenshot"}:
             return self._extract_image_findings(evidence_path, source_type)
         if source_type == "csv_data":
             headers, rows = self._extract_csv_rows(evidence_path)
             mapping = self._normalize_column_mapping(column_mapping, headers)
-            return self._build_tabular_findings(
-                source_label=f"CSV:{evidence_path.name}",
-                headers=headers,
-                rows=rows,
-                mapping=mapping,
-            ), "ok", False
-        if source_type == "excel_sheet":
+            return (
+                self._build_tabular_findings(
+                    source_label=f"CSV:{evidence_path.name}",
+                    headers=headers,
+                    rows=rows,
+                    mapping=mapping,
+                ),
+                "ok",
+                False,
+            )
+        if source_type == "spreadsheet":
             headers, rows, sheet_name = self._extract_excel_rows(evidence_path)
             mapping = self._normalize_column_mapping(column_mapping, headers)
-            return self._build_tabular_findings(
-                source_label=f"Excel:{evidence_path.name}:{sheet_name}",
-                headers=headers,
-                rows=rows,
-                mapping=mapping,
-            ), "ok", False
+            return (
+                self._build_tabular_findings(
+                    source_label=f"Excel:{evidence_path.name}:{sheet_name}",
+                    headers=headers,
+                    rows=rows,
+                    mapping=mapping,
+                ),
+                "ok",
+                False,
+            )
         if source_type == "pdf_doc":
             return self._extract_pdf_findings(evidence_path)
         if source_type == "word_doc":
@@ -342,6 +576,15 @@ class InvestigationService:
             raise ValueError(f"Cannot read evidence file: {exc}") from exc
         lines = [line.strip() for line in text.splitlines() if line.strip()]
         return lines[:30], "ok", False
+
+    def _read_content_preview(self, evidence_path: Path | None) -> str | None:
+        if evidence_path is None:
+            return None
+        try:
+            with evidence_path.open("rb") as handle:
+                return handle.read(8192).decode("utf-8", errors="replace")
+        except OSError:
+            return None
 
     def _extract_image_findings(
         self,
@@ -375,9 +618,11 @@ class InvestigationService:
                 findings.append("OCR unavailable; retained metadata-based image analysis.")
                 return findings, "metadata_only", False
         except UnidentifiedImageError:
-            return [
-                f"Image file could not be decoded: {evidence_path.name}"
-            ], "unreadable_image", False
+            return (
+                [f"Image file could not be decoded: {evidence_path.name}"],
+                "unreadable_image",
+                False,
+            )
 
     def _image_metadata(self, image: Image.Image) -> list[str]:
         keys = [str(key) for key in image.getexif().keys()][:8]
@@ -454,17 +699,17 @@ class InvestigationService:
                 if len(findings) >= 60:
                     break
         if not saw_text:
-            return [
-                "Scanned PDF detected. OCR is required before reliable extraction."
-            ], "requires_ocr", True
+            return (
+                ["Scanned PDF detected. OCR is required before reliable extraction."],
+                "requires_ocr",
+                True,
+            )
         return findings[:60], "ok", False
 
     def _extract_word_findings(self, evidence_path: Path) -> list[str]:
         document = Document(evidence_path)
         findings = [
-            paragraph.text.strip()
-            for paragraph in document.paragraphs
-            if paragraph.text.strip()
+            paragraph.text.strip() for paragraph in document.paragraphs if paragraph.text.strip()
         ]
         if not findings:
             return [f"Word document contains no readable paragraph text: {evidence_path.name}"]
@@ -598,9 +843,7 @@ class InvestigationService:
             return []
 
         conn = await self._db.connect()
-        file_cursor = await conn.execute(
-            "SELECT file_path FROM file_index LIMIT 10000"
-        )
+        file_cursor = await conn.execute("SELECT file_path FROM file_index LIMIT 10000")
         symbol_cursor = await conn.execute(
             "SELECT DISTINCT file_path, name FROM symbols LIMIT 10000"
         )
@@ -714,8 +957,7 @@ class InvestigationService:
             for entry in evidence_entries
         ] or ["- none"]
         findings_lines = [
-            "- "
-            f"[{entry.source_type}:{entry.source_path or entry.source_url or 'n/a'}] {finding}"
+            f"- [{entry.source_type}:{entry.source_path or entry.source_url or 'n/a'}] {finding}"
             for entry in evidence_entries
             for finding in entry.findings
         ] or ["- none"]

@@ -16,8 +16,7 @@ async def test_migrations_apply_on_fresh_db():
 
     version = await run_migrations(conn)
 
-    # Should have applied at least version 1
-    assert version >= 1
+    assert version == 9
 
     # Verify core tables exist
     cursor = await conn.execute(
@@ -51,6 +50,12 @@ async def test_migrations_apply_on_fresh_db():
         "local_flows",
         "local_flow_runs",
         "workspace_roots",
+        "memory_relations",
+        "retention_config",
+        "recall_traces",
+        "audit_events",
+        "memory_artifacts",
+        "investigation_sessions",
     ]
 
     for table in expected_tables:
@@ -99,6 +104,6 @@ async def test_schema_version_table_populated():
     cursor = await conn.execute("SELECT version FROM schema_version")
     row = await cursor.fetchone()
     assert row is not None
-    assert row[0] == 1
+    assert row[0] == 9
 
     await conn.close()

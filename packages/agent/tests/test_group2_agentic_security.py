@@ -2,8 +2,12 @@
 
 from __future__ import annotations
 
+from unittest.mock import patch
+
 import pytest
 from httpx import AsyncClient
+
+from agent.config import load_config
 
 
 @pytest.mark.asyncio
@@ -94,3 +98,136 @@ async def test_agentic_loop_caps_iterations_and_records_blocked_calls(
     )
     count_row = await cursor.fetchone()
     assert count_row["total"] == 5
+
+
+@pytest.mark.asyncio
+async def test_agentic_loop_uses_pre_fetch_context_cap(
+    client: AsyncClient,
+    test_token: str,
+    test_db,
+    test_config,
+):
+    test_config.mcp_cap_pre_fetch = 8
+    headers = {"X-Agent-Token": test_token}
+    await client.post("/v1/workspace/init", headers=headers)
+
+    task_run = await client.post(
+        "/v1/task-runs/start",
+        headers=headers,
+        json={"user_request": "Run MCP pre-fetch workflow"},
+    )
+    task_run_id = task_run.json()["task_run_id"]
+
+    run_response = await client.post(
+        "/v1/mcp/agentic/run",
+        headers=headers,
+        json={
+            "task_run_id": task_run_id,
+            "server_name": "local-mcp",
+            "context": "pre_fetch",
+            "max_iterations": 10,
+            "tool_calls": [
+                {"tool_name": f"tool-{idx}", "input_data": {"text": f"value-{idx}"}}
+                for idx in range(9)
+            ],
+        },
+    )
+
+    assert run_response.status_code == 200
+    payload = run_response.json()
+    assert payload["requested_iterations"] == 9
+    assert payload["executed_iterations"] == 8
+    assert payload["capped_at"] == 8
+
+    conn = test_db.connection
+    assert conn is not None
+    cursor = await conn.execute(
+        "SELECT COUNT(*) AS total FROM mcp_calls WHERE task_run_id = ?",
+        (task_run_id,),
+    )
+    count_row = await cursor.fetchone()
+    assert count_row["total"] == 8
+
+
+@pytest.mark.asyncio
+async def test_agentic_loop_applies_hard_absolute_cap(
+    client: AsyncClient,
+    test_token: str,
+    test_db,
+    test_config,
+):
+    test_config.mcp_cap_investigation = 25
+    test_config.mcp_hard_absolute_cap = 20
+    headers = {"X-Agent-Token": test_token}
+    await client.post("/v1/workspace/init", headers=headers)
+
+    task_run = await client.post(
+        "/v1/task-runs/start",
+        headers=headers,
+        json={"user_request": "Run MCP investigation workflow"},
+    )
+    task_run_id = task_run.json()["task_run_id"]
+
+    run_response = await client.post(
+        "/v1/mcp/agentic/run",
+        headers=headers,
+        json={
+            "task_run_id": task_run_id,
+            "server_name": "local-mcp",
+            "context": "investigation",
+            "max_iterations": 25,
+            "tool_calls": [
+                {"tool_name": f"tool-{idx}", "input_data": {"text": f"value-{idx}"}}
+                for idx in range(21)
+            ],
+        },
+    )
+
+    assert run_response.status_code == 200
+    payload = run_response.json()
+    assert payload["requested_iterations"] == 21
+    assert payload["executed_iterations"] == 20
+    assert payload["capped_at"] == 20
+
+    conn = test_db.connection
+    assert conn is not None
+    cursor = await conn.execute(
+        "SELECT COUNT(*) AS total FROM mcp_calls WHERE task_run_id = ?",
+        (task_run_id,),
+    )
+    count_row = await cursor.fetchone()
+    assert count_row["total"] == 20
+
+
+def test_load_config_reads_mcp_iteration_caps(tmp_path, monkeypatch):
+    home_dir = tmp_path / "home"
+    workspace = tmp_path / "workspace"
+    global_settings_dir = home_dir / ".memopilot"
+    workspace_settings_dir = workspace / ".memopilot"
+    global_settings_dir.mkdir(parents=True)
+    workspace_settings_dir.mkdir(parents=True)
+
+    (global_settings_dir / "settings.yaml").write_text(
+        "mcp:\n  iteration_caps:\n    pre_fetch: 7\n    patch_generation: 4\n",
+        encoding="utf-8",
+    )
+    (workspace_settings_dir / "settings.yaml").write_text(
+        (
+            "mcp:\n"
+            "  iteration_caps:\n"
+            "    pre_fetch: 9\n"
+            "    patch_generation: 6\n"
+            "    investigation: 14\n"
+            "    hard_absolute_cap: 18\n"
+        ),
+        encoding="utf-8",
+    )
+
+    monkeypatch.setenv("MEMOPILOT_WORKSPACE", str(workspace))
+    with patch("agent.config.Path.home", return_value=home_dir):
+        config = load_config()
+
+    assert config.mcp_cap_pre_fetch == 9
+    assert config.mcp_cap_patch_generation == 6
+    assert config.mcp_cap_investigation == 14
+    assert config.mcp_hard_absolute_cap == 18

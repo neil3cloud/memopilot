@@ -50,6 +50,11 @@ async def test_budget_tracking_and_usage_recording(client: AsyncClient, test_tok
     assert data["monthly_budget_usd"] == pytest.approx(20.0)
     assert data["spent_usd"] == pytest.approx(3.0)
     assert data["remaining_usd"] == pytest.approx(17.0)
+    assert data["warning_triggered"] is False
+
+    alias_status = await client.get("/v1/cost/budget-status", headers=headers)
+    assert alias_status.status_code == 200
+    assert alias_status.json()["spend_ratio"] == pytest.approx(0.15)
 
 
 @pytest.mark.asyncio
@@ -87,3 +92,54 @@ async def test_response_cache_lookup_records_savings(client: AsyncClient, test_t
     report_data = report.json()
     assert report_data["cache_savings_usd"] == pytest.approx(1.25)
     assert report_data["month_spend_usd"] == pytest.approx(0.0)
+
+
+@pytest.mark.asyncio
+async def test_response_cache_lookup_ignores_failed_entries(client: AsyncClient, test_token: str):
+    headers = {"X-Agent-Token": test_token}
+    await client.post("/v1/workspace/init", headers=headers)
+
+    stored = await client.post(
+        "/v1/cache/store",
+        headers=headers,
+        json={
+            "context_pack_hash": "hash-failed",
+            "response_text": "stale response",
+            "estimated_cost": 2.0,
+            "response_status": "failed",
+        },
+    )
+    assert stored.status_code == 200
+
+    looked_up = await client.post(
+        "/v1/cache/lookup",
+        headers=headers,
+        json={"context_pack_hash": "hash-failed"},
+    )
+    assert looked_up.status_code == 200
+    assert looked_up.json()["hit"] is False
+
+
+@pytest.mark.asyncio
+async def test_response_cache_lookup_bypasses_critical_task_types(client: AsyncClient, test_token: str):
+    headers = {"X-Agent-Token": test_token}
+    await client.post("/v1/workspace/init", headers=headers)
+
+    stored = await client.post(
+        "/v1/cache/store",
+        headers=headers,
+        json={
+            "context_pack_hash": "hash-critical",
+            "response_text": "cached response",
+            "estimated_cost": 4.0,
+        },
+    )
+    assert stored.status_code == 200
+
+    looked_up = await client.post(
+        "/v1/cache/lookup",
+        headers=headers,
+        json={"context_pack_hash": "hash-critical", "task_type": "security_change"},
+    )
+    assert looked_up.status_code == 200
+    assert looked_up.json()["hit"] is False

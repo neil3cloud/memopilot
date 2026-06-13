@@ -13,6 +13,9 @@ from pathlib import Path
 from .config import Config
 from .db import DatabaseManager
 
+_SECTION_HEADER_RE = re.compile(r"^#\s+(?P<title>.+?)\s*$")
+_LIST_PREFIX_RE = re.compile(r"^(?:[-*+]\s+|\d+[.)]\s+)")
+
 
 @dataclass(frozen=True)
 class ContextTemplateRecord:
@@ -33,6 +36,7 @@ class ContextPackVersionRecord:
     selected_model: str | None
     template_id: str | None
     created_at: str
+    pack_content_snapshot: str | None = None
 
 
 @dataclass(frozen=True)
@@ -40,6 +44,9 @@ class ContextPackDiffResult:
     left_version_id: str
     right_version_id: str
     diff_text: str
+    added_items: dict[str, list[str]]
+    removed_items: dict[str, list[str]]
+    token_delta_estimate: int
 
 
 class ContextBuilderService:
@@ -138,8 +145,10 @@ class ContextBuilderService:
         version_id = uuid.uuid4().hex
         pack_hash = hashlib.sha256(context_pack_text.encode("utf-8")).hexdigest()
 
-        resolved_path = Path(pack_path) if pack_path else (
-            self._config.memopilot_dir / "context-packs" / f"version-{version_id}.md"
+        resolved_path = (
+            Path(pack_path)
+            if pack_path
+            else (self._config.memopilot_dir / "context-packs" / f"version-{version_id}.md")
         )
         resolved_path.parent.mkdir(parents=True, exist_ok=True)
         resolved_path.write_text(context_pack_text, encoding="utf-8")
@@ -148,8 +157,11 @@ class ContextBuilderService:
         await conn.execute(
             """
             INSERT INTO context_pack_versions
-            (id, task_run_id, pack_path, pack_hash, token_estimate, selected_model, template_id)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
+            (
+                id, task_run_id, pack_path, pack_hash, token_estimate,
+                selected_model, template_id, pack_content_snapshot
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 version_id,
@@ -159,6 +171,7 @@ class ContextBuilderService:
                 token_estimate,
                 selected_model,
                 template_id,
+                context_pack_text,
             ),
         )
         await conn.commit()
@@ -170,7 +183,8 @@ class ContextBuilderService:
             """
             SELECT
                 id, task_run_id, pack_path, pack_hash,
-                token_estimate, selected_model, template_id, created_at
+                token_estimate, selected_model, template_id, created_at,
+                pack_content_snapshot
             FROM context_pack_versions
             WHERE id = ?
             """,
@@ -179,16 +193,7 @@ class ContextBuilderService:
         row = await cursor.fetchone()
         if row is None:
             raise ValueError(f"Context pack version not found: {version_id}")
-        return ContextPackVersionRecord(
-            version_id=row["id"],
-            task_run_id=row["task_run_id"],
-            pack_path=row["pack_path"],
-            pack_hash=row["pack_hash"],
-            token_estimate=row["token_estimate"],
-            selected_model=row["selected_model"],
-            template_id=row["template_id"],
-            created_at=row["created_at"],
-        )
+        return self._row_to_version_record(row)
 
     async def list_context_pack_versions(
         self,
@@ -202,7 +207,8 @@ class ContextBuilderService:
                 """
                 SELECT
                     id, task_run_id, pack_path, pack_hash,
-                    token_estimate, selected_model, template_id, created_at
+                    token_estimate, selected_model, template_id, created_at,
+                    pack_content_snapshot
                 FROM context_pack_versions
                 WHERE task_run_id = ?
                 ORDER BY created_at DESC
@@ -215,7 +221,8 @@ class ContextBuilderService:
                 """
                 SELECT
                     id, task_run_id, pack_path, pack_hash,
-                    token_estimate, selected_model, template_id, created_at
+                    token_estimate, selected_model, template_id, created_at,
+                    pack_content_snapshot
                 FROM context_pack_versions
                 ORDER BY created_at DESC
                 LIMIT ?
@@ -223,19 +230,7 @@ class ContextBuilderService:
                 (limit,),
             )
         rows = await cursor.fetchall()
-        return [
-            ContextPackVersionRecord(
-                version_id=row["id"],
-                task_run_id=row["task_run_id"],
-                pack_path=row["pack_path"],
-                pack_hash=row["pack_hash"],
-                token_estimate=row["token_estimate"],
-                selected_model=row["selected_model"],
-                template_id=row["template_id"],
-                created_at=row["created_at"],
-            )
-            for row in rows
-        ]
+        return [self._row_to_version_record(row) for row in rows]
 
     async def diff_context_pack_versions(
         self,
@@ -245,8 +240,8 @@ class ContextBuilderService:
     ) -> ContextPackDiffResult:
         left = await self.get_context_pack_version(left_version_id)
         right = await self.get_context_pack_version(right_version_id)
-        left_text = Path(left.pack_path).read_text(encoding="utf-8", errors="replace")
-        right_text = Path(right.pack_path).read_text(encoding="utf-8", errors="replace")
+        left_text = self._load_context_pack_text(left)
+        right_text = self._load_context_pack_text(right)
         diff = "\n".join(
             difflib.unified_diff(
                 left_text.splitlines(),
@@ -256,8 +251,90 @@ class ContextBuilderService:
                 lineterm="",
             )
         )
+        added_items, removed_items, token_delta_estimate = context_pack_differ(
+            left_text,
+            right_text,
+        )
         return ContextPackDiffResult(
             left_version_id=left_version_id,
             right_version_id=right_version_id,
             diff_text=diff,
+            added_items=added_items,
+            removed_items=removed_items,
+            token_delta_estimate=token_delta_estimate,
         )
+
+    def _row_to_version_record(self, row) -> ContextPackVersionRecord:
+        return ContextPackVersionRecord(
+            version_id=row["id"],
+            task_run_id=row["task_run_id"],
+            pack_path=row["pack_path"],
+            pack_hash=row["pack_hash"],
+            token_estimate=row["token_estimate"],
+            selected_model=row["selected_model"],
+            template_id=row["template_id"],
+            created_at=row["created_at"],
+            pack_content_snapshot=row["pack_content_snapshot"],
+        )
+
+    def _load_context_pack_text(self, version: ContextPackVersionRecord) -> str:
+        if version.pack_content_snapshot:
+            return version.pack_content_snapshot
+        pack_path = Path(version.pack_path)
+        if not pack_path.exists():
+            raise ValueError(f"Context pack file not found: {version.pack_path}")
+        return pack_path.read_text(encoding="utf-8", errors="replace")
+
+
+def context_pack_differ(
+    left_markdown: str,
+    right_markdown: str,
+) -> tuple[dict[str, list[str]], dict[str, list[str]], int]:
+    """Diff two context packs by top-level section heading."""
+    left_sections = _parse_context_pack_sections(left_markdown)
+    right_sections = _parse_context_pack_sections(right_markdown)
+
+    added: dict[str, list[str]] = {}
+    removed: dict[str, list[str]] = {}
+
+    for section_name in sorted(set(left_sections) | set(right_sections)):
+        left_items = left_sections.get(section_name, [])
+        right_items = right_sections.get(section_name, [])
+        left_set = set(left_items)
+        right_set = set(right_items)
+
+        section_added = [item for item in right_items if item not in left_set]
+        section_removed = [item for item in left_items if item not in right_set]
+        if section_added:
+            added[section_name] = section_added
+        if section_removed:
+            removed[section_name] = section_removed
+
+    token_delta_estimate = _estimate_tokens(right_markdown) - _estimate_tokens(left_markdown)
+    return added, removed, token_delta_estimate
+
+
+def _parse_context_pack_sections(markdown_text: str) -> dict[str, list[str]]:
+    sections: dict[str, list[str]] = {}
+    current_section: str | None = None
+
+    for raw_line in markdown_text.splitlines():
+        header_match = _SECTION_HEADER_RE.match(raw_line.strip())
+        if header_match:
+            current_section = header_match.group("title").strip()
+            sections.setdefault(current_section, [])
+            continue
+        if current_section is None:
+            continue
+        stripped = raw_line.strip()
+        if not stripped:
+            continue
+        normalized = _LIST_PREFIX_RE.sub("", stripped).strip()
+        if normalized:
+            sections[current_section].append(normalized)
+
+    return sections
+
+
+def _estimate_tokens(text: str) -> int:
+    return max(0, (len(text) + 3) // 4)

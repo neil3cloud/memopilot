@@ -141,9 +141,7 @@ class SymbolExtractor:
     ) -> SymbolRecord:
         start_line = getattr(node, "lineno", 1)
         end_line = getattr(node, "end_lineno", start_line)
-        symbol_id = hashlib.sha1(
-            f"{file_path}:{name}:{kind}:{start_line}".encode()
-        ).hexdigest()
+        symbol_id = hashlib.sha1(f"{file_path}:{name}:{kind}:{start_line}".encode()).hexdigest()
         return SymbolRecord(
             id=symbol_id,
             file_path=file_path,

@@ -5,12 +5,13 @@ from __future__ import annotations
 import json
 import uuid
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Literal
 
+from .config import Config
 from .db import DatabaseManager
 from .security_policy import CredentialRedactor, DatabaseWriteBlocker
 
-MAX_AGENTIC_ITERATIONS = 5
+MCPContext = Literal["pre_fetch", "patch_generation", "investigation"]
 
 
 @dataclass(frozen=True)
@@ -45,10 +46,12 @@ class MCPOrchestrator:
         self,
         *,
         db: DatabaseManager,
+        config: Config,
         redactor: CredentialRedactor | None = None,
         blocker: DatabaseWriteBlocker | None = None,
     ) -> None:
         self._db = db
+        self._config = config
         self._redactor = redactor or CredentialRedactor()
         self._blocker = blocker or DatabaseWriteBlocker()
 
@@ -59,8 +62,9 @@ class MCPOrchestrator:
         server_name: str,
         tool_calls: list[ToolCall],
         max_iterations: int,
+        context: MCPContext = "patch_generation",
     ) -> AgenticRunResult:
-        capped = min(max(max_iterations, 0), MAX_AGENTIC_ITERATIONS)
+        capped = self._resolve_iteration_cap(context=context, requested_iterations=max_iterations)
         requested = len(tool_calls)
         executable_calls = tool_calls[:capped]
 
@@ -121,9 +125,25 @@ class MCPOrchestrator:
         return AgenticRunResult(
             requested_iterations=requested,
             executed_iterations=len(results),
-            capped_at=MAX_AGENTIC_ITERATIONS,
+            capped_at=capped,
             calls=results,
         )
+
+    def _resolve_iteration_cap(
+        self,
+        *,
+        context: MCPContext,
+        requested_iterations: int,
+    ) -> int:
+        context_caps: dict[MCPContext, int] = {
+            "pre_fetch": self._config.mcp_cap_pre_fetch,
+            "patch_generation": self._config.mcp_cap_patch_generation,
+            "investigation": self._config.mcp_cap_investigation,
+        }
+        context_cap = context_caps[context]
+        absolute_cap = max(int(self._config.mcp_hard_absolute_cap), 0)
+        bounded_context_cap = min(max(int(context_cap), 0), absolute_cap)
+        return min(max(requested_iterations, 0), bounded_context_cap)
 
     def _to_json(self, value: Any) -> str:
         if isinstance(value, str):

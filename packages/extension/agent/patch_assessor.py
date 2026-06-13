@@ -56,9 +56,8 @@ class PatchAssessorService:
 
         for rule in active_rules:
             low_rule = rule.lower()
-            if (
-                "must include tests" in low_rule
-                and not any("test" in item for item in lowered_files)
+            if "must include tests" in low_rule and not any(
+                "test" in item for item in lowered_files
             ):
                 score -= 0.25
                 reasons.append("missing_test_file_for_rule")

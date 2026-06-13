@@ -1,6 +1,8 @@
 """Tests for POST /v1/task/generate-patch and POST /v1/task/validate endpoints."""
 from __future__ import annotations
 
+import sys
+
 import pytest
 from httpx import AsyncClient
 
@@ -143,3 +145,29 @@ async def test_validate_unknown_check_skipped(client: AsyncClient, test_token: s
     assert resp.status_code == 200
     data = resp.json()
     assert data["checks"][0]["status"] == "skipped"
+
+
+@pytest.mark.asyncio
+async def test_validate_command_timeout_fails(client: AsyncClient, test_token: str):
+    headers = {"X-Agent-Token": test_token}
+    await client.post("/v1/workspace/init", headers=headers)
+
+    resp = await client.post(
+        "/v1/task/validate",
+        headers=headers,
+        json={
+            "checks": [],
+            "commands": [
+                {
+                    "name": "Slow Check",
+                    "command": [sys.executable, "-c", "import time; time.sleep(2)"],
+                    "timeout": 1,
+                }
+            ],
+        },
+    )
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["overall_status"] == "fail"
+    assert data["can_apply"] is False
+    assert data["checks"][0]["status"] == "timeout"

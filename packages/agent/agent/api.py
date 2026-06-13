@@ -11,23 +11,41 @@ Security:
 
 from __future__ import annotations
 
+import asyncio
+import hashlib
 import hmac
+import importlib.util
+import json
 import logging
 import os
+import re
+import sys
+import uuid
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
+from .code_review_memory import (
+    ReviewLesson as ReviewMemoryLesson,
+)
+from .code_review_memory import (
+    approve_lesson,
+    extract_review_lessons,
+)
 from .config import Config
 from .context_builder import ContextBuilderService
 from .cost_guard import CostGuardService
 from .db import DatabaseManager
+from .document_ingestion import extract_csv, extract_docx, extract_excel, extract_pdf, extract_pptx
+from .endpoint_registry import ENDPOINT_STATUS
 from .flow_builder import FlowBuilderService
+from .image_analysis import ImageAnalysisResult, analyze_image
 from .investigation_service import InvestigationService
 from .mcp_orchestrator import MCPOrchestrator, ToolCall
 from .memory_manager_service import MemoryManagerService
+from .memory_recall import MemoryRecallService, RecallRequest, RecallResponse
 from .migration_runner import run_migrations
 from .patch_assessor import PatchAssessorService
 from .policy_packs import PolicyPacksService
@@ -35,8 +53,11 @@ from .privacy_dashboard_service import PrivacyDashboardService
 from .provider_registry import ProviderCapabilityRecord, ProviderRegistryService
 from .provider_resilience import ProviderCallError, ProviderResilienceService
 from .response_cache import ResponseCacheService
+from .retention import enforce_retention
+from .review_memory_mode import CodeReviewMemoryModeService
 from .security_policy import CredentialRedactor, DatabaseWriteBlocker
 from .skill_loader import SkillLoaderService
+from .validation_runner import ValidationCommand, ValidationRunner
 from .workspace_indexer import WorkspaceIndexer
 from .workspace_init import ensure_global_config
 from .workspace_profile_service import WorkspaceProfileService
@@ -50,6 +71,8 @@ app = FastAPI(title="MemoPilot Agent", version="0.1.0")
 _config: Config | None = None
 _db: DatabaseManager | None = None
 _expected_token: str | None = None
+_retention_task: asyncio.Task[None] | None = None
+_RETENTION_INTERVAL_SECONDS = 6 * 60 * 60
 
 
 class HealthResponse(BaseModel):
@@ -85,6 +108,10 @@ class BudgetStatusResponse(BaseModel):
     spent_usd: float
     saved_usd: float
     remaining_usd: float
+    warning_threshold_usd: float = 0.0
+    warning_triggered: bool = False
+    blocked: bool = False
+    spend_ratio: float = 0.0
 
 
 class BudgetCheckRequest(BaseModel):
@@ -107,6 +134,7 @@ class StartTaskRunRequest(BaseModel):
     estimated_cost: float | None = Field(default=None, ge=0)
     constraints: list[str] = Field(default_factory=list)
     notes: str | None = None
+    workspace_root: str | None = None
 
 
 class StartTaskRunResponse(BaseModel):
@@ -119,6 +147,10 @@ class TaskAnalyzeRequest(BaseModel):
     constraints: list[str] = Field(default_factory=list)
     mode: str | None = None
     notes: str | None = None
+    file_paths: list[str] = Field(default_factory=list)
+    changed_files: list[str] = Field(default_factory=list)
+    context_files: list[str] = Field(default_factory=list)
+    workspace_root: str | None = None
 
 
 class TaskAnalyzeResponse(BaseModel):
@@ -127,6 +159,8 @@ class TaskAnalyzeResponse(BaseModel):
     applicable_rules: list[str]
     estimated_complexity: str
     suggested_mode: str
+    task_type: str = "general"
+    risk: str = "medium"
 
 
 class ContextBuildRequest(BaseModel):
@@ -134,6 +168,7 @@ class ContextBuildRequest(BaseModel):
     suggested_files: list[str] = Field(default_factory=list)
     file_overrides: list[str] | None = None
     mode: str | None = None
+    workspace_root: str | None = None
 
 
 class ContextFileEntry(BaseModel):
@@ -148,6 +183,7 @@ class ContextBuildResponse(BaseModel):
     skills: list[str]
     total_tokens: int
     estimated_cost_usd: float
+    context_pack_hash: str
 
 
 class ModelRouteRequest(BaseModel):
@@ -202,14 +238,22 @@ class GeneratePatchResponse(BaseModel):
     cost_usd: float
 
 
+class ValidationCommandRequest(BaseModel):
+    name: str
+    command: list[str] = Field(min_length=1)
+    timeout: int | None = Field(default=None, ge=1)
+
+
 class ValidateRequest(BaseModel):
     patches: list[dict] = Field(default_factory=list)
     checks: list[str] = Field(default_factory=lambda: ["syntax", "lint", "test_impact"])
+    commands: list[ValidationCommandRequest] = Field(default_factory=list)
+    command_timeouts: dict[str, int] = Field(default_factory=dict)
 
 
 class ValidationCheck(BaseModel):
     name: str
-    status: str  # "pass", "fail", "warn", "skipped"
+    status: str  # "pass", "fail", "warn", "skipped", "timeout"
     message: str
 
 
@@ -288,6 +332,7 @@ class CacheStoreRequest(BaseModel):
     model: str | None = None
     estimated_cost: float = Field(default=0, ge=0)
     actual_cost: float | None = Field(default=None, ge=0)
+    response_status: str = "success"
 
 
 class CacheStoreResponse(BaseModel):
@@ -296,6 +341,7 @@ class CacheStoreResponse(BaseModel):
 
 class CacheLookupRequest(BaseModel):
     context_pack_hash: str
+    task_type: str | None = None
 
 
 class CacheLookupResponse(BaseModel):
@@ -335,6 +381,10 @@ class AgenticRunRequest(BaseModel):
     task_run_id: str
     server_name: str
     max_iterations: int = Field(default=5, ge=1)
+    context: str = Field(
+        default="patch_generation",
+        pattern="^(pre_fetch|patch_generation|investigation)$",
+    )
     tool_calls: list[AgenticToolCallRequest]
 
 
@@ -399,6 +449,11 @@ class MemoryItemResponse(BaseModel):
     trust_level: int
     stale: bool
     tags: dict | list | None
+    memory_class: str
+    memory_status: str
+    visibility_scope: str
+    reusable: bool
+    review_required: bool
     created_at: str
     updated_at: str
 
@@ -418,11 +473,15 @@ class SuggestMemoryRequest(BaseModel):
     source: str = "ai_suggestion"
     source_path: str | None = None
     tags: dict | None = None
+    task_run_id: str | None = None
+    workspace_root: str | None = None
 
 
 class SuggestMemoryResponse(BaseModel):
-    memory_item_id: str
+    memory_item_id: str | None
     pending_approval: bool
+    artifact_id: str | None = None
+    blocked_reason: str | None = None
 
 
 class MemoryEditRequest(BaseModel):
@@ -432,6 +491,65 @@ class MemoryEditRequest(BaseModel):
 
 class MemoryActionResponse(BaseModel):
     success: bool
+
+
+class MemoryReviewRequest(BaseModel):
+    decision: str
+    workspace_root: str | None = None
+
+
+class SubmitReviewEvidenceRequest(BaseModel):
+    pr_number: int
+    body: str
+    path: str | None = None
+    line: int | None = None
+    workspace_root: str | None = None
+
+
+class SubmitReviewEvidenceResponse(BaseModel):
+    evidence_id: str
+    approved: bool
+
+
+class ApproveReviewLessonRequest(BaseModel):
+    evidence_id: str
+    lesson_title: str
+    lesson_body: str
+    workspace_root: str | None = None
+
+
+class ApproveReviewLessonResponse(BaseModel):
+    memory_item_id: str
+    evidence_id: str
+
+
+class ExtractReviewLessonsRequest(BaseModel):
+    review_comments: list[dict[str, object]] = Field(default_factory=list)
+
+
+class ReviewMemoryLessonResponse(BaseModel):
+    summary: str
+    context: str
+    source_pr: str | None = None
+    source_reviewer: str | None = None
+    approved: bool = False
+
+
+class ExtractReviewLessonsResponse(BaseModel):
+    lessons: list[ReviewMemoryLessonResponse]
+
+
+class ApproveReviewMemoryLessonRequest(BaseModel):
+    summary: str
+    context: str
+    source_pr: str | None = None
+    source_reviewer: str | None = None
+    workspace_root: str | None = None
+
+
+class ApproveReviewMemoryLessonResponse(BaseModel):
+    memory_item_id: str
+    approved: bool
 
 
 class PrivacyRecentCloudCallResponse(BaseModel):
@@ -457,7 +575,9 @@ class AttachEvidenceRequest(BaseModel):
     evidence_path: str | None = None
     source_url: str | None = None
     task_run_id: str | None = None
+    investigation_session_id: str | None = None
     column_mapping: dict[str, str] | None = None
+    workspace_root: str | None = None
 
 
 class AttachEvidenceResponse(BaseModel):
@@ -469,6 +589,7 @@ class AttachEvidenceResponse(BaseModel):
     findings: list[str]
     redacted_values: int
     source_path: str | None = None
+    investigation_session_id: str | None = None
 
 
 class EvidenceBoardItemResponse(BaseModel):
@@ -481,14 +602,41 @@ class EvidenceBoardItemResponse(BaseModel):
     extraction_status: str
     redacted_values: int
     findings: list[str]
+    investigation_session_id: str | None = None
 
 
 class EvidenceBoardResponse(BaseModel):
     items: list[EvidenceBoardItemResponse]
 
 
+class StartInvestigationRequest(BaseModel):
+    title: str
+    description: str = ""
+    mode: str = "investigation"
+    workspace_root: str | None = None
+
+
+class InvestigationSessionResponse(BaseModel):
+    id: str
+    title: str
+    description: str | None = None
+    mode: str
+    status: str
+    workspace_root: str
+    created_at: str
+    updated_at: str
+    evidence_count: int = 0
+    evidence: list[EvidenceBoardItemResponse] = Field(default_factory=list)
+
+
+class RemoveEvidenceResponse(BaseModel):
+    evidence_id: str
+    removed: bool
+
+
 class EvidenceColumnsPreviewRequest(BaseModel):
     evidence_path: str
+    workspace_root: str | None = None
 
 
 class EvidenceColumnsPreviewResponse(BaseModel):
@@ -503,6 +651,7 @@ class RunInvestigationRequest(BaseModel):
     description: str = ""
     acceptance_criteria: list[str] = Field(default_factory=list)
     task_run_id: str | None = None
+    workspace_root: str | None = None
 
 
 class RunInvestigationResponse(BaseModel):
@@ -570,9 +719,14 @@ class ContextPackDiffRequest(BaseModel):
 
 
 class ContextPackDiffResponse(BaseModel):
+    from_version_id: str
+    to_version_id: str
     left_version_id: str
     right_version_id: str
     diff_text: str
+    added_items: dict[str, list[str]] = Field(default_factory=dict)
+    removed_items: dict[str, list[str]] = Field(default_factory=dict)
+    token_delta_estimate: int = 0
 
 
 class PatchAssessmentRequest(BaseModel):
@@ -625,10 +779,29 @@ class SkillStoreItemResponse(BaseModel):
     enabled: bool
     version: int
     conflict: bool
+    source: str
 
 
 class SkillStoreListResponse(BaseModel):
     items: list[SkillStoreItemResponse]
+
+
+class SkillImportRequest(BaseModel):
+    yaml_content: str
+
+
+class SkillConflictItemResponse(BaseModel):
+    first_skill_id: str
+    first_name: str
+    second_skill_id: str
+    second_name: str
+    language: str
+    path_contains: str
+    contradictory_rules: list[str]
+
+
+class SkillConflictListResponse(BaseModel):
+    items: list[SkillConflictItemResponse]
 
 
 # --- Active Rules & Skills (merged view) ---
@@ -667,6 +840,7 @@ class BackupMemoryResponse(BaseModel):
     backup_path: str
     item_count: int
     created_at: str
+    manifest: dict[str, int | float | str | None] = Field(default_factory=dict)
 
 
 class RestoreMemoryRequest(BaseModel):
@@ -680,12 +854,16 @@ class RestoreMemoryResponse(BaseModel):
 class ToolSkillOptimizeRequest(BaseModel):
     task_text: str
     available_tools: list[str] = Field(default_factory=list)
+    task_type: str | None = None
+    budget_profile: str = "balanced"
 
 
 class ToolSkillOptimizeResponse(BaseModel):
     suggested_tools: list[str]
+    excluded_tools: list[str] = Field(default_factory=list)
     suggested_skills: list[str]
     reasons: list[str]
+    reasons_map: dict[str, str] = Field(default_factory=dict)
 
 
 class BudgetProfilesResponse(BaseModel):
@@ -709,6 +887,69 @@ class EvidenceClassifyResponse(BaseModel):
     source_type: str
     trust_level: int
     extraction_method: str
+
+
+class DocumentChunkResponse(BaseModel):
+    chunk_index: int
+    chunk_text: str
+    source_hash: str = ""
+    trust_level: int = 3
+    memory_class: str = "evidence"
+    memory_status: str = "evidence_only"
+
+
+class ExtractionResultResponse(BaseModel):
+    source_type: str
+    chunks: list[DocumentChunkResponse] = Field(default_factory=list)
+    metadata: dict[str, object] = Field(default_factory=dict)
+    error: str | None = None
+    requires_ocr: bool = False
+
+
+class ExtractPdfRequest(BaseModel):
+    file_path: str
+    workspace_root: str | None = None
+
+
+class ExtractExcelRequest(BaseModel):
+    file_path: str
+    sheet_names: list[str] | None = None
+    column_mapping: dict[str, str] | None = None
+    workspace_root: str | None = None
+
+
+class ExtractCsvRequest(BaseModel):
+    file_path: str
+    delimiter: str | None = None
+    column_mapping: dict[str, str] | None = None
+    workspace_root: str | None = None
+
+
+class ExtractDocxRequest(BaseModel):
+    file_path: str
+    workspace_root: str | None = None
+
+
+class ExtractPptxRequest(BaseModel):
+    file_path: str
+    workspace_root: str | None = None
+
+
+class AnalyzeImageRequest(BaseModel):
+    file_path: str
+    allow_cloud: bool = False
+    workspace_root: str | None = None
+
+
+class ImageAnalysisResponse(BaseModel):
+    description: str
+    ui_elements: list[str]
+    error_messages: list[str]
+    ocr_text: str
+    source: str
+    trust_level: int
+    memory_status: str
+    error: str | None = None
 
 
 class PolicyPackItemResponse(BaseModel):
@@ -741,6 +982,7 @@ class PolicyEvaluateRequest(BaseModel):
     task_text: str = ""
     files_changed: list[str] = Field(default_factory=list)
     selected_model: str | None = None
+    workspace_root: str | None = None
 
 
 class PolicyEvaluateResponse(BaseModel):
@@ -753,18 +995,59 @@ class PolicyEvaluateResponse(BaseModel):
     applied_policies: list[str]
 
 
+class ActivePolicyRuleResponse(BaseModel):
+    rule: str
+    source: str
+    source_kind: str
+    precedence: int
+    enforcement_mode: str
+    pack_id: str | None = None
+    pack_name: str | None = None
+
+
+class PolicyConflictResponse(BaseModel):
+    rule: str
+    source: str
+    source_kind: str
+    overridden_by_rule: str
+    overridden_by_source: str
+    overridden_by_kind: str
+    conflict_key: str
+
+
+class ActivePolicyRulesResponse(BaseModel):
+    items: list[ActivePolicyRuleResponse]
+    conflicts: list[PolicyConflictResponse] = Field(default_factory=list)
+    precedence_order: list[str] = Field(default_factory=list)
+
+
+class PolicyDirectoryLoadRequest(BaseModel):
+    policy_dir: str | None = None
+    workspace_root: str | None = None
+
+
 class LocalFlowStepRequest(BaseModel):
     id: str | None = None
+    name: str | None = None
     title: str | None = None
     action: str
     stage: str | None = None
     available_tools: list[str] = Field(default_factory=list)
+    requires_approval: bool = False
+    approval_required: bool = False
+    escalate_after_failures: int | None = None
+    escalate_to_model: str | None = None
+    requires_mcp: bool = False
+    simulate_failure: bool = False
+    command: str | None = None
 
 
 class SaveLocalFlowRequest(BaseModel):
-    name: str
+    flow_id: str | None = None
+    name: str = ""
     description: str = ""
     steps: list[LocalFlowStepRequest] = Field(default_factory=list)
+    flow_yaml: str | None = None
 
 
 class LocalFlowItemResponse(BaseModel):
@@ -772,7 +1055,7 @@ class LocalFlowItemResponse(BaseModel):
     name: str
     description: str
     enabled: bool
-    steps: list[dict[str, str | list[str] | bool]]
+    steps: list[dict[str, object]]
 
 
 class LocalFlowsResponse(BaseModel):
@@ -784,6 +1067,13 @@ class RunLocalFlowRequest(BaseModel):
     task_text: str
     files_changed: list[str] = Field(default_factory=list)
     selected_model: str | None = None
+    constraints: list[str] = Field(default_factory=list)
+    approved_steps: list[str] = Field(default_factory=list)
+    planned_mcp_calls: int = 0
+    mcp_cap: int | None = None
+    failure_count: int = 0
+    allow_file_modifications: bool = False
+    workspace_root: str | None = None
 
 
 class RunLocalFlowResponse(BaseModel):
@@ -791,7 +1081,7 @@ class RunLocalFlowResponse(BaseModel):
     flow_id: str
     flow_name: str
     status: str
-    steps: list[dict[str, str | bool | list[str]]]
+    steps: list[dict[str, object]]
     blocked_reason: str | None = None
 
 
@@ -810,10 +1100,13 @@ class AddWorkspaceRootRequest(BaseModel):
     root_path: str
     label: str | None = None
     activate: bool = False
+    workspace_root: str | None = None
 
 
 class ActivateWorkspaceRootRequest(BaseModel):
-    workspace_id: str
+    workspace_id: str | None = None
+    root_path: str | None = None
+    workspace_root: str | None = None
 
 
 def configure(config: Config, db: DatabaseManager) -> None:
@@ -822,6 +1115,50 @@ def configure(config: Config, db: DatabaseManager) -> None:
     _config = config
     _db = db
     _expected_token = os.environ.get("MEMOPILOT_TOKEN")
+
+
+async def _run_retention_pass() -> None:
+    db = _db
+    if db is None:
+        return
+    conn = await db.connect()
+    await enforce_retention(conn)
+
+
+async def _retention_loop() -> None:
+    try:
+        while True:
+            await asyncio.sleep(_RETENTION_INTERVAL_SECONDS)
+            try:
+                await _run_retention_pass()
+            except Exception:
+                logger.exception("Scheduled retention enforcement failed")
+    except asyncio.CancelledError:
+        return
+
+
+@app.on_event("startup")
+async def startup_event() -> None:
+    global _retention_task
+    try:
+        await _run_retention_pass()
+    except Exception:
+        logger.exception("Startup retention enforcement failed")
+    if _retention_task is None or _retention_task.done():
+        _retention_task = asyncio.create_task(_retention_loop())
+
+
+@app.on_event("shutdown")
+async def shutdown_event() -> None:
+    global _retention_task
+    if _retention_task is None:
+        return
+    _retention_task.cancel()
+    try:
+        await _retention_task
+    except asyncio.CancelledError:
+        pass
+    _retention_task = None
 
 
 @app.middleware("http")
@@ -859,6 +1196,11 @@ async def health() -> HealthResponse:
     )
 
 
+@app.get("/v1/endpoints/status", response_model=dict[str, str])
+async def endpoint_status() -> dict[str, str]:
+    return ENDPOINT_STATUS
+
+
 @app.post("/v1/workspace/init", response_model=InitWorkspaceResponse)
 async def init_workspace() -> InitWorkspaceResponse:
     """Initialize the .memopilot/ workspace folder structure and run migrations."""
@@ -872,7 +1214,7 @@ async def init_workspace() -> InitWorkspaceResponse:
         config.memopilot_dir / "logs",
         config.memopilot_dir / "context-packs",
         config.memopilot_dir / "context-templates",
-        config.memopilot_dir / "snapshots",
+        config.memopilot_dir / "memory" / "snapshots",
     ]
     for dir_path in dirs_to_create:
         dir_path.mkdir(parents=True, exist_ok=True)
@@ -887,9 +1229,10 @@ async def init_workspace() -> InitWorkspaceResponse:
     wave4_service = WorkspaceRootsService(config=config, db=db)
     await wave4_service.ensure_default_workspace_root()
 
-    logger.info(
-        f"Workspace initialized: {config.memopilot_dir} (schema v{schema_version})"
-    )
+    profile_service = WorkspaceProfileService(config=config, db=db)
+    await profile_service.ensure_profile()
+
+    logger.info(f"Workspace initialized: {config.memopilot_dir} (schema v{schema_version})")
 
     return InitWorkspaceResponse(
         initialized=True,
@@ -938,6 +1281,7 @@ async def rebuild_memory() -> RebuildMemoryResponse:
 
 
 @app.get("/v1/cost/budget/status", response_model=BudgetStatusResponse)
+@app.get("/v1/cost/budget-status", response_model=BudgetStatusResponse)
 async def budget_status() -> BudgetStatusResponse:
     service = CostGuardService(config=_get_config(), db=_get_db())
     status = await service.get_budget_status()
@@ -946,6 +1290,10 @@ async def budget_status() -> BudgetStatusResponse:
         spent_usd=status.spent_usd,
         saved_usd=status.saved_usd,
         remaining_usd=status.remaining_usd,
+        warning_threshold_usd=status.warning_threshold_usd,
+        warning_triggered=status.warning_triggered,
+        blocked=status.blocked,
+        spend_ratio=status.spend_ratio,
     )
 
 
@@ -962,8 +1310,74 @@ async def check_budget(request: BudgetCheckRequest) -> BudgetCheckResponse:
             spent_usd=result.status.spent_usd,
             saved_usd=result.status.saved_usd,
             remaining_usd=result.status.remaining_usd,
+            warning_threshold_usd=result.status.warning_threshold_usd,
+            warning_triggered=result.status.warning_triggered,
+            blocked=result.status.blocked,
+            spend_ratio=result.status.spend_ratio,
         ),
     )
+
+
+def _collect_task_paths(request: TaskAnalyzeRequest) -> list[str]:
+    raw_paths = [*request.file_paths, *request.changed_files, *request.context_files]
+    path_pattern = re.compile(r"(?:[A-Za-z]:)?[\\/][^\s,;]+|[\w.-]+(?:[\\/][\w.-]+)+")
+    for source in (request.description, request.notes or ""):
+        raw_paths.extend(match.group(0) for match in path_pattern.finditer(source))
+
+    seen: set[str] = set()
+    normalized_paths: list[str] = []
+    for raw_path in raw_paths:
+        candidate = raw_path.strip().strip("`\"'")
+        if not candidate:
+            continue
+        normalized = candidate.replace("\\", "/")
+        if normalized not in seen:
+            seen.add(normalized)
+            normalized_paths.append(normalized)
+    return normalized_paths
+
+
+def _classify_task_from_signals(request: TaskAnalyzeRequest) -> tuple[str, str]:
+    normalized_paths = [path.lower() for path in _collect_task_paths(request)]
+
+    for path in normalized_paths:
+        file_name = path.rsplit("/", 1)[-1]
+        if (
+            file_name.endswith("_test.py")
+            or (file_name.startswith("test_") and file_name.endswith(".py"))
+            or file_name.endswith(".spec.ts")
+            or file_name.endswith(".test.ts")
+        ):
+            return "test_generation", "low"
+        if file_name.endswith("_migration.py") or "/migrations/" in f"/{path}/":
+            return "schema_change", "critical"
+
+    for path in normalized_paths:
+        if any(segment in path for segment in ("/auth/", "/security/", "/permission/", "/oauth/")):
+            return "security_change", "high"
+        if any(
+            segment in path for segment in ("/billing/", "/payment/", "/invoice/", "/subscription/")
+        ):
+            return "billing_change", "high"
+
+    combined_text = f"{request.description} {request.notes or ''}".lower()
+    joined_paths = " ".join(normalized_paths)
+    if any(signal in joined_paths for signal in ("migration", "schema", "alembic")) or any(
+        keyword in combined_text for keyword in ("migration", "schema", "alembic")
+    ):
+        return "schema_change", "critical"
+    if any(keyword in combined_text for keyword in ("explain", "summarize", "describe")):
+        return "explanation", "low"
+    if any(keyword in combined_text for keyword in ("document", "docstring", "comment", "readme")):
+        return "documentation", "low"
+    if (
+        any(keyword in combined_text for keyword in ("refactor", "restructure", "move", "rename"))
+        and len(normalized_paths) == 1
+    ):
+        return "bounded_refactor", "medium"
+    if any(keyword in combined_text for keyword in ("fix", "bug", "error", "exception", "broken")):
+        return "bug_fix", "medium"
+    return "general", "medium"
 
 
 @app.post("/v1/task/analyze", response_model=TaskAnalyzeResponse)
@@ -976,8 +1390,21 @@ async def analyze_task(request: TaskAnalyzeRequest) -> TaskAnalyzeResponse:
     if not description:
         raise HTTPException(status_code=400, detail="Task description is required.")
 
-    # Determine suggested mode from keywords
+    task_type, risk = _classify_task_from_signals(request)
+
+    # Determine suggested mode from classification and keywords
     mode = request.mode
+    if not mode:
+        mode_by_task_type = {
+            "billing_change": "fix",
+            "bounded_refactor": "refactor",
+            "bug_fix": "fix",
+            "documentation": "document",
+            "schema_change": "refactor",
+            "security_change": "fix",
+            "test_generation": "test",
+        }
+        mode = mode_by_task_type.get(task_type)
     if not mode:
         lower = description.lower()
         if any(kw in lower for kw in ("fix", "bug", "error", "broken")):
@@ -999,30 +1426,39 @@ async def analyze_task(request: TaskAnalyzeRequest) -> TaskAnalyzeResponse:
         complexity_signals += 1
     if any(kw in description.lower() for kw in ("database", "migration", "schema")):
         complexity_signals += 1
-    complexity = "low" if complexity_signals == 0 else "medium" if complexity_signals <= 1 else "high"
+    complexity = (
+        "low" if complexity_signals == 0 else "medium" if complexity_signals <= 1 else "high"
+    )
 
     # Find applicable rules from active policy packs
     applicable_rules: list[str] = []
     try:
         policy_service = PolicyPacksService(config=config, db=db)
-        packs = await policy_service.list_policy_packs(limit=50)
-        for pack in packs:
-            if pack.active:
-                applicable_rules.extend(pack.rules[:5])
+        active_rules = await policy_service.list_active_policy_rules(
+            workspace_root=request.workspace_root
+        )
+        applicable_rules.extend([item.rule for item in active_rules[:5]])
     except Exception:
         pass
 
     # Add constraint-derived rules
     if "follow_all_rules" in request.constraints:
         pass  # Already including all active rules above
-    if "run_tests" in request.constraints and "Run tests after applying changes" not in applicable_rules:
+    if (
+        "run_tests" in request.constraints
+        and "Run tests after applying changes" not in applicable_rules
+    ):
         applicable_rules.append("Run tests after applying changes")
 
     # Suggest files by searching memory for relevant symbols
     suggested_files: list[str] = []
     try:
         memory_service = MemoryManagerService(config=config, db=db)
-        items = await memory_service.list_items(filter_name="file_summaries", limit=200)
+        items = await memory_service.list_items(
+            filter_name="file_summaries",
+            limit=200,
+            workspace_root=request.workspace_root,
+        )
         # Simple keyword matching from task description
         keywords = [w.lower() for w in description.split() if len(w) > 3]
         for item in items:
@@ -1046,47 +1482,47 @@ async def analyze_task(request: TaskAnalyzeRequest) -> TaskAnalyzeResponse:
         applicable_rules=applicable_rules[:10],
         estimated_complexity=complexity,
         suggested_mode=mode,
+        task_type=task_type,
+        risk=risk,
     )
 
 
-@app.post("/v1/context/build", response_model=ContextBuildResponse)
-async def build_context_pack(request: ContextBuildRequest) -> ContextBuildResponse:
+async def _generate_context_pack_response(request: ContextBuildRequest) -> ContextBuildResponse:
     """Build a context pack for preview with token estimates."""
     config = _get_config()
     db = _get_db()
 
-    # Determine which files to include
     files_to_include = request.file_overrides if request.file_overrides else request.suggested_files
 
-    # Build file entries with token estimates (approx 4 chars per token)
     file_entries: list[ContextFileEntry] = []
-    workspace_root = config.workspace_root if hasattr(config, "workspace_root") else "."
+    workspace_service = WorkspaceRootsService(config=config, db=db)
+    workspace_root = str(await workspace_service.resolve_workspace_root(request.workspace_root))
     import os
 
-    for file_path in files_to_include[:20]:  # Cap at 20 files
-        full_path = os.path.join(workspace_root, file_path) if not os.path.isabs(file_path) else file_path
+    for file_path in files_to_include[:20]:
+        full_path = (
+            os.path.join(workspace_root, file_path) if not os.path.isabs(file_path) else file_path
+        )
         content = ""
         try:
             if os.path.exists(full_path) and os.path.isfile(full_path):
-                with open(full_path, "r", encoding="utf-8", errors="replace") as f:
-                    content = f.read(50_000)  # Cap per-file at 50KB
+                with open(full_path, encoding="utf-8", errors="replace") as f:
+                    content = f.read(50_000)
         except Exception:
             content = f"# Could not read {file_path}"
         tokens = max(1, len(content) // 4)
         file_entries.append(ContextFileEntry(path=file_path, tokens=tokens, content=content))
 
-    # Gather active rules
     rules: list[str] = []
     try:
         policy_service = PolicyPacksService(config=config, db=db)
-        packs = await policy_service.list_policy_packs(limit=50)
-        for pack in packs:
-            if pack.active:
-                rules.extend(pack.rules[:10])
+        active_rules = await policy_service.list_active_policy_rules(
+            workspace_root=request.workspace_root
+        )
+        rules.extend([item.rule for item in active_rules[:10]])
     except Exception:
         pass
 
-    # Gather detected skills
     skills: list[str] = []
     try:
         skill_service = SkillLoaderService(config=config, db=db)
@@ -1095,21 +1531,43 @@ async def build_context_pack(request: ContextBuildRequest) -> ContextBuildRespon
     except Exception:
         pass
 
-    # Calculate totals
     file_tokens = sum(f.tokens for f in file_entries)
     rule_tokens = sum(len(r) // 4 for r in rules)
-    total_tokens = file_tokens + rule_tokens + len(skills) * 10  # ~10 tokens per skill reference
-
-    # Estimate cost at a default rate of $0.003 per 1K input tokens
+    total_tokens = file_tokens + rule_tokens + len(skills) * 10
     estimated_cost = (total_tokens / 1000) * 0.003
 
-    return ContextBuildResponse(
-        files=file_entries,
-        rules=rules[:15],
-        skills=skills[:10],
-        total_tokens=total_tokens,
-        estimated_cost_usd=round(estimated_cost, 6),
+    response_payload = {
+        "files": [entry.model_dump() for entry in file_entries],
+        "rules": rules[:15],
+        "skills": skills[:10],
+        "total_tokens": total_tokens,
+        "estimated_cost_usd": round(estimated_cost, 6),
+    }
+    context_pack_hash = hashlib.sha256(
+        json.dumps(response_payload, sort_keys=True).encode("utf-8")
+    ).hexdigest()
+    recall_service = MemoryRecallService(db)
+    await recall_service.record_recall_trace(
+        context_pack_hash=context_pack_hash,
+        request_json=request.model_dump_json(),
+        included_memory_ids=[],
+        excluded_memory_ids=[],
     )
+
+    return ContextBuildResponse(
+        **response_payload,
+        context_pack_hash=context_pack_hash,
+    )
+
+
+@app.post("/v1/context-pack/generate", response_model=ContextBuildResponse)
+async def generate_context_pack(request: ContextBuildRequest) -> ContextBuildResponse:
+    return await _generate_context_pack_response(request)
+
+
+@app.post("/v1/context/build", response_model=ContextBuildResponse, deprecated=True)
+async def build_context_pack(request: ContextBuildRequest) -> ContextBuildResponse:
+    return await _generate_context_pack_response(request)
 
 
 @app.post("/v1/model/route", response_model=ModelRouteResponse)
@@ -1122,19 +1580,16 @@ async def route_model(request: ModelRouteRequest) -> ModelRouteResponse:
     privacy = request.privacy_level
     task_type = request.task_type
 
-    # Check budget
-    remaining_usd = 50.0  # default
+    cost_service = CostGuardService(config=config, db=db)
+    remaining_usd = 50.0
     try:
-        cost_service = CostGuardService(config=config, db=db)
         budget_info = await cost_service.get_budget_status()
-        remaining_usd = budget_info.get("remaining_usd", 50.0) if isinstance(budget_info, dict) else 50.0
+        remaining_usd = budget_info.remaining_usd
     except Exception:
-        pass
+        budget_info = None
 
-    # Build candidate models based on provider registry
     candidates: list[ModelChoice] = []
 
-    # Local model (always available, zero cost)
     local_fits = context_tokens <= 32_000
     local_reasons = []
     if local_fits:
@@ -1143,54 +1598,83 @@ async def route_model(request: ModelRouteRequest) -> ModelRouteResponse:
         local_reasons.append("Privacy preference: local")
     if task_type in ("refactor", "fix", "test"):
         local_reasons.append(f"Task type '{task_type}' suitable for local model")
-    candidates.append(ModelChoice(
-        model_id="codellama-13b-local",
-        provider="ollama",
-        cost_estimate_usd=0.0,
-        reasons=local_reasons or ["Local model available"],
-        fits_context=local_fits,
-    ))
+    candidates.append(
+        ModelChoice(
+            model_id="codellama-13b-local",
+            provider="ollama",
+            cost_estimate_usd=0.0,
+            reasons=local_reasons or ["Local model available"],
+            fits_context=local_fits,
+        )
+    )
 
-    # Cloud models
-    gpt4o_cost = (context_tokens / 1_000_000) * 5.0 + 0.015  # input + ~output
-    candidates.append(ModelChoice(
-        model_id="gpt-4o",
-        provider="openai",
-        cost_estimate_usd=round(gpt4o_cost, 4),
-        reasons=["Higher quality for complex tasks", "128K context window"],
-        fits_context=context_tokens <= 128_000,
-    ))
+    gpt4o_cost = (context_tokens / 1_000_000) * 5.0 + 0.015
+    candidates.append(
+        ModelChoice(
+            model_id="gpt-4o",
+            provider="openai",
+            cost_estimate_usd=round(gpt4o_cost, 4),
+            reasons=["Higher quality for complex tasks", "128K context window"],
+            fits_context=context_tokens <= 128_000,
+        )
+    )
 
     claude_cost = (context_tokens / 1_000_000) * 3.0 + 0.015
-    candidates.append(ModelChoice(
-        model_id="claude-3.5-sonnet",
-        provider="anthropic",
-        cost_estimate_usd=round(claude_cost, 4),
-        reasons=["Strong at structured code changes", "200K context window"],
-        fits_context=context_tokens <= 200_000,
-    ))
+    candidates.append(
+        ModelChoice(
+            model_id="claude-3.5-sonnet",
+            provider="anthropic",
+            cost_estimate_usd=round(claude_cost, 4),
+            reasons=["Strong at structured code changes", "200K context window"],
+            fits_context=context_tokens <= 200_000,
+        )
+    )
 
-    # Select recommended model
-    recommended = candidates[0]  # default: local
+    allowed_candidates: list[ModelChoice] = []
+    candidate_checks: dict[str, object] = {}
+    for candidate in candidates:
+        provider_privacy = "local" if candidate.provider == "ollama" else "cloud"
+        provider_check = await cost_service.check_provider_budget(
+            provider=candidate.provider,
+            model=candidate.model_id,
+            privacy_level=provider_privacy,
+            estimated_cost_usd=candidate.cost_estimate_usd,
+            requires_approval=candidate.model_id in {"gpt-4o", "claude-3.5-sonnet"},
+            approval_granted=False,
+        )
+        candidate_checks[candidate.model_id] = provider_check
+        if candidate.fits_context and provider_check.allowed:
+            allowed_candidates.append(candidate)
+
+    selection_pool = (
+        allowed_candidates
+        or [candidate for candidate in candidates if candidate.fits_context]
+        or candidates
+    )
+    recommended = selection_pool[0]
 
     if request.preferred_model:
-        # Honor explicit preference
-        for c in candidates:
-            if c.model_id == request.preferred_model:
-                recommended = c
+        for candidate in selection_pool:
+            if candidate.model_id == request.preferred_model:
+                recommended = candidate
                 break
     elif not local_fits:
-        # Local doesn't fit, use cheapest cloud that fits
-        cloud_fits = [c for c in candidates[1:] if c.fits_context]
+        cloud_fits = [candidate for candidate in selection_pool if candidate.provider != "ollama"]
         if cloud_fits:
-            recommended = min(cloud_fits, key=lambda x: x.cost_estimate_usd)
+            recommended = min(cloud_fits, key=lambda item: item.cost_estimate_usd)
     elif privacy == "cloud_ok" and task_type in ("complex", "architecture"):
-        # Prefer cloud for complex tasks when privacy allows
-        recommended = candidates[1]  # gpt-4o
+        for candidate in selection_pool:
+            if candidate.provider != "ollama":
+                recommended = candidate
+                break
 
-    alternatives = [c for c in candidates if c.model_id != recommended.model_id]
-
-    budget_allowed = recommended.cost_estimate_usd <= remaining_usd
+    alternatives = [
+        candidate for candidate in candidates if candidate.model_id != recommended.model_id
+    ]
+    recommended_check = candidate_checks.get(recommended.model_id)
+    budget_allowed = bool(
+        getattr(recommended_check, "allowed", recommended.cost_estimate_usd <= remaining_usd)
+    )
     return ModelRouteResponse(
         recommended=recommended,
         alternatives=alternatives,
@@ -1223,23 +1707,33 @@ async def generate_patch(request: GeneratePatchRequest) -> GeneratePatchResponse
             +# Task: {description[:50]}
              # rest of file
         """)
-        patches.append(FilePatch(
-            path=file_path,
-            action="modify",
-            original_content="# existing code\n# rest of file\n",
-            new_content=f"# existing code\n# AI-generated change ({seed})\n# Task: {description[:50]}\n# rest of file\n",
-            diff=mock_diff.strip(),
-        ))
+        patches.append(
+            FilePatch(
+                path=file_path,
+                action="modify",
+                original_content="# existing code\n# rest of file\n",
+                new_content=(
+                    f"# existing code\n# AI-generated change ({seed})\n"
+                    f"# Task: {description[:50]}\n# rest of file\n"
+                ),
+                diff=mock_diff.strip(),
+            )
+        )
 
     # If no context files provided, generate a single placeholder patch
     if not patches:
-        patches.append(FilePatch(
-            path="src/changes.py",
-            action="create",
-            original_content=None,
-            new_content=f"# New file for: {description[:60]}\n",
-            diff=f"--- /dev/null\n+++ b/src/changes.py\n@@ -0,0 +1,1 @@\n+# New file for: {description[:60]}",
-        ))
+        patches.append(
+            FilePatch(
+                path="src/changes.py",
+                action="create",
+                original_content=None,
+                new_content=f"# New file for: {description[:60]}\n",
+                diff=(
+                    f"--- /dev/null\n+++ b/src/changes.py\n"
+                    f"@@ -0,0 +1,1 @@\n+# New file for: {description[:60]}"
+                ),
+            )
+        )
 
     # Estimate risk based on file count and mode
     risk = "low"
@@ -1262,65 +1756,162 @@ async def generate_patch(request: GeneratePatchRequest) -> GeneratePatchResponse
     )
 
 
+def _module_available(module_name: str) -> bool:
+    return importlib.util.find_spec(module_name) is not None
+
+
+def _validation_command_for_check(
+    *,
+    check_name: str,
+    request: ValidateRequest,
+    config: Config,
+) -> ValidationCommand | None:
+    timeout = request.command_timeouts.get(check_name)
+    workspace = config.workspace_path
+    normalized = check_name.strip().lower()
+    if normalized == "syntax":
+        return ValidationCommand(
+            name="Syntax Check",
+            display_name="Syntax Check",
+            argv=[sys.executable, "-m", "compileall", "-q", str(workspace)],
+            timeout=timeout,
+            cwd=workspace,
+        )
+    if normalized in {"pytest", "tests"}:
+        return ValidationCommand(
+            name="Pytest",
+            display_name="Pytest",
+            argv=[sys.executable, "-m", "pytest", "-q"],
+            timeout=timeout,
+            cwd=workspace,
+        )
+    if normalized == "ruff" and _module_available("ruff"):
+        return ValidationCommand(
+            name="Ruff",
+            display_name="Ruff",
+            argv=[sys.executable, "-m", "ruff", "check", "."],
+            timeout=timeout,
+            cwd=workspace,
+        )
+    if normalized == "mypy" and _module_available("mypy"):
+        return ValidationCommand(
+            name="Mypy",
+            display_name="Mypy",
+            argv=[sys.executable, "-m", "mypy", "."],
+            timeout=timeout,
+            cwd=workspace,
+        )
+    if normalized == "lint" and _module_available("ruff"):
+        return ValidationCommand(
+            name="Lint",
+            display_name="Lint",
+            argv=[sys.executable, "-m", "ruff", "check", "."],
+            timeout=timeout,
+            cwd=workspace,
+        )
+    return None
+
+
 @app.post("/v1/task/validate", response_model=ValidateResponse)
 async def validate_patches(request: ValidateRequest) -> ValidateResponse:
     """Run validation checks on proposed patches."""
+    config = _get_config()
+    runner = ValidationRunner(config=config)
     checks_to_run = request.checks
     results: list[ValidationCheck] = []
 
     for check_name in checks_to_run:
-        if check_name == "syntax":
-            # Mock: all patches pass syntax check
-            results.append(ValidationCheck(
-                name="Syntax Check",
-                status="pass",
-                message="All modified files have valid syntax.",
-            ))
-        elif check_name == "lint":
-            # Mock: check based on number of patches
+        command = _validation_command_for_check(
+            check_name=check_name,
+            request=request,
+            config=config,
+        )
+        if command is not None:
+            command_result = await runner.run_command(command)
+            results.append(
+                ValidationCheck(
+                    name=command_result.name,
+                    status=command_result.status,
+                    message=command_result.message,
+                )
+            )
+            continue
+
+        if check_name == "lint":
             if len(request.patches) > 5:
-                results.append(ValidationCheck(
-                    name="Lint",
-                    status="warn",
-                    message=f"{len(request.patches)} files changed — review lint warnings.",
-                ))
+                results.append(
+                    ValidationCheck(
+                        name="Lint",
+                        status="warn",
+                        message=f"{len(request.patches)} files changed — review lint warnings.",
+                    )
+                )
             else:
-                results.append(ValidationCheck(
-                    name="Lint",
-                    status="pass",
-                    message="No lint issues detected.",
-                ))
+                results.append(
+                    ValidationCheck(
+                        name="Lint",
+                        status="pass",
+                        message="No lint issues detected.",
+                    )
+                )
         elif check_name == "test_impact":
-            # Mock: identify if tests might be affected
             test_files = [p for p in request.patches if "test" in str(p.get("path", "")).lower()]
             if test_files:
-                results.append(ValidationCheck(
-                    name="Test Impact",
-                    status="warn",
-                    message=f"{len(test_files)} test file(s) modified — re-run tests recommended.",
-                ))
+                results.append(
+                    ValidationCheck(
+                        name="Test Impact",
+                        status="warn",
+                        message=(
+                            f"{len(test_files)} test file(s) modified — "
+                            "re-run tests recommended."
+                        ),
+                    )
+                )
             else:
-                results.append(ValidationCheck(
-                    name="Test Impact",
-                    status="pass",
-                    message="No test files affected.",
-                ))
+                results.append(
+                    ValidationCheck(
+                        name="Test Impact",
+                        status="pass",
+                        message="No test files affected.",
+                    )
+                )
         elif check_name == "security":
-            results.append(ValidationCheck(
-                name="Security Scan",
-                status="pass",
-                message="No secrets or vulnerabilities detected in patches.",
-            ))
+            results.append(
+                ValidationCheck(
+                    name="Security Scan",
+                    status="pass",
+                    message="No secrets or vulnerabilities detected in patches.",
+                )
+            )
         else:
-            results.append(ValidationCheck(
-                name=check_name,
-                status="skipped",
-                message=f"Check '{check_name}' not implemented.",
-            ))
+            results.append(
+                ValidationCheck(
+                    name=check_name,
+                    status="skipped",
+                    message=f"Check '{check_name}' not implemented.",
+                )
+            )
 
-    # Determine overall status
+    for command_request in request.commands:
+        command_result = await runner.run_command(
+            ValidationCommand(
+                name=command_request.name,
+                display_name=command_request.name,
+                argv=command_request.command,
+                timeout=command_request.timeout,
+                cwd=config.workspace_path,
+            )
+        )
+        results.append(
+            ValidationCheck(
+                name=command_result.name,
+                status=command_result.status,
+                message=command_result.message,
+            )
+        )
+
     statuses = [c.status for c in results]
-    if "fail" in statuses:
+    if "fail" in statuses or "timeout" in statuses:
         overall = "fail"
     elif "warn" in statuses:
         overall = "warn"
@@ -1342,6 +1933,7 @@ async def start_task_run(request: StartTaskRunRequest) -> StartTaskRunResponse:
         task_text=request.user_request,
         files_changed=[],
         selected_model=request.selected_model,
+        workspace_root=request.workspace_root,
     )
     if not policy_result.allowed:
         raise HTTPException(
@@ -1354,6 +1946,10 @@ async def start_task_run(request: StartTaskRunRequest) -> StartTaskRunResponse:
         )
 
     service = CostGuardService(config=_get_config(), db=_get_db())
+    workspace_root = None
+    if request.workspace_root:
+        workspace_service = WorkspaceRootsService(config=_get_config(), db=_get_db())
+        workspace_root = str(await workspace_service.resolve_workspace_root(request.workspace_root))
     task_run_id = await service.create_task_run(
         user_request=request.user_request,
         task_type=request.task_type,
@@ -1361,6 +1957,7 @@ async def start_task_run(request: StartTaskRunRequest) -> StartTaskRunResponse:
         risk_level=request.risk_level,
         selected_model=request.selected_model,
         estimated_cost=request.estimated_cost,
+        workspace_root=workspace_root,
     )
     return StartTaskRunResponse(task_run_id=task_run_id, status="running")
 
@@ -1413,21 +2010,23 @@ async def task_history(limit: int = 20) -> TaskHistoryResponse:
         report = await service.get_savings_report()
 
         # Generate mock history entries based on actual usage data
-        now = datetime.datetime.now(datetime.timezone.utc)
+        now = datetime.datetime.now(datetime.UTC)
         call_count = min(report.month_total_ai_calls, limit)
         for i in range(call_count):
             ts = now - datetime.timedelta(hours=i * 2)
-            entries.append(TaskHistoryEntry(
-                task_id=f"task-{i + 1:04d}",
-                description=f"Task #{i + 1}",
-                mode="auto",
-                status="completed",
-                model_used="codellama-13b-local" if i % 3 != 0 else "gpt-4o",
-                files_changed=max(1, (i % 5) + 1),
-                cost_usd=round(0.001 * (i % 4), 4) if i % 3 == 0 else 0.0,
-                created_at=ts.isoformat(),
-                duration_ms=1500 + (i * 300),
-            ))
+            entries.append(
+                TaskHistoryEntry(
+                    task_id=f"task-{i + 1:04d}",
+                    description=f"Task #{i + 1}",
+                    mode="auto",
+                    status="completed",
+                    model_used="codellama-13b-local" if i % 3 != 0 else "gpt-4o",
+                    files_changed=max(1, (i % 5) + 1),
+                    cost_usd=round(0.001 * (i % 4), 4) if i % 3 == 0 else 0.0,
+                    created_at=ts.isoformat(),
+                    duration_ms=1500 + (i * 300),
+                )
+            )
     except Exception:
         pass
 
@@ -1443,7 +2042,7 @@ async def cost_dashboard(days: int = 30) -> CostDashboardResponse:
     budget = await service.get_budget_status()
     report = await service.get_savings_report()
 
-    now = datetime.datetime.now(datetime.timezone.utc)
+    now = datetime.datetime.now(datetime.UTC)
 
     # Build daily breakdown from available data
     by_day: list[CostDashboardEntry] = []
@@ -1453,36 +2052,42 @@ async def cost_dashboard(days: int = 30) -> CostDashboardResponse:
 
     for d in range(min(days, 30)):
         date = (now - datetime.timedelta(days=d)).strftime("%Y-%m-%d")
-        by_day.append(CostDashboardEntry(
-            date=date,
-            provider="mixed",
-            model="mixed",
-            calls=avg_daily_calls,
-            tokens=avg_daily_calls * 3000,
-            cost_usd=round(avg_daily_cost, 4),
-        ))
+        by_day.append(
+            CostDashboardEntry(
+                date=date,
+                provider="mixed",
+                model="mixed",
+                calls=avg_daily_calls,
+                tokens=avg_daily_calls * 3000,
+                cost_usd=round(avg_daily_cost, 4),
+            )
+        )
 
     # By-model breakdown
     by_model: list[CostDashboardEntry] = []
     local_calls = int(total_calls * 0.7)
     cloud_calls = total_calls - local_calls
-    by_model.append(CostDashboardEntry(
-        date="",
-        provider="ollama",
-        model="codellama-13b-local",
-        calls=local_calls,
-        tokens=local_calls * 2500,
-        cost_usd=0.0,
-    ))
-    if cloud_calls > 0:
-        by_model.append(CostDashboardEntry(
+    by_model.append(
+        CostDashboardEntry(
             date="",
-            provider="openai",
-            model="gpt-4o",
-            calls=cloud_calls,
-            tokens=cloud_calls * 4000,
-            cost_usd=round(budget.spent_usd, 4),
-        ))
+            provider="ollama",
+            model="codellama-13b-local",
+            calls=local_calls,
+            tokens=local_calls * 2500,
+            cost_usd=0.0,
+        )
+    )
+    if cloud_calls > 0:
+        by_model.append(
+            CostDashboardEntry(
+                date="",
+                provider="openai",
+                model="gpt-4o",
+                calls=cloud_calls,
+                tokens=cloud_calls * 4000,
+                cost_usd=round(budget.spent_usd, 4),
+            )
+        )
 
     return CostDashboardResponse(
         period_days=days,
@@ -1505,6 +2110,7 @@ async def cache_store(request: CacheStoreRequest) -> CacheStoreResponse:
         model=request.model,
         estimated_cost=request.estimated_cost,
         actual_cost=request.actual_cost,
+        response_status=request.response_status,
     )
     return CacheStoreResponse(stored=True)
 
@@ -1513,7 +2119,10 @@ async def cache_store(request: CacheStoreRequest) -> CacheStoreResponse:
 async def cache_lookup(request: CacheLookupRequest) -> CacheLookupResponse:
     cache_service = ResponseCacheService(db=_get_db())
     cost_service = CostGuardService(config=_get_config(), db=_get_db())
-    cached = await cache_service.get(context_pack_hash=request.context_pack_hash)
+    cached = await cache_service.lookup(
+        context_pack_hash=request.context_pack_hash,
+        task_type=request.task_type,
+    )
     if cached is None:
         return CacheLookupResponse(hit=False)
 
@@ -1556,47 +2165,51 @@ async def list_mcp_tools() -> dict:
 
     # Detect MCP server configs from workspace .memopilot/mcp.json or settings
     servers: list[dict] = []
-    import os
     import json as json_mod
+    import os
 
     workspace_root = config.workspace_root if hasattr(config, "workspace_root") else "."
     mcp_config_path = os.path.join(workspace_root, ".memopilot", "mcp.json")
 
     if os.path.exists(mcp_config_path):
         try:
-            with open(mcp_config_path, "r") as f:
+            with open(mcp_config_path) as f:
                 mcp_config = json_mod.load(f)
             for server in mcp_config.get("servers", []):
-                servers.append({
-                    "name": server.get("name", "unknown"),
-                    "status": "configured",
-                    "tools": server.get("tools", []),
-                })
+                servers.append(
+                    {
+                        "name": server.get("name", "unknown"),
+                        "status": "configured",
+                        "tools": server.get("tools", []),
+                    }
+                )
         except Exception:
             pass
 
     # Always include the built-in MemoPilot tools
-    servers.append({
-        "name": "memopilot-builtin",
-        "status": "connected",
-        "tools": [
-            "memory_search",
-            "memory_store",
-            "context_build",
-            "model_route",
-            "patch_generate",
-            "patch_validate",
-            "cost_check",
-            "rule_evaluate",
-        ],
-    })
+    servers.append(
+        {
+            "name": "memopilot-builtin",
+            "status": "connected",
+            "tools": [
+                "memory_search",
+                "memory_store",
+                "context_build",
+                "model_route",
+                "patch_generate",
+                "patch_validate",
+                "cost_check",
+                "rule_evaluate",
+            ],
+        }
+    )
 
     return {"servers": servers}
 
 
 @app.post("/v1/mcp/agentic/run", response_model=AgenticRunResponse)
 async def run_agentic_mcp(request: AgenticRunRequest) -> AgenticRunResponse:
-    orchestrator = MCPOrchestrator(db=_get_db())
+    orchestrator = MCPOrchestrator(db=_get_db(), config=_get_config())
     try:
         result = await orchestrator.run_agentic_loop(
             task_run_id=request.task_run_id,
@@ -1606,6 +2219,7 @@ async def run_agentic_mcp(request: AgenticRunRequest) -> AgenticRunResponse:
                 for item in request.tool_calls
             ],
             max_iterations=request.max_iterations,
+            context=request.context,
         )
     except ValueError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
@@ -1702,10 +2316,18 @@ async def export_workspace_profile(
 
 
 @app.get("/v1/memory/items", response_model=MemoryItemsResponse)
-async def list_memory_items(filter_name: str = "all", limit: int = 100) -> MemoryItemsResponse:
+async def list_memory_items(
+    filter_name: str = "all",
+    limit: int = 100,
+    workspace_root: str | None = None,
+) -> MemoryItemsResponse:
     query = MemoryListQuery(filter_name=filter_name, limit=limit)
-    service = MemoryManagerService(db=_get_db())
-    items = await service.list_items(filter_name=query.filter_name, limit=query.limit)
+    service = MemoryManagerService(config=_get_config(), db=_get_db())
+    items = await service.list_items(
+        filter_name=query.filter_name,
+        limit=query.limit,
+        workspace_root=workspace_root,
+    )
     return MemoryItemsResponse(
         items=[
             MemoryItemResponse(
@@ -1718,6 +2340,11 @@ async def list_memory_items(filter_name: str = "all", limit: int = 100) -> Memor
                 trust_level=item.trust_level,
                 stale=item.stale,
                 tags=item.tags,
+                memory_class=item.memory_class,
+                memory_status=item.memory_status,
+                visibility_scope=item.visibility_scope,
+                reusable=item.reusable,
+                review_required=item.review_required,
                 created_at=item.created_at,
                 updated_at=item.updated_at,
             )
@@ -1726,67 +2353,291 @@ async def list_memory_items(filter_name: str = "all", limit: int = 100) -> Memor
     )
 
 
-@app.post("/v1/memory/suggestions", response_model=SuggestMemoryResponse)
-async def suggest_memory_update(request: SuggestMemoryRequest) -> SuggestMemoryResponse:
-    service = MemoryManagerService(db=_get_db())
-    item_id = await service.suggest_memory_update(
+@app.post("/v1/memory/recall", response_model=RecallResponse)
+async def recall_memory(request: RecallRequest) -> RecallResponse:
+    if request.workspace_root:
+        workspace_service = WorkspaceRootsService(config=_get_config(), db=_get_db())
+        request.workspace_root = str(
+            await workspace_service.resolve_workspace_root(request.workspace_root)
+        )
+    service = MemoryRecallService(_get_db())
+    return await service.recall(request)
+
+
+async def _write_back_memory(request: SuggestMemoryRequest) -> SuggestMemoryResponse:
+    service = MemoryManagerService(config=_get_config(), db=_get_db())
+    workspace_root = None
+    if request.workspace_root:
+        workspace_service = WorkspaceRootsService(config=_get_config(), db=_get_db())
+        workspace_root = str(await workspace_service.resolve_workspace_root(request.workspace_root))
+    result = await service.suggest_memory_update(
         title=request.title,
         body=request.body,
         source=request.source,
         source_path=request.source_path,
         tags=request.tags,
+        task_run_id=request.task_run_id,
+        workspace_root=workspace_root,
     )
-    return SuggestMemoryResponse(memory_item_id=item_id, pending_approval=True)
+    return SuggestMemoryResponse(
+        memory_item_id=result.memory_item_id,
+        pending_approval=result.pending_approval,
+        artifact_id=result.artifact_id,
+        blocked_reason=result.blocked_reason,
+    )
+
+
+@app.post("/v1/memory/writeback", response_model=SuggestMemoryResponse)
+async def write_back_memory(request: SuggestMemoryRequest) -> SuggestMemoryResponse:
+    return await _write_back_memory(request)
+
+
+@app.post("/v1/memory/suggestions", response_model=SuggestMemoryResponse)
+async def suggest_memory_update(request: SuggestMemoryRequest) -> SuggestMemoryResponse:
+    return await _write_back_memory(request)
+
+
+@app.get("/v1/memory/review", response_model=MemoryItemsResponse)
+async def list_memory_review_queue(
+    limit: int = 100,
+    workspace_root: str | None = None,
+) -> MemoryItemsResponse:
+    service = MemoryManagerService(config=_get_config(), db=_get_db())
+    items = await service.list_review_items(limit=limit, workspace_root=workspace_root)
+    return MemoryItemsResponse(
+        items=[
+            MemoryItemResponse(
+                id=item.id,
+                type=item.type,
+                title=item.title,
+                body=item.body,
+                source=item.source,
+                source_path=item.source_path,
+                trust_level=item.trust_level,
+                stale=item.stale,
+                tags=item.tags,
+                memory_class=item.memory_class,
+                memory_status=item.memory_status,
+                visibility_scope=item.visibility_scope,
+                reusable=item.reusable,
+                review_required=item.review_required,
+                created_at=item.created_at,
+                updated_at=item.updated_at,
+            )
+            for item in items
+        ]
+    )
+
+
+@app.patch("/v1/memory/items/{item_id}/review", response_model=MemoryActionResponse)
+async def review_memory_item(item_id: str, request: MemoryReviewRequest) -> MemoryActionResponse:
+    service = MemoryManagerService(config=_get_config(), db=_get_db())
+    try:
+        await service.review_item(
+            item_id, decision=request.decision, workspace_root=request.workspace_root
+        )
+    except ValueError as exc:
+        detail = str(exc)
+        status_code = 404 if detail.startswith("Memory item not found") else 400
+        raise HTTPException(status_code=status_code, detail=detail) from exc
+    return MemoryActionResponse(success=True)
 
 
 @app.post("/v1/memory/items/{item_id}/approve", response_model=MemoryActionResponse)
-async def approve_memory_item(item_id: str) -> MemoryActionResponse:
-    service = MemoryManagerService(db=_get_db())
+async def approve_memory_item(
+    item_id: str, workspace_root: str | None = None
+) -> MemoryActionResponse:
+    service = MemoryManagerService(config=_get_config(), db=_get_db())
     try:
-        await service.approve_item(item_id)
+        await service.approve_item(item_id, workspace_root=workspace_root)
     except ValueError as exc:
-        raise HTTPException(status_code=404, detail=str(exc)) from exc
+        detail = str(exc)
+        status_code = 404 if detail.startswith("Memory item not found") else 400
+        raise HTTPException(status_code=status_code, detail=detail) from exc
     return MemoryActionResponse(success=True)
 
 
 @app.post("/v1/memory/items/{item_id}/reject", response_model=MemoryActionResponse)
-async def reject_memory_item(item_id: str) -> MemoryActionResponse:
-    service = MemoryManagerService(db=_get_db())
+async def reject_memory_item(
+    item_id: str, workspace_root: str | None = None
+) -> MemoryActionResponse:
+    service = MemoryManagerService(config=_get_config(), db=_get_db())
     try:
-        await service.reject_item(item_id)
+        await service.reject_item(item_id, workspace_root=workspace_root)
     except ValueError as exc:
-        raise HTTPException(status_code=404, detail=str(exc)) from exc
+        detail = str(exc)
+        status_code = 404 if detail.startswith("Memory item not found") else 400
+        raise HTTPException(status_code=status_code, detail=detail) from exc
     return MemoryActionResponse(success=True)
 
 
 @app.put("/v1/memory/items/{item_id}", response_model=MemoryActionResponse)
-async def edit_memory_item(item_id: str, request: MemoryEditRequest) -> MemoryActionResponse:
-    service = MemoryManagerService(db=_get_db())
+async def edit_memory_item(
+    item_id: str,
+    request: MemoryEditRequest,
+    workspace_root: str | None = None,
+) -> MemoryActionResponse:
+    service = MemoryManagerService(config=_get_config(), db=_get_db())
     try:
-        await service.edit_item(item_id, title=request.title, body=request.body)
+        await service.edit_item(
+            item_id, title=request.title, body=request.body, workspace_root=workspace_root
+        )
     except ValueError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     return MemoryActionResponse(success=True)
 
 
 @app.delete("/v1/memory/items/{item_id}", response_model=MemoryActionResponse)
-async def delete_memory_item(item_id: str) -> MemoryActionResponse:
-    service = MemoryManagerService(db=_get_db())
+async def delete_memory_item(
+    item_id: str, workspace_root: str | None = None
+) -> MemoryActionResponse:
+    service = MemoryManagerService(config=_get_config(), db=_get_db())
     try:
-        await service.delete_item(item_id)
+        await service.delete_item(item_id, workspace_root=workspace_root)
     except ValueError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     return MemoryActionResponse(success=True)
 
 
 @app.post("/v1/memory/items/{item_id}/rebuild", response_model=MemoryActionResponse)
-async def rebuild_memory_item(item_id: str) -> MemoryActionResponse:
-    service = MemoryManagerService(db=_get_db())
+async def rebuild_memory_item(
+    item_id: str, workspace_root: str | None = None
+) -> MemoryActionResponse:
+    service = MemoryManagerService(config=_get_config(), db=_get_db())
     try:
-        await service.rebuild_item(item_id)
+        await service.rebuild_item(item_id, workspace_root=workspace_root)
     except ValueError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     return MemoryActionResponse(success=True)
+
+
+@app.post("/v1/reviews/evidence", response_model=SubmitReviewEvidenceResponse)
+async def submit_review_evidence(
+    request: SubmitReviewEvidenceRequest,
+) -> SubmitReviewEvidenceResponse:
+    workspace_root = None
+    if request.workspace_root:
+        workspace_service = WorkspaceRootsService(config=_get_config(), db=_get_db())
+        workspace_root = str(await workspace_service.resolve_workspace_root(request.workspace_root))
+    service = CodeReviewMemoryModeService(config=_get_config(), db=_get_db())
+    evidence = await service.submit_review_evidence(
+        pr_number=request.pr_number,
+        body=request.body,
+        path=request.path,
+        line=request.line,
+        workspace_root=workspace_root,
+    )
+    return SubmitReviewEvidenceResponse(
+        evidence_id=evidence.evidence_id, approved=evidence.approved
+    )
+
+
+@app.post("/v1/reviews/approve-lesson", response_model=ApproveReviewLessonResponse)
+async def approve_review_lesson(request: ApproveReviewLessonRequest) -> ApproveReviewLessonResponse:
+    workspace_root = None
+    if request.workspace_root:
+        workspace_service = WorkspaceRootsService(config=_get_config(), db=_get_db())
+        workspace_root = str(await workspace_service.resolve_workspace_root(request.workspace_root))
+    service = CodeReviewMemoryModeService(config=_get_config(), db=_get_db())
+    try:
+        lesson = await service.approve_review_lesson(
+            evidence_id=request.evidence_id,
+            lesson_title=request.lesson_title,
+            lesson_body=request.lesson_body,
+            workspace_root=workspace_root,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    return ApproveReviewLessonResponse(
+        memory_item_id=lesson.memory_item_id,
+        evidence_id=lesson.evidence_id,
+    )
+
+
+@app.post("/v1/memory/review-lessons/extract", response_model=ExtractReviewLessonsResponse)
+async def extract_review_memory_lessons(
+    request: ExtractReviewLessonsRequest,
+) -> ExtractReviewLessonsResponse:
+    lessons = extract_review_lessons(list(request.review_comments))
+    return ExtractReviewLessonsResponse(
+        lessons=[
+            ReviewMemoryLessonResponse(
+                summary=lesson.summary,
+                context=lesson.context,
+                source_pr=lesson.source_pr,
+                source_reviewer=lesson.source_reviewer,
+                approved=lesson.approved,
+            )
+            for lesson in lessons
+        ]
+    )
+
+
+@app.post("/v1/memory/review-lessons/approve", response_model=ApproveReviewMemoryLessonResponse)
+async def approve_review_memory_lesson(
+    request: ApproveReviewMemoryLessonRequest,
+) -> ApproveReviewMemoryLessonResponse:
+    workspace_root = str(_get_config().workspace_path.resolve())
+    if request.workspace_root:
+        workspace_service = WorkspaceRootsService(config=_get_config(), db=_get_db())
+        workspace_root = str(await workspace_service.resolve_workspace_root(request.workspace_root))
+
+    lesson = ReviewMemoryLesson(
+        summary=request.summary,
+        context=request.context,
+        source_pr=request.source_pr,
+        source_reviewer=request.source_reviewer,
+        approved=True,
+    )
+    memory_item = approve_lesson(lesson)
+    memory_item_id = uuid.uuid4().hex
+    conn = await _get_db().connect()
+    tags = json.dumps(
+        {
+            "approved_review_lesson": True,
+            "source_reviewer": request.source_reviewer,
+            "maintainer_approved": True,
+        }
+    )
+    provenance = json.dumps(
+        [
+            {
+                "source_type": "code_review",
+                "source_ref": request.source_pr or "unknown",
+                "source_path": request.context,
+                "reviewer": request.source_reviewer,
+            }
+        ]
+    )
+    await conn.execute(
+        """
+        INSERT INTO memory_items
+        (
+            id, type, title, body, source, source_path, source_hash, trust_level,
+            tags_json, stale, memory_class, memory_status, visibility_scope,
+            reusable, review_required, use_policy_json, provenance_json, workspace_root
+        )
+        VALUES (?, ?, ?, ?, ?, ?, NULL, ?, ?, 0, ?, ?, 'workspace', ?, ?, NULL, ?, ?)
+        """,
+        (
+            memory_item_id,
+            memory_item["type"],
+            memory_item["title"],
+            memory_item["body"],
+            memory_item["source"],
+            memory_item["source_path"],
+            int(memory_item["trust_level"]),
+            tags,
+            memory_item["memory_class"],
+            memory_item["memory_status"],
+            int(memory_item["reusable"]),
+            int(memory_item["review_required"]),
+            provenance,
+            workspace_root,
+        ),
+    )
+    await conn.commit()
+    return ApproveReviewMemoryLessonResponse(memory_item_id=memory_item_id, approved=True)
 
 
 @app.get("/v1/privacy/dashboard", response_model=PrivacyDashboardResponse)
@@ -1814,6 +2665,116 @@ async def get_privacy_dashboard() -> PrivacyDashboardResponse:
     )
 
 
+def _build_evidence_item_response(item) -> EvidenceBoardItemResponse:
+    return EvidenceBoardItemResponse(
+        evidence_id=item.evidence_id,
+        source_type=item.source_type,
+        source_path=item.source_path,
+        source_url=item.source_url,
+        trust_level=item.trust_level,
+        extraction_method=item.extraction_method,
+        extraction_status=item.extraction_status,
+        redacted_values=item.redacted_values,
+        findings=item.findings,
+        investigation_session_id=item.investigation_session_id,
+    )
+
+
+def _build_investigation_session_response(session) -> InvestigationSessionResponse:
+    return InvestigationSessionResponse(
+        id=session.id,
+        title=session.title,
+        description=session.description,
+        mode=session.mode,
+        status=session.status,
+        workspace_root=session.workspace_root,
+        created_at=session.created_at,
+        updated_at=session.updated_at,
+        evidence_count=session.evidence_count,
+        evidence=[_build_evidence_item_response(item) for item in session.evidence],
+    )
+
+
+@app.post("/v1/investigation/start", response_model=InvestigationSessionResponse)
+async def start_investigation(request: StartInvestigationRequest) -> InvestigationSessionResponse:
+    service = InvestigationService(config=_get_config(), db=_get_db())
+    try:
+        session = await service.start_session(
+            title=request.title,
+            description=request.description,
+            mode=request.mode,
+            workspace_root=request.workspace_root,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return _build_investigation_session_response(session)
+
+
+@app.post("/v1/investigation/{session_id}/evidence", response_model=AttachEvidenceResponse)
+async def attach_investigation_evidence(
+    session_id: str,
+    request: AttachEvidenceRequest,
+) -> AttachEvidenceResponse:
+    if not request.evidence_path and not request.source_url:
+        raise HTTPException(
+            status_code=400,
+            detail="Either evidence_path or source_url is required",
+        )
+    service = InvestigationService(config=_get_config(), db=_get_db())
+    try:
+        result = await service.attach_evidence(
+            evidence_path=request.evidence_path,
+            source_url=request.source_url,
+            task_run_id=request.task_run_id,
+            investigation_session_id=session_id,
+            column_mapping=request.column_mapping,
+            workspace_root=request.workspace_root,
+        )
+    except ValueError as exc:
+        status_code = 404 if "Investigation session not found" in str(exc) else 400
+        raise HTTPException(status_code=status_code, detail=str(exc)) from exc
+    return AttachEvidenceResponse(
+        evidence_id=result.evidence_id,
+        source_type=result.source_type,
+        trust_level=result.trust_level,
+        extraction_method=result.extraction_method,
+        extraction_status=result.extraction_status,
+        findings=result.findings,
+        redacted_values=result.redacted_values,
+        source_path=result.source_path,
+        investigation_session_id=result.investigation_session_id,
+    )
+
+
+@app.delete(
+    "/v1/investigation/{session_id}/evidence/{evidence_id}",
+    response_model=RemoveEvidenceResponse,
+)
+async def delete_investigation_evidence(
+    session_id: str,
+    evidence_id: str,
+) -> RemoveEvidenceResponse:
+    service = InvestigationService(config=_get_config(), db=_get_db())
+    try:
+        result = await service.remove_evidence(session_id=session_id, evidence_id=evidence_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    return RemoveEvidenceResponse(evidence_id=result.evidence_id, removed=result.removed)
+
+
+@app.post(
+    "/v1/investigation/{session_id}/transition-to-patch",
+    response_model=InvestigationSessionResponse,
+)
+async def transition_investigation_to_patch(session_id: str) -> InvestigationSessionResponse:
+    service = InvestigationService(config=_get_config(), db=_get_db())
+    try:
+        session = await service.transition_to_patch(session_id=session_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    return _build_investigation_session_response(session)
+
+
 @app.post("/v1/investigation/evidence/attach", response_model=AttachEvidenceResponse)
 async def attach_evidence(request: AttachEvidenceRequest) -> AttachEvidenceResponse:
     if not request.evidence_path and not request.source_url:
@@ -1827,7 +2788,9 @@ async def attach_evidence(request: AttachEvidenceRequest) -> AttachEvidenceRespo
             evidence_path=request.evidence_path,
             source_url=request.source_url,
             task_run_id=request.task_run_id,
+            investigation_session_id=request.investigation_session_id,
             column_mapping=request.column_mapping,
+            workspace_root=request.workspace_root,
         )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -1840,29 +2803,23 @@ async def attach_evidence(request: AttachEvidenceRequest) -> AttachEvidenceRespo
         findings=result.findings,
         redacted_values=result.redacted_values,
         source_path=result.source_path,
+        investigation_session_id=result.investigation_session_id,
     )
 
 
 @app.get("/v1/investigation/evidence", response_model=EvidenceBoardResponse)
-async def list_evidence(task_run_id: str | None = None) -> EvidenceBoardResponse:
+async def list_evidence(
+    task_run_id: str | None = None,
+    investigation_session_id: str | None = None,
+    workspace_root: str | None = None,
+) -> EvidenceBoardResponse:
     service = InvestigationService(config=_get_config(), db=_get_db())
-    items = await service.list_evidence_board(task_run_id=task_run_id)
-    return EvidenceBoardResponse(
-        items=[
-            EvidenceBoardItemResponse(
-                evidence_id=item.evidence_id,
-                source_type=item.source_type,
-                source_path=item.source_path,
-                source_url=item.source_url,
-                trust_level=item.trust_level,
-                extraction_method=item.extraction_method,
-                extraction_status=item.extraction_status,
-                redacted_values=item.redacted_values,
-                findings=item.findings,
-            )
-            for item in items
-        ]
+    items = await service.list_evidence_board(
+        task_run_id=task_run_id,
+        investigation_session_id=investigation_session_id,
+        workspace_root=workspace_root,
     )
+    return EvidenceBoardResponse(items=[_build_evidence_item_response(item) for item in items])
 
 
 @app.post(
@@ -1874,7 +2831,10 @@ async def preview_evidence_columns(
 ) -> EvidenceColumnsPreviewResponse:
     service = InvestigationService(config=_get_config(), db=_get_db())
     try:
-        preview = await service.preview_columns(evidence_path=request.evidence_path)
+        preview = await service.preview_columns(
+            evidence_path=request.evidence_path,
+            workspace_root=request.workspace_root,
+        )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     return EvidenceColumnsPreviewResponse(
@@ -1885,6 +2845,16 @@ async def preview_evidence_columns(
     )
 
 
+@app.get("/v1/investigation/{session_id}", response_model=InvestigationSessionResponse)
+async def get_investigation(session_id: str) -> InvestigationSessionResponse:
+    service = InvestigationService(config=_get_config(), db=_get_db())
+    try:
+        session = await service.get_session(session_id=session_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    return _build_investigation_session_response(session)
+
+
 @app.post("/v1/investigation/run", response_model=RunInvestigationResponse)
 async def run_investigation(request: RunInvestigationRequest) -> RunInvestigationResponse:
     service = InvestigationService(config=_get_config(), db=_get_db())
@@ -1893,6 +2863,7 @@ async def run_investigation(request: RunInvestigationRequest) -> RunInvestigatio
         description=request.description,
         acceptance_criteria=request.acceptance_criteria,
         task_run_id=request.task_run_id,
+        workspace_root=request.workspace_root,
     )
     return RunInvestigationResponse(
         context_pack=result.context_pack,
@@ -1997,6 +2968,35 @@ async def list_context_pack_versions(
     )
 
 
+def _serialize_context_pack_diff(diff_result) -> ContextPackDiffResponse:
+    return ContextPackDiffResponse(
+        from_version_id=diff_result.left_version_id,
+        to_version_id=diff_result.right_version_id,
+        left_version_id=diff_result.left_version_id,
+        right_version_id=diff_result.right_version_id,
+        diff_text=diff_result.diff_text,
+        added_items=diff_result.added_items,
+        removed_items=diff_result.removed_items,
+        token_delta_estimate=diff_result.token_delta_estimate,
+    )
+
+
+@app.get("/v1/context-pack/diff", response_model=ContextPackDiffResponse)
+async def get_context_pack_diff(
+    from_version_id: str,
+    to_version_id: str,
+) -> ContextPackDiffResponse:
+    service = ContextBuilderService(config=_get_config(), db=_get_db())
+    try:
+        diff_result = await service.diff_context_pack_versions(
+            left_version_id=from_version_id,
+            right_version_id=to_version_id,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    return _serialize_context_pack_diff(diff_result)
+
+
 @app.post("/v1/context/versions/diff", response_model=ContextPackDiffResponse)
 async def diff_context_pack_versions(
     request: ContextPackDiffRequest,
@@ -2009,11 +3009,7 @@ async def diff_context_pack_versions(
         )
     except ValueError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
-    return ContextPackDiffResponse(
-        left_version_id=diff_result.left_version_id,
-        right_version_id=diff_result.right_version_id,
-        diff_text=diff_result.diff_text,
-    )
+    return _serialize_context_pack_diff(diff_result)
 
 
 @app.post("/v1/patch/assess", response_model=PatchAssessmentResponse)
@@ -2119,6 +3115,7 @@ async def replay_ai_call(ai_call_id: str) -> ReplayAICallResponse:
 
 
 @app.get("/v1/skills/store", response_model=SkillStoreListResponse)
+@app.get("/v1/skills", response_model=SkillStoreListResponse)
 async def list_skill_store(limit: int = 100) -> SkillStoreListResponse:
     service = SkillLoaderService(config=_get_config(), db=_get_db())
     items = await service.list_skills(limit=limit)
@@ -2131,6 +3128,7 @@ async def list_skill_store(limit: int = 100) -> SkillStoreListResponse:
                 enabled=item.enabled,
                 version=item.version,
                 conflict=item.conflict,
+                source=item.source,
             )
             for item in items
         ]
@@ -2158,59 +3156,74 @@ async def upsert_skill_store_item(
         enabled=item.enabled,
         version=item.version,
         conflict=item.conflict,
+        source=item.source,
+    )
+
+
+@app.post("/v1/skills/import", response_model=SkillStoreItemResponse)
+async def import_skill_store_item(request: SkillImportRequest) -> SkillStoreItemResponse:
+    service = SkillLoaderService(config=_get_config(), db=_get_db())
+    try:
+        item = await service.import_skill_from_yaml(request.yaml_content)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return SkillStoreItemResponse(
+        skill_id=item.skill_id,
+        name=item.name,
+        applies_when=item.applies_when,
+        enabled=item.enabled,
+        version=item.version,
+        conflict=item.conflict,
+        source=item.source,
+    )
+
+
+@app.get("/v1/skills/conflicts", response_model=SkillConflictListResponse)
+async def list_skill_conflicts() -> SkillConflictListResponse:
+    service = SkillLoaderService(config=_get_config(), db=_get_db())
+    items = await service.detect_conflicts()
+    return SkillConflictListResponse(
+        items=[
+            SkillConflictItemResponse(
+                first_skill_id=item.first_skill_id,
+                first_name=item.first_name,
+                second_skill_id=item.second_skill_id,
+                second_name=item.second_name,
+                language=item.language,
+                path_contains=item.path_contains,
+                contradictory_rules=item.contradictory_rules,
+            )
+            for item in items
+        ]
     )
 
 
 @app.get("/v1/rules/active", response_model=ActiveRulesResponse)
-async def get_active_rules() -> ActiveRulesResponse:
+async def get_active_rules(workspace_root: str | None = None) -> ActiveRulesResponse:
     """Return merged view of global rules, project rules, and detected skills."""
     config = _get_config()
     db = _get_db()
 
-    # Gather project rules from active policy packs
     policy_service = PolicyPacksService(config=config, db=db)
-    packs = await policy_service.list_policy_packs(limit=50)
+    active_policy_rules = await policy_service.list_active_policy_rules(
+        workspace_root=workspace_root
+    )
 
     global_rules: list[ActiveRuleItem] = []
     project_rules: list[ActiveRuleItem] = []
 
-    for pack in packs:
-        if not pack.active:
-            continue
-        category = "global" if "global" in pack.name.lower() else "project"
+    for index, rule in enumerate(active_policy_rules):
+        category = "global" if rule.source_kind == "global_dev_rules" else "project"
         target = global_rules if category == "global" else project_rules
-        for i, rule_text in enumerate(pack.rules):
-            target.append(ActiveRuleItem(
-                rule_id=f"{pack.pack_id}-r{i}",
-                text=rule_text,
-                source_file=f"policy-pack:{pack.name}",
+        target.append(
+            ActiveRuleItem(
+                rule_id=f"active-rule-{index}",
+                text=rule.rule,
+                source_file=rule.source,
                 enabled=True,
                 category=category,
-            ))
-
-    # Also scan workspace rule files
-    rules_dir = config.memopilot_dir / "rules"
-    if rules_dir.exists():
-        import yaml  # noqa: PLC0415
-
-        for rule_file in sorted(rules_dir.glob("*.yaml")):
-            try:
-                content = rule_file.read_text(encoding="utf-8")
-                data = yaml.safe_load(content) or {}
-                rules_list = data.get("rules", [])
-                is_global = "global" in rule_file.stem.lower()
-                target = global_rules if is_global else project_rules
-                for i, rule in enumerate(rules_list):
-                    rule_text = rule if isinstance(rule, str) else str(rule.get("text", rule))
-                    target.append(ActiveRuleItem(
-                        rule_id=f"{rule_file.stem}-r{i}",
-                        text=rule_text,
-                        source_file=str(rule_file.relative_to(config.workspace_path)),
-                        enabled=True,
-                        category="global" if is_global else "project",
-                    ))
-            except Exception:
-                pass  # Skip malformed rule files
+            )
+        )
 
     # Gather detected skills (enabled skills from store + detected frameworks)
     skill_service = SkillLoaderService(config=config, db=db)
@@ -2231,12 +3244,14 @@ async def get_active_rules() -> ActiveRulesResponse:
     existing_names = {s.name.lower() for s in skills}
     for fw in frameworks:
         if fw.lower() not in existing_names:
-            detected_skills.append(ActiveSkillItem(
-                skill_id=f"fw-{fw}",
-                name=fw,
-                framework="python",
-                enabled=True,
-            ))
+            detected_skills.append(
+                ActiveSkillItem(
+                    skill_id=f"fw-{fw}",
+                    name=fw,
+                    framework="python",
+                    enabled=True,
+                )
+            )
 
     return ActiveRulesResponse(
         global_rules=global_rules,
@@ -2254,6 +3269,7 @@ async def backup_memory() -> BackupMemoryResponse:
         backup_path=backup.backup_path,
         item_count=backup.item_count,
         created_at=backup.created_at,
+        manifest=backup.manifest,
     )
 
 
@@ -2275,11 +3291,15 @@ async def optimize_tools_and_skills(
     result = await service.optimize_tools_and_skills(
         task_text=request.task_text,
         available_tools=request.available_tools,
+        task_type=request.task_type,
+        budget_profile=request.budget_profile,
     )
     return ToolSkillOptimizeResponse(
         suggested_tools=result.suggested_tools,
+        excluded_tools=result.excluded_tools,
         suggested_skills=result.suggested_skills,
         reasons=result.reasons,
+        reasons_map=result.reasons_map,
     )
 
 
@@ -2329,6 +3349,53 @@ async def classify_evidence_source(request: EvidenceClassifyRequest) -> Evidence
         trust_level=trust_level,
         extraction_method=extraction_method,
     )
+
+
+@app.post("/v1/evidence/extract-pdf", response_model=ExtractionResultResponse)
+async def extract_pdf_evidence(request: ExtractPdfRequest) -> ExtractionResultResponse:
+    result = extract_pdf(await _resolve_workspace_file(request.file_path, request.workspace_root))
+    return _serialize_extraction_result(result)
+
+
+@app.post("/v1/evidence/extract-excel", response_model=ExtractionResultResponse)
+async def extract_excel_evidence(request: ExtractExcelRequest) -> ExtractionResultResponse:
+    result = extract_excel(
+        await _resolve_workspace_file(request.file_path, request.workspace_root),
+        sheet_names=request.sheet_names,
+        column_mapping=request.column_mapping,
+    )
+    return _serialize_extraction_result(result)
+
+
+@app.post("/v1/evidence/extract-csv", response_model=ExtractionResultResponse)
+async def extract_csv_evidence(request: ExtractCsvRequest) -> ExtractionResultResponse:
+    result = extract_csv(
+        await _resolve_workspace_file(request.file_path, request.workspace_root),
+        delimiter=request.delimiter,
+        column_mapping=request.column_mapping,
+    )
+    return _serialize_extraction_result(result)
+
+
+@app.post("/v1/evidence/extract-docx", response_model=ExtractionResultResponse)
+async def extract_docx_evidence(request: ExtractDocxRequest) -> ExtractionResultResponse:
+    result = extract_docx(await _resolve_workspace_file(request.file_path, request.workspace_root))
+    return _serialize_extraction_result(result)
+
+
+@app.post("/v1/evidence/extract-pptx", response_model=ExtractionResultResponse)
+async def extract_pptx_evidence(request: ExtractPptxRequest) -> ExtractionResultResponse:
+    result = extract_pptx(await _resolve_workspace_file(request.file_path, request.workspace_root))
+    return _serialize_extraction_result(result)
+
+
+@app.post("/v1/evidence/analyze-image", response_model=ImageAnalysisResponse)
+async def analyze_image_evidence(request: AnalyzeImageRequest) -> ImageAnalysisResponse:
+    result: ImageAnalysisResult = await analyze_image(
+        await _resolve_workspace_file(request.file_path, request.workspace_root),
+        allow_cloud=request.allow_cloud,
+    )
+    return ImageAnalysisResponse(**result.__dict__)
 
 
 @app.get("/v1/policies/packs", response_model=PolicyPacksResponse)
@@ -2384,6 +3451,72 @@ async def activate_policy_pack(request: ActivatePolicyPackRequest) -> MemoryActi
     return MemoryActionResponse(success=True)
 
 
+@app.post("/v1/policies/load", response_model=PolicyPacksResponse)
+async def load_policy_packs(
+    request: PolicyDirectoryLoadRequest | None = None,
+    workspace_root: str | None = None,
+) -> PolicyPacksResponse:
+    service = PolicyPacksService(config=_get_config(), db=_get_db())
+    if request is not None and request.policy_dir:
+        items = await service.load_from_directory(Path(request.policy_dir))
+    else:
+        resolved_workspace = request.workspace_root if request is not None else workspace_root
+        items = await service.load_policy_directory(workspace_root=resolved_workspace)
+    return PolicyPacksResponse(
+        items=[
+            PolicyPackItemResponse(
+                pack_id=item.pack_id,
+                name=item.name,
+                description=item.description,
+                enforcement_mode=item.enforcement_mode,
+                rules=item.rules,
+                active=item.active,
+                version=item.version,
+            )
+            for item in items
+        ]
+    )
+
+
+@app.get("/v1/policies/active", response_model=ActivePolicyRulesResponse)
+async def list_active_policy_rules(workspace_root: str | None = None) -> ActivePolicyRulesResponse:
+    service = PolicyPacksService(config=_get_config(), db=_get_db())
+    items = await service.list_active_policy_rules(workspace_root=workspace_root)
+    conflicts = service.resolve_conflicts(items)
+    return ActivePolicyRulesResponse(
+        items=[
+            ActivePolicyRuleResponse(
+                rule=item.rule,
+                source=item.source,
+                source_kind=item.source_kind,
+                precedence=item.precedence,
+                enforcement_mode=item.enforcement_mode,
+                pack_id=item.pack_id,
+                pack_name=item.pack_name,
+            )
+            for item in items
+        ],
+        conflicts=[
+            PolicyConflictResponse(
+                rule=item.rule,
+                source=item.source,
+                source_kind=item.source_kind,
+                overridden_by_rule=item.overridden_by_rule,
+                overridden_by_source=item.overridden_by_source,
+                overridden_by_kind=item.overridden_by_kind,
+                conflict_key=item.conflict_key,
+            )
+            for item in conflicts
+        ],
+        precedence_order=[
+            "safety_rules",
+            "policy_pack_rules",
+            "workspace_rules",
+            "global_dev_rules",
+        ],
+    )
+
+
 @app.post("/v1/policies/evaluate", response_model=PolicyEvaluateResponse)
 async def evaluate_policy_pack(request: PolicyEvaluateRequest) -> PolicyEvaluateResponse:
     service = PolicyPacksService(config=_get_config(), db=_get_db())
@@ -2392,6 +3525,7 @@ async def evaluate_policy_pack(request: PolicyEvaluateRequest) -> PolicyEvaluate
         task_text=request.task_text,
         files_changed=request.files_changed,
         selected_model=request.selected_model,
+        workspace_root=request.workspace_root,
     )
     return PolicyEvaluateResponse(
         allowed=result.allowed,
@@ -2427,9 +3561,11 @@ async def save_local_flow(request: SaveLocalFlowRequest) -> LocalFlowItemRespons
     service = FlowBuilderService(config=_get_config(), db=_get_db())
     try:
         item = await service.save_flow(
+            flow_id=request.flow_id,
             name=request.name,
             description=request.description,
             steps=[step.model_dump(exclude_none=True) for step in request.steps],
+            flow_yaml=request.flow_yaml,
         )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -2451,6 +3587,13 @@ async def run_local_flow(request: RunLocalFlowRequest) -> RunLocalFlowResponse:
             task_text=request.task_text,
             files_changed=request.files_changed,
             selected_model=request.selected_model,
+            constraints=request.constraints,
+            approved_steps=request.approved_steps,
+            planned_mcp_calls=request.planned_mcp_calls,
+            mcp_cap=request.mcp_cap,
+            failure_count=request.failure_count,
+            allow_file_modifications=request.allow_file_modifications,
+            workspace_root=request.workspace_root,
         )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -2465,9 +3608,12 @@ async def run_local_flow(request: RunLocalFlowRequest) -> RunLocalFlowResponse:
 
 
 @app.get("/v1/workspaces", response_model=WorkspaceRootsResponse)
-async def list_workspace_roots(limit: int = 100) -> WorkspaceRootsResponse:
+async def list_workspace_roots(
+    limit: int = 100,
+    workspace_root: str | None = None,
+) -> WorkspaceRootsResponse:
     service = WorkspaceRootsService(config=_get_config(), db=_get_db())
-    items = await service.list_workspace_roots(limit=limit)
+    items = await service.list_roots(limit=limit, workspace_root=workspace_root)
     return WorkspaceRootsResponse(
         items=[
             WorkspaceRootItemResponse(
@@ -2489,6 +3635,7 @@ async def add_workspace_root(request: AddWorkspaceRootRequest) -> WorkspaceRootI
             root_path=request.root_path,
             label=request.label,
             activate=request.activate,
+            workspace_root=request.workspace_root,
         )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -2506,7 +3653,18 @@ async def activate_workspace_root(
 ) -> WorkspaceRootItemResponse:
     service = WorkspaceRootsService(config=_get_config(), db=_get_db())
     try:
-        item = await service.activate_workspace_root(workspace_id=request.workspace_id)
+        if request.root_path:
+            item = await service.set_active_root(
+                request.root_path,
+                workspace_root=request.workspace_root,
+            )
+        elif request.workspace_id:
+            item = await service.activate_workspace_root(
+                workspace_id=request.workspace_id,
+                workspace_root=request.workspace_root,
+            )
+        else:
+            raise ValueError("workspace_id or root_path is required")
     except ValueError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     return WorkspaceRootItemResponse(
@@ -2514,6 +3672,42 @@ async def activate_workspace_root(
         root_path=item.root_path,
         label=item.label,
         active=item.active,
+    )
+
+
+async def _resolve_workspace_file(file_path: str, workspace_root: str | None = None) -> Path:
+    candidate = Path(file_path)
+    config = _get_config()
+    workspace_service = WorkspaceRootsService(config=config, db=_get_db())
+    try:
+        resolved_workspace_root = await workspace_service.resolve_workspace_root(workspace_root)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if not candidate.is_absolute():
+        candidate = (resolved_workspace_root / candidate).resolve()
+        if not candidate.is_relative_to(resolved_workspace_root):
+            raise HTTPException(status_code=400, detail="Path traversal denied")
+    return candidate.resolve()
+
+
+def _serialize_extraction_result(result: object) -> ExtractionResultResponse:
+    chunks = getattr(result, "chunks", [])
+    return ExtractionResultResponse(
+        source_type=str(getattr(result, "source_type", "")),
+        chunks=[
+            DocumentChunkResponse(
+                chunk_index=chunk.chunk_index,
+                chunk_text=chunk.chunk_text,
+                source_hash=chunk.source_hash,
+                trust_level=chunk.trust_level,
+                memory_class=chunk.memory_class,
+                memory_status=chunk.memory_status,
+            )
+            for chunk in chunks
+        ],
+        metadata=dict(getattr(result, "metadata", {}) or {}),
+        error=getattr(result, "error", None),
+        requires_ocr=bool(getattr(result, "requires_ocr", False)),
     )
 
 

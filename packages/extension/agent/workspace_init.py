@@ -32,6 +32,13 @@ log_level: info
 
 # budget:
 #   monthly_budget_usd: 20
+#
+# mcp:
+#   iteration_caps:
+#     pre_fetch: 8
+#     patch_generation: 5
+#     investigation: 12
+#     hard_absolute_cap: 20
 """
 
 GLOBAL_PROVIDERS_STUB = """\

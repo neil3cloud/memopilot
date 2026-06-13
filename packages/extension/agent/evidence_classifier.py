@@ -1,9 +1,14 @@
-"""Dedicated evidence source classifier for investigation mode."""
+"""Deterministic evidence source classifier for investigation mode."""
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from pathlib import Path
+
+_STACK_TRACE_ERROR_PATTERN = re.compile(r"(?ms)^Error:\s+.+(?:\r?\n[ \t]+.+)+")
+_IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp"}
+_SCREENSHOT_TOKENS = ("screenshot", "screen", "capture", "snip", "ui", "modal", "dialog")
 
 
 @dataclass(frozen=True)
@@ -11,6 +16,42 @@ class EvidenceClassification:
     source_type: str
     trust_level: int
     extraction_method: str
+
+
+def classify_evidence(file_path: str, content_preview: str | None = None) -> tuple[str, int]:
+    """Returns (source_type, trust_level)."""
+    path = Path(file_path)
+    suffix = path.suffix.lower()
+    name = path.name.lower()
+    preview = content_preview or ""
+
+    if suffix in {".log", ".txt"}:
+        if _looks_like_stack_trace(preview):
+            return "stack_trace", 4
+        return "text_log", 3
+    if suffix == ".md":
+        return "markdown_doc", 4
+    if suffix == ".csv":
+        return "csv_data", 3
+    if suffix in {".xlsx", ".xls", ".xlsm", ".xltx"}:
+        return "spreadsheet", 3
+    if suffix == ".pdf":
+        return "pdf_doc", 3
+    if suffix in {".json", ".xml"}:
+        return "api_payload", 3
+    if suffix in {".sql", ".ddl"}:
+        return "database_schema", 4
+    if suffix in {".py", ".ts", ".cs", ".java"}:
+        return "existing_code", 5
+    if suffix == ".docx":
+        return "word_doc", 3
+    if suffix == ".pptx":
+        return "powerpoint_doc", 3
+    if suffix in _IMAGE_SUFFIXES:
+        if any(token in name for token in _SCREENSHOT_TOKENS):
+            return "screenshot", 4
+        return "image", 5
+    return "unknown", 2
 
 
 class EvidenceSourceClassifier:
@@ -21,78 +62,48 @@ class EvidenceSourceClassifier:
         *,
         evidence_path: Path | None,
         source_url: str | None,
+        content_preview: str | None = None,
     ) -> EvidenceClassification:
-        source_type = self._source_type(evidence_path=evidence_path, source_url=source_url)
+        if source_url:
+            source_type = "external_work_item"
+            trust_level = 3
+        else:
+            source_type, trust_level = classify_evidence(
+                str(evidence_path) if evidence_path is not None else "",
+                content_preview=content_preview,
+            )
         return EvidenceClassification(
             source_type=source_type,
-            trust_level=self._trust_level(source_type),
+            trust_level=trust_level,
             extraction_method=self._extraction_method(source_type),
         )
 
-    def _source_type(self, *, evidence_path: Path | None, source_url: str | None) -> str:
-        if source_url:
-            return "external_work_item"
-        if evidence_path is None:
-            return "text_note"
-
-        suffix = evidence_path.suffix.lower()
-        name = evidence_path.name.lower()
-        if suffix == ".md":
-            return "markdown_doc"
-        if suffix == ".csv":
-            return "csv_data"
-        if suffix in (".txt", ".log"):
-            return "text_log"
-        if suffix in (".json", ".xml"):
-            return "api_payload"
-        if suffix in (".xlsx", ".xlsm", ".xltx"):
-            return "excel_sheet"
-        if suffix == ".pdf":
-            return "pdf_doc"
-        if suffix == ".docx":
-            return "word_doc"
-        if suffix == ".pptx":
-            return "powerpoint_doc"
-        if suffix in (".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp"):
-            if self._looks_like_screenshot(name):
-                return "screenshot"
-            return "image"
-        return "text_note"
-
-    def _trust_level(self, source_type: str) -> int:
-        mapping = {
-            "markdown_doc": 2,
-            "text_log": 3,
-            "csv_data": 3,
-            "api_payload": 3,
-            "excel_sheet": 3,
-            "pdf_doc": 2,
-            "word_doc": 3,
-            "powerpoint_doc": 3,
-            "screenshot": 4,
-            "external_work_item": 3,
-            "image": 5,
-            "text_note": 2,
-        }
-        return mapping.get(source_type, 3)
-
     def _extraction_method(self, source_type: str) -> str:
         mapping = {
-            "markdown_doc": "text_parsing",
+            "stack_trace": "stack_trace_parsing",
             "text_log": "text_parsing",
+            "markdown_doc": "text_parsing",
             "csv_data": "column_parsing",
-            "api_payload": "payload_parsing",
-            "excel_sheet": "excel_parsing",
+            "spreadsheet": "excel_parsing",
             "pdf_doc": "pdf_text_parsing",
+            "api_payload": "payload_parsing",
+            "database_schema": "schema_parsing",
+            "existing_code": "code_parsing",
             "word_doc": "word_text_parsing",
             "powerpoint_doc": "slide_text_parsing",
             "screenshot": "image_analysis",
             "external_work_item": "work_item_summary",
             "image": "ocr_required",
-            "text_note": "text_parsing",
+            "unknown": "text_parsing",
         }
         return mapping.get(source_type, "text_parsing")
 
-    def _looks_like_screenshot(self, name: str) -> bool:
-        tokens = ("screenshot", "screen", "capture", "snip", "ui", "modal", "dialog")
-        return any(token in name for token in tokens)
+
+def _looks_like_stack_trace(content_preview: str) -> bool:
+    if not content_preview:
+        return False
+    if "Traceback (most recent call last):" in content_preview:
+        return True
+    if "Exception" in content_preview and "  at " in content_preview:
+        return True
+    return bool(_STACK_TRACE_ERROR_PATTERN.search(content_preview))

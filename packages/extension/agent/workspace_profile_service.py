@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from copy import deepcopy
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -11,6 +12,17 @@ import yaml
 from .config import Config
 from .db import DatabaseManager
 
+_PROFILE_ROW_ID = "default"
+_USER_EDITED_MARKER = "# user-edited"
+_DEFAULT_USER_EDITED_PATHS = {
+    ("workspace", "test_commands"),
+    ("workspace", "lint_commands"),
+    ("workspace", "typecheck_commands"),
+    ("workspace", "model_policy"),
+    ("workspace", "privacy_policy"),
+    ("workspace", "mcp"),
+}
+
 
 @dataclass(frozen=True)
 class WorkspaceProfileResult:
@@ -19,67 +31,97 @@ class WorkspaceProfileResult:
 
 
 class WorkspaceProfileService:
-    """Builds and persists workspace profile YAML from project introspection."""
+    """Maintains YAML as source-of-truth and SQLite as a read cache."""
 
     def __init__(self, *, config: Config, db: DatabaseManager) -> None:
         self._config = config
         self._db = db
+        self._profile_path = self._config.memopilot_dir / "workspace.profile.yaml"
 
     async def ensure_profile(self) -> WorkspaceProfileResult:
-        current = await self.get_profile()
-        if current is not None:
-            return current
+        if self._profile_path.exists():
+            return await self.sync_from_yaml()
         return await self.rebuild_profile()
+
+    async def sync_from_yaml(self) -> WorkspaceProfileResult:
+        if not self._profile_path.exists():
+            raise FileNotFoundError(f"workspace profile not found: {self._profile_path}")
+
+        profile_yaml = self._profile_path.read_text(encoding="utf-8")
+        parsed = self._parse_profile_yaml(profile_yaml)
+        valid, issues = self._validate_profile_dict(parsed)
+        if not valid:
+            raise ValueError("invalid workspace profile: " + "; ".join(issues))
+
+        conn = await self._db.connect()
+        await conn.execute(
+            """
+            INSERT INTO workspace_profile (
+                id, profile_yaml, detected_at, updated_at, is_cache, synced_from_yaml_at
+            )
+            VALUES (?, ?, datetime('now'), datetime('now'), 1, datetime('now'))
+            ON CONFLICT(id) DO UPDATE SET
+                profile_yaml = excluded.profile_yaml,
+                updated_at = datetime('now'),
+                is_cache = 1,
+                synced_from_yaml_at = excluded.synced_from_yaml_at
+            """,
+            (_PROFILE_ROW_ID, profile_yaml),
+        )
+        await conn.commit()
+        return WorkspaceProfileResult(profile=parsed, profile_yaml=profile_yaml)
 
     async def get_profile(self) -> WorkspaceProfileResult | None:
         conn = await self._db.connect()
         cursor = await conn.execute(
-            "SELECT profile_yaml FROM workspace_profile WHERE id = ?",
-            ("default",),
+            """
+            SELECT profile_yaml
+            FROM workspace_profile
+            WHERE id = ?
+            """,
+            (_PROFILE_ROW_ID,),
         )
         row = await cursor.fetchone()
         if row is None:
             return None
 
-        profile_yaml = row["profile_yaml"]
-        parsed = yaml.safe_load(profile_yaml) or {}
+        profile_yaml = str(row["profile_yaml"])
+        parsed = self._parse_profile_yaml(profile_yaml)
         return WorkspaceProfileResult(profile=parsed, profile_yaml=profile_yaml)
 
     async def rebuild_profile(self) -> WorkspaceProfileResult:
-        existing = await self.get_profile()
-        detected = await self._detect_profile()
-        merged = self._merge_with_existing(existing.profile if existing else {}, detected)
-        profile_yaml = yaml.safe_dump(merged, sort_keys=False)
+        existing_profile: dict[str, Any] = {}
+        user_edited_paths = set(_DEFAULT_USER_EDITED_PATHS)
+        if self._profile_path.exists():
+            existing_yaml = self._profile_path.read_text(encoding="utf-8")
+            existing_profile = self._parse_profile_yaml(existing_yaml)
+            user_edited_paths.update(self._extract_user_edited_paths(existing_yaml))
 
-        conn = await self._db.connect()
-        await conn.execute(
-            """
-            INSERT INTO workspace_profile (id, profile_yaml, detected_at, updated_at)
-            VALUES ('default', ?, datetime('now'), datetime('now'))
-            ON CONFLICT(id) DO UPDATE SET
-                profile_yaml = excluded.profile_yaml,
-                updated_at = datetime('now')
-            """,
-            (profile_yaml,),
+        detected = await self._detect_profile()
+        merged = self._merge_preserving_user_edited(
+            existing=existing_profile,
+            detected=detected,
+            user_edited_paths=user_edited_paths,
         )
-        await conn.commit()
-        return WorkspaceProfileResult(profile=merged, profile_yaml=profile_yaml)
+        rendered_yaml = yaml.safe_dump(merged, sort_keys=False)
+        profile_yaml = self._annotate_user_edited_fields(rendered_yaml, user_edited_paths)
+
+        self._profile_path.parent.mkdir(parents=True, exist_ok=True)
+        self._profile_path.write_text(profile_yaml, encoding="utf-8")
+        return await self.sync_from_yaml()
 
     async def validate_profile(self) -> tuple[bool, list[str]]:
-        current = await self.get_profile()
-        if current is None:
-            return False, ["workspace profile not found"]
+        if self._profile_path.exists():
+            try:
+                current = await self.sync_from_yaml()
+            except (ValueError, yaml.YAMLError) as exc:
+                return False, [str(exc)]
+        else:
+            current = await self.get_profile()
+            if current is None:
+                return False, ["workspace profile not found"]
 
-        workspace = current.profile.get("workspace")
-        if not isinstance(workspace, dict):
-            return False, ["workspace section missing"]
-
-        issues: list[str] = []
-        required_fields = ("name", "primary_language", "model_policy", "privacy_policy")
-        for field in required_fields:
-            if field not in workspace:
-                issues.append(f"workspace.{field} missing")
-        return len(issues) == 0, issues
+        return self._validate_profile_dict(current.profile)
 
     async def export_profile(self, export_path: Path) -> str:
         profile = await self.ensure_profile()
@@ -180,36 +222,139 @@ class WorkspaceProfileService:
         row = await cursor.fetchone()
         return int(row["total"] or 0) > 0
 
-    def _merge_with_existing(
+    def _parse_profile_yaml(self, profile_yaml: str) -> dict[str, Any]:
+        parsed = yaml.safe_load(profile_yaml) or {}
+        if not isinstance(parsed, dict):
+            raise ValueError("workspace profile must be a YAML mapping")
+        return parsed
+
+    def _validate_profile_dict(self, profile: dict[str, Any]) -> tuple[bool, list[str]]:
+        workspace = profile.get("workspace")
+        if not isinstance(workspace, dict):
+            return False, ["workspace section missing"]
+
+        issues: list[str] = []
+        required_fields = ("name", "primary_language", "model_policy", "privacy_policy")
+        for field in required_fields:
+            if field not in workspace:
+                issues.append(f"workspace.{field} missing")
+        return len(issues) == 0, issues
+
+    def _merge_preserving_user_edited(
         self,
+        *,
         existing: dict[str, Any],
         detected: dict[str, Any],
+        user_edited_paths: set[tuple[str, ...]],
     ) -> dict[str, Any]:
-        existing_workspace = existing.get("workspace")
-        if not isinstance(existing_workspace, dict):
-            return detected
-
-        merged = detected.copy()
-        detected_workspace = dict(detected["workspace"])
-        user_preserve_fields = (
-            "test_commands",
-            "lint_commands",
-            "typecheck_commands",
-            "model_policy",
-            "privacy_policy",
-            "mcp",
-        )
-        for field in user_preserve_fields:
-            value = existing_workspace.get(field)
-            if value is not None:
-                detected_workspace[field] = value
-
-        for key, value in existing_workspace.items():
-            if key not in detected_workspace:
-                detected_workspace[key] = value
-
-        merged["workspace"] = detected_workspace
+        merged = deepcopy(detected)
+        for path in user_edited_paths:
+            existing_value = self._get_nested_value(existing, path)
+            if existing_value is not None:
+                self._set_nested_value(merged, path, deepcopy(existing_value))
         return merged
+
+    def _extract_user_edited_paths(self, profile_yaml: str) -> set[tuple[str, ...]]:
+        paths: set[tuple[str, ...]] = set()
+        key_stack: list[str] = []
+        pending_user_edit = False
+
+        for raw_line in profile_yaml.splitlines():
+            stripped = raw_line.strip()
+            if not stripped:
+                continue
+            if stripped.startswith("#"):
+                pending_user_edit = _USER_EDITED_MARKER in stripped
+                continue
+            if stripped.startswith("- ") or ":" not in stripped:
+                pending_user_edit = False
+                continue
+
+            indent = len(raw_line) - len(raw_line.lstrip(" "))
+            level = indent // 2
+            while len(key_stack) > level:
+                key_stack.pop()
+
+            key, _, remainder = stripped.partition(":")
+            current_path = tuple(key_stack + [key.strip().strip("\"'")])
+            if pending_user_edit or _USER_EDITED_MARKER in remainder:
+                paths.add(current_path)
+
+            value_without_comment = remainder.split("#", 1)[0].strip()
+            if value_without_comment == "":
+                if len(key_stack) == level:
+                    key_stack.append(key.strip().strip("\"'"))
+                else:
+                    key_stack = key_stack[:level] + [key.strip().strip("\"'")]
+            pending_user_edit = False
+
+        return paths
+
+    def _annotate_user_edited_fields(
+        self,
+        profile_yaml: str,
+        user_edited_paths: set[tuple[str, ...]],
+    ) -> str:
+        if not user_edited_paths:
+            return profile_yaml
+
+        annotated_lines: list[str] = []
+        key_stack: list[str] = []
+        for raw_line in profile_yaml.splitlines():
+            stripped = raw_line.strip()
+            if (
+                not stripped
+                or stripped.startswith("#")
+                or stripped.startswith("- ")
+                or ":" not in stripped
+            ):
+                annotated_lines.append(raw_line)
+                continue
+
+            indent = len(raw_line) - len(raw_line.lstrip(" "))
+            level = indent // 2
+            while len(key_stack) > level:
+                key_stack.pop()
+
+            key, _, remainder = stripped.partition(":")
+            normalized_key = key.strip().strip("\"'")
+            current_path = tuple(key_stack + [normalized_key])
+            line = raw_line
+            if current_path in user_edited_paths and _USER_EDITED_MARKER not in raw_line:
+                suffix = (
+                    f"  {_USER_EDITED_MARKER}"
+                    if raw_line.rstrip().endswith(":")
+                    else f" {_USER_EDITED_MARKER}"
+                )
+                line = raw_line.rstrip() + suffix
+            annotated_lines.append(line)
+
+            value_without_comment = remainder.split("#", 1)[0].strip()
+            if value_without_comment == "":
+                if len(key_stack) == level:
+                    key_stack.append(normalized_key)
+                else:
+                    key_stack = key_stack[:level] + [normalized_key]
+
+        return "\n".join(annotated_lines) + "\n"
+
+    def _get_nested_value(self, payload: dict[str, Any], path: tuple[str, ...]) -> Any | None:
+        current: Any = payload
+        for key in path:
+            if not isinstance(current, dict) or key not in current:
+                return None
+            current = current[key]
+        return current
+
+    def _set_nested_value(self, payload: dict[str, Any], path: tuple[str, ...], value: Any) -> None:
+        current = payload
+        for key in path[:-1]:
+            next_value = current.get(key)
+            if not isinstance(next_value, dict):
+                next_value = {}
+                current[key] = next_value
+            current = next_value
+        current[path[-1]] = value
 
     def _default_test_commands(self, language: str) -> list[str]:
         if language == "python":

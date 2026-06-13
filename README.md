@@ -119,26 +119,15 @@ docs/          — Product documentation
 
 ## Current Implementation Status
 
-**Completed:** Phases 1–17 (MVP + v1 production + v1.5) + Full UI Implementation
+**Completed:** Phases 1–23 (All phases through v2) — Full Remediation + Feature Delivery
 
-- Workspace indexing delivered (`/v1/workspace/index`, stale-file handling, symbol extraction, rebuild-memory flow)
-- Cost guard and cache delivered (budget checks, task run + usage ledger, savings report, response cache)
-- Agentic safety delivered (credential redaction, DB write blocker checks, MCP loop capped to 5 iterations)
-- Hardening delivered (provider resilience test call, DB recovery path, `detect-secrets` integration, VSIX packaging hardening)
-- Governance UX delivered (Workspace Profile, Memory Manager actions, Privacy Dashboard, agent modes)
-- Extension commands/views include Evidence Board and investigation actions
-- Backend startup false-timeout fix delivered in extension (`BackendManager` now accepts log-discovered port + health check fallback when lockfile detection lags)
-- Investigation mode delivered:
-  - Evidence attach endpoint (`/v1/investigation/evidence/attach`) with source classification and trust scoring
-  - Evidence board endpoint (`/v1/investigation/evidence`) with extraction status and redaction metadata
-  - Investigation run endpoint (`/v1/investigation/run`) generating context packs with extracted/redacted findings, impacted file discovery, related test discovery, and missing test coverage detection
-  - PDF/Excel artifact extraction, Excel column mapping, and dedicated evidence classification
-- v1.5 delivered:
-  - Context Pack diffing and version history
-  - Skill Store versioning and conflict detection
-  - Memory backup/restore
-  - Tool/skill selection optimizer
-  - Model budget profiles
+- **Schema Remediation (26 issues resolved):** Lockfile format with schema/api version, FTS5 sync triggers, governance migration (memory_class, memory_status, visibility_scope, reusable, review_required), trust level inverted (5=best), supersedes_id removed in favor of memory_relations, schema constraints, snapshots folder spec
+- **Workflow Correctness:** Patch apply via `git apply --check` with snapshot rollback, response cache quality filter (success-only, disabled for critical tasks), investigation sessions (pre-task evidence), 8 investigation API endpoints, task classifier two-pass priority (file type > directory), workspace profile YAML as source of truth, per-command validation timeouts, MCP per-context caps (pre_fetch=8, patch=5, investigation=12)
+- **Governance Hardening (Phase 18A):** Memory recall with UsePolicy and VisibilityScope filtering, write-back safety filter (blocks secrets, full diffs, raw transcripts), memory review queue, recall trace recording, retention policy enforcement (90/180 day + row caps), memory status lifecycle validation
+- **v1.5 Features:** Skill Store with versioning and conflict detection, Context Pack Diffing, Memory Backup/Restore, PDF/Excel/CSV extraction, Evidence Source Classifier (deterministic, <100ms), Tool/Skill Selection Optimizer, Model Budget Profiles (strict_local, monthly cap)
+- **v2 Features:** Image/screenshot analysis (LLaVA local + OCR), Team Policy Packs with precedence enforcement, Local Agent Flow Builder with YAML validation and approval gates, Multi-workspace support (isolated per-repo), Code Review Memory Mode (Phase 18B), Word/PowerPoint ingestion
+- Full UI Implementation (17 views, zero placeholders)
+- 127 tests passing, 0 lint errors
 
 ### UI Implementation (Latest — June 2025)
 
@@ -161,16 +150,33 @@ New architecture additions:
 
 Key principle: **Developer approval is mandatory** — the TaskFlowController always stops at the approval gate before any code is applied.
 
-## v2 Implementation Plan
+## v2 Implementation Status
 
-| Wave | Scope | Order |
+All v2 waves are implemented:
+
+| Wave | Scope | Status |
 |---|---|---|
-| 1 | Image/screenshot analysis | First |
-| 2 | Team Policy Packs + Local Agent Flow Builder | Second |
-| 3 | Deferred: Multi-language Skill Marketplace + Team-Shared Memory Server | Deferred |
-| 4 | Multi-workspace support v2 + Word/PowerPoint ingestion | Next active |
+| 1 | Image/screenshot analysis (LLaVA + OCR) | ✅ Complete |
+| 2 | Team Policy Packs + Local Agent Flow Builder | ✅ Complete |
+| 3 | Code Review Memory Mode (Phase 18B) | ✅ Complete |
+| 4 | Multi-workspace support + Word/PowerPoint ingestion | ✅ Complete |
 
-Wave 3 is deferred for now; next active V2 scope is Wave 4 after Wave 2.
+### New Backend Modules (Remediation Sprint — June 2026)
+
+| Module | Purpose |
+|--------|---------|
+| `patcher.py` | git apply with snapshot-based rollback |
+| `retention.py` | Trace table retention enforcement |
+| `memory_recall.py` | Recall with UsePolicy + visibility filtering |
+| `memory_governance.py` | Memory status lifecycle enforcement |
+| `watcher.py` | File watcher (watchdog, 1500ms debounce) |
+| `backup.py` | Memory backup/restore with FTS rebuild |
+| `tool_selector.py` | Pre-pack tool filtering by task type |
+| `document_ingestion.py` | PDF, Excel, CSV, Word, PowerPoint |
+| `image_analysis.py` | Vision analysis (LLaVA/OCR/cloud) |
+| `code_review_memory.py` | Review lesson extraction + write-back |
+| `endpoint_registry.py` | API implementation status register |
+| `validation_runner.py` | Per-command timeouts |
 
 ## Development
 

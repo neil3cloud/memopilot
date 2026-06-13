@@ -76,13 +76,16 @@ class CredentialRedactor:
             temp_path = Path(temp_file.name)
 
         try:
-            result = subprocess.run(
-                [sys.executable, "-m", "detect_secrets", "scan", str(temp_path)],
-                capture_output=True,
-                text=True,
-                check=False,
-                timeout=10,
-            )
+            try:
+                result = subprocess.run(
+                    [sys.executable, "-m", "detect_secrets", "scan", str(temp_path)],
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                    timeout=10,
+                )
+            except subprocess.TimeoutExpired:
+                return {}
             if result.returncode != 0:
                 raise RuntimeError(result.stderr.strip() or result.stdout.strip())
 

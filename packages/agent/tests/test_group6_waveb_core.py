@@ -7,6 +7,29 @@ from httpx import AsyncClient
 
 
 @pytest.mark.asyncio
+async def test_endpoint_status_and_context_pack_route(client: AsyncClient, test_token: str):
+    headers = {"X-Agent-Token": test_token}
+    await client.post("/v1/workspace/init", headers=headers)
+
+    status = await client.get("/v1/endpoints/status", headers=headers)
+    assert status.status_code == 200
+    body = status.json()
+    assert body["POST /v1/context-pack/generate"] == "real"
+    assert body["POST /v1/investigation/{session_id}/run"] == "stub"
+
+    context_pack = await client.post(
+        "/v1/context-pack/generate",
+        headers=headers,
+        json={
+            "task_description": "Inspect retry path",
+            "suggested_files": [],
+        },
+    )
+    assert context_pack.status_code == 200
+    assert "files" in context_pack.json()
+
+
+@pytest.mark.asyncio
 async def test_context_template_lifecycle(client: AsyncClient, test_token: str):
     headers = {"X-Agent-Token": test_token}
     await client.post("/v1/workspace/init", headers=headers)

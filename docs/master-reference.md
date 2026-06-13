@@ -1,6 +1,6 @@
 # MemoPilot: Master Product and Implementation Reference
 
-**Document Version:** 2.1 (UI Implementation Complete) **Target Product:** MemoPilot — Rule-Aware, Local-Memory, Cost-Governed AI Development Agent Extension for VS Code/Cursor **Status:** Production Reference
+**Document Version:** 2.2 (Remediation + Feature Hardening Complete) **Target Product:** MemoPilot — Rule-Aware, Local-Memory, Cost-Governed AI Development Agent Extension for VS Code/Cursor **Status:** Production Reference
 
 ---
 
@@ -33,6 +33,7 @@
 25. [Risks and Mitigations](#25-risks-and-mitigations)  
 26. [Final Product Positioning](#26-final-product-positioning)
 27. [UI Implementation Progress (v2.1)](#27-ui-implementation-progress-v21--june-2025)
+28. [Remediation and Feature Hardening (v2.2)](#28-remediation-and-feature-hardening-v22--june-2026)
 
 ---
 
@@ -3328,3 +3329,154 @@ The flow automatically proceeds through analysis, context building, model routin
 3. **Mock-first backend**: Patch generation and validation use deterministic mocks to enable UI development ahead of AI integration
 4. **Developer-in-control**: TaskFlowController always stops at approval gate; cost visibility is first-class throughout
 5. **Incremental delivery**: Each phase ships independently; no big-bang rewrites  
+
+---
+
+## 28\. Remediation and Feature Hardening (v2.2 — June 2026)
+
+### Overview
+
+A comprehensive remediation sprint resolved **26 open issues** (5 P0, 9 P1, 7 P2, 5 P3) identified across two architectural review cycles, and delivered all remaining v1.5 and v2 features. The result: 34 files changed, +5,280/-983 lines, 127 tests passing, 0 lint errors.
+
+### Fix Track Summary
+
+| Track | Issues Resolved | Scope |
+|-------|----------------|-------|
+| F1: Schema Foundation | P0-A, P0-C, P0-E, P1-D, P1-F, P3-A, P3-B, P3-C | Lockfile format, FTS5 triggers, governance migration, trust level inversion, memory_relations consolidation, schema constraints, snapshots spec |
+| F2: Workflow Correctness | P0-B, P1-A, P1-B, P1-C, P2-A, P2-B, P2-C, P2-D, P3-D, P3-E | Patch apply mechanism, cache quality filter, investigation sessions, investigation API, classifier fix, workspace profile YAML source-of-truth, validation timeout, document_chunks FK, file watcher, MCP per-context caps |
+| F3: Governance Wiring | P1-E, P1-G, P1-H, P1-I, P2-E, P2-F, P2-G | Governance field integration, retention policy, recall API contract (UsePolicy + VisibilityScope), memory_artifacts, API path reconciliation, endpoint status register, Phase 18 dep fix |
+| F4: Phase Restructure | P0-D | Phase 17 decomposed into 17A–17D with individual acceptance criteria |
+
+### New Modules Added
+
+| Module | Purpose |
+|--------|---------|
+| `patcher.py` | `git apply --check` → snapshot → apply → rollback on failure |
+| `retention.py` | Retention policy enforcement for recall_traces, audit_events (90/180 day, row caps) |
+| `memory_recall.py` | Recall service with UsePolicy, VisibilityScope/Target filtering, recall trace recording |
+| `memory_governance.py` | Memory status lifecycle validation (valid transitions enforced) |
+| `watcher.py` | File watcher via watchdog with 1500ms debounce, excluded dirs, async queue |
+| `backup.py` | WAL checkpoint, DB + rules + templates backup/restore, FTS rebuild |
+| `tool_selector.py` | Pre-context-pack tool filtering by task_type, budget_profile enforcement |
+| `document_ingestion.py` | PDF (pdfplumber), Excel (openpyxl), CSV, Word (python-docx), PowerPoint (python-pptx) |
+| `image_analysis.py` | Local LLaVA → OCR (pytesseract) → cloud fallback; trust_level=2 |
+| `code_review_memory.py` | Review lesson extraction from PR comments, maintainer-approved write-back |
+| `endpoint_registry.py` | API implementation status register (real/stub/mock/missing per endpoint) |
+| `validation_runner.py` | Per-command timeouts via asyncio.wait_for, timeout = validation failure |
+
+### New Migrations
+
+| Migration | Version | Contents |
+|-----------|---------|----------|
+| `006_schema_remediation.sql` | 6 | Governance columns (memory_class, memory_status, visibility_scope, reusable, review_required, use_policy_json, provenance_json), memory_relations table with CHECK constraint, retention_config, recall_traces, audit_events, memory_artifacts, investigation_sessions, evidence/task_run FKs, document_chunks memory_id FK, workspace_profile cache columns, rules/status validation triggers, trust level data inversion, FTS rebuild |
+| `007_response_cache_quality.sql` | 7 | response_status and raw_response columns on ai_calls for cache quality filtering |
+| `008_context_pack_snapshot.sql` | 8 | pack_content_snapshot on context_pack_versions for diffing |
+
+### Key Architectural Decisions
+
+1. **Trust level inverted**: Trust 5 = source-verified (highest), Trust 1 = inferred (lowest). All queries sort DESC.
+2. **supersedes_id removed**: Supersession handled exclusively via `memory_relations` with `relation_type='supersedes'` and cycle detection.
+3. **YAML is source of truth**: workspace.profile.yaml is authoritative; SQLite workspace_profile is a read cache synced on startup/watch.
+4. **Lockfile enhanced**: Now includes `started_at`, `schema_version`, `api_version` alongside `port` and `pid`.
+5. **Patch safety**: Full pre-check → snapshot → apply → rollback lifecycle. Never `shell=True`.
+6. **MCP caps per-context**: pre_fetch=8, patch_generation=5, investigation=12, hard_absolute_cap=20.
+7. **Write-back safety filter**: Blocks secrets, full diffs (>200 lines), raw transcripts. Blocked content saved as memory_artifacts.
+8. **Memory status lifecycle**: Enforced transitions (discovered → pending_review → confirmed, etc.). Terminal states: evidence_only, rejected, superseded.
+
+### New API Endpoints (added in this sprint)
+
+| Endpoint | Method | Status |
+|----------|--------|--------|
+| `/v1/context-pack/generate` | POST | real |
+| `/v1/context-pack/diff` | GET | real |
+| `/v1/investigation/start` | POST | real |
+| `/v1/investigation/{session_id}` | GET | real |
+| `/v1/investigation/{session_id}/evidence` | POST | real |
+| `/v1/investigation/{session_id}/evidence/{evidence_id}` | DELETE | real |
+| `/v1/investigation/{session_id}/transition-to-patch` | POST | real |
+| `/v1/memory/recall` | POST | real |
+| `/v1/memory/writeback` | POST | real |
+| `/v1/memory/review` | GET | real |
+| `/v1/memory/items/{item_id}/review` | PATCH | real |
+| `/v1/memory/backup` | POST | real |
+| `/v1/memory/restore` | POST | real |
+| `/v1/memory/review-lessons/extract` | POST | real |
+| `/v1/memory/review-lessons/approve` | POST | real |
+| `/v1/evidence/extract-pdf` | POST | real |
+| `/v1/evidence/extract-excel` | POST | real |
+| `/v1/evidence/extract-csv` | POST | real |
+| `/v1/evidence/extract-docx` | POST | real |
+| `/v1/evidence/extract-pptx` | POST | real |
+| `/v1/evidence/analyze-image` | POST | real |
+| `/v1/skills` | GET | real |
+| `/v1/skills/import` | POST | real |
+| `/v1/skills/conflicts` | GET | real |
+| `/v1/policies/load` | POST | real |
+| `/v1/policies/active` | GET | real |
+| `/v1/cost/budget-status` | GET | real |
+| `/v1/endpoints/status` | GET | real |
+| `/v1/task/apply-patch` | POST | real |
+
+### Test Coverage (post-remediation)
+
+| Test File | Tests | Scope |
+|-----------|-------|-------|
+| test_health.py | 2 | Health + schema version |
+| test_main.py | 3 | Lockfile read/write |
+| test_migrations.py | 4 | Migration runner |
+| test_workspace_init.py | 3 | Workspace initialization |
+| test_workspace_index.py | 4 | Indexing + rebuild |
+| test_auth.py | 3 | HMAC token auth |
+| test_rules_active.py | 5 | Rules aggregation |
+| test_task_analyze.py | 10 | Task analysis + classifier priority |
+| test_context_build.py | 5 | Context pack building |
+| test_model_route.py | 6 | Model selection + budget |
+| test_patch_validate.py | 10 | Patch + validation + timeout |
+| test_patcher.py | 7 | Patch apply + snapshot + rollback |
+| test_history_dashboard.py | 5 | Task history + cost dashboard |
+| test_mcp_tools.py | 2 | MCP tools listing |
+| test_symbol_extractor.py | 4 | Symbol extraction |
+| test_group1_cost_cache.py | 8 | Cost guard + cache quality filter |
+| test_group2_agentic_security.py | 10 | MCP caps + credential redaction |
+| test_group3_hardening.py | 4 | Provider resilience + DB recovery |
+| test_group4_profile_memory_privacy.py | 12 | Profile sync + recall + privacy |
+| test_group5_investigation.py | 10 | Investigation API + evidence |
+| test_group6_waveb_core.py | 4 | Evidence classifier + endpoints |
+| test_group7_wavec_v15.py | 6 | Skills + document ingestion |
+| test_group8_wave2_policy_flow.py | 5 | Policy packs + flow builder |
+| test_group9_wave4_multi_workspace_ingestion.py | 5 | Multi-workspace + DOCX/PPTX |
+| **Total** | **127** | All critical paths covered |
+
+### Phase Structure (Revised)
+
+```
+Phase 0:   Product Definition and Constraints
+Phase 0.5: Technical Spikes
+Phase 1:   Extension Shell
+Phase 2:   Python Backend Foundation
+Phase 3:   Project Scanner and Symbol Indexer + File Watcher
+Phase 4:   Rule and Skill Resolver
+Phase 5:   Local Memory Store (with FTS5 triggers, governance defaults)
+Phase 6:   Summary Generator
+Phase 7:   Context Pack Builder (with updated classifier signal priority)
+Phase 8:   Model Router and Provider Adapters
+Phase 9:   Patch Generation and Approval (with git apply spec, snapshots)
+Phase 10:  Validation Runner (with per-command timeout)
+Phase 11:  Cost Guard and Reporting
+Phase 12:  MCP Tool Integration (per-context caps)
+Phase 13:  Production Hardening
+Phase 14:  Workspace Profile, Memory Manager, Privacy Dashboard
+Phase 15:  Evidence-Aware Investigation (with investigation_sessions)
+Phase 16:  PDF and Excel Artifact Analysis
+Phase 17A: Context Governance (templates, agent modes, intelligent selection)
+Phase 17B: Patch Governance (risk classifier, compliance score, AI replay)
+Phase 17C: Provider and Cost Governance (capability matrix, budget profiles)
+Phase 17D: v1.5 Structural Features (skill store, diffing, backup)
+Phase 18A: Memory Governance Hardening — Core (recall, write-back, review, retention)
+Phase 18B: Memory Governance Hardening — Advanced (usage, provenance, code review mode)
+Phase 19:  Image and Screenshot Analysis
+Phase 20:  Team Policy Packs
+Phase 21:  Local Agent Flow Builder
+Phase 22:  Multi-Workspace Support
+Phase 23:  Word and PowerPoint Ingestion
+```

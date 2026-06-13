@@ -25,9 +25,15 @@ class Config:
     global_dir: Path
     log_level: str = "info"
     api_version: int = 1
-    schema_version: int = 1
+    schema_version: int = 9
     monthly_budget_usd: float = 20.0
     budget_profile: str = "balanced"
+    validation_default_timeout: int = 60
+    validation_max_timeout: int = 300
+    mcp_cap_pre_fetch: int = 8
+    mcp_cap_patch_generation: int = 5
+    mcp_cap_investigation: int = 12
+    mcp_hard_absolute_cap: int = 20
 
     # Derived paths
     db_path: Path = field(init=False)
@@ -68,6 +74,18 @@ def load_config() -> Config:
     if not isinstance(budget_settings, dict):
         budget_settings = {}
 
+    validation_settings = merged.get("validation", {})
+    if not isinstance(validation_settings, dict):
+        validation_settings = {}
+
+    mcp_settings = merged.get("mcp", {})
+    if not isinstance(mcp_settings, dict):
+        mcp_settings = {}
+
+    iteration_caps = mcp_settings.get("iteration_caps", {})
+    if not isinstance(iteration_caps, dict):
+        iteration_caps = {}
+
     return Config(
         workspace_path=workspace_path,
         memopilot_dir=memopilot_dir,
@@ -75,4 +93,10 @@ def load_config() -> Config:
         log_level=merged.get("log_level", "info"),
         monthly_budget_usd=float(budget_settings.get("monthly_budget_usd", 20.0)),
         budget_profile=str(budget_settings.get("profile", "balanced")),
+        validation_default_timeout=int(validation_settings.get("default_timeout", 60)),
+        validation_max_timeout=int(validation_settings.get("max_timeout", 300)),
+        mcp_cap_pre_fetch=int(iteration_caps.get("pre_fetch", 8)),
+        mcp_cap_patch_generation=int(iteration_caps.get("patch_generation", 5)),
+        mcp_cap_investigation=int(iteration_caps.get("investigation", 12)),
+        mcp_hard_absolute_cap=int(iteration_caps.get("hard_absolute_cap", 20)),
     )

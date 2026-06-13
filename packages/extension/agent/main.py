@@ -1,7 +1,7 @@
 """MemoPilot Agent Backend entrypoint.
 
 Starts the FastAPI server bound to 127.0.0.1:0 (OS-assigned port).
-Writes the assigned port and PID to <workspace>/.memopilot/agent.lock.
+Writes backend metadata to <workspace>/.memopilot/agent.lock.
 """
 
 from __future__ import annotations
@@ -13,6 +13,7 @@ import os
 import signal
 import subprocess
 import sys
+from datetime import UTC, datetime
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
@@ -56,8 +57,7 @@ def ensure_runtime_dependencies() -> None:
     )
     if install.returncode != 0:
         raise RuntimeError(
-            "Failed to install backend dependencies:\n"
-            f"{(install.stderr or install.stdout).strip()}"
+            f"Failed to install backend dependencies:\n{(install.stderr or install.stdout).strip()}"
         )
 
 
@@ -82,15 +82,42 @@ def _ensure_pip_available() -> None:
     )
     if ensure.returncode != 0:
         raise RuntimeError(
-            "Failed to bootstrap pip with ensurepip:\n"
-            f"{(ensure.stderr or ensure.stdout).strip()}"
+            f"Failed to bootstrap pip with ensurepip:\n{(ensure.stderr or ensure.stdout).strip()}"
         )
 
 
-def write_lockfile(lock_path: Path, port: int, pid: int) -> None:
-    """Write port and PID to the agent lockfile atomically."""
+def read_lockfile(lock_path: Path) -> dict[str, object] | None:
+    """Read and parse the agent lockfile, returning None when missing or invalid."""
+    try:
+        content = lock_path.read_text(encoding="utf-8")
+    except OSError:
+        return None
+
+    try:
+        lock_data = json.loads(content)
+    except json.JSONDecodeError:
+        return None
+
+    return lock_data if isinstance(lock_data, dict) else None
+
+
+def write_lockfile(
+    lock_path: Path,
+    port: int,
+    pid: int,
+    started_at: str,
+    schema_version: int,
+    api_version: int,
+) -> None:
+    """Write backend metadata to the agent lockfile atomically."""
     lock_path.parent.mkdir(parents=True, exist_ok=True)
-    lock_data = {"port": port, "pid": pid}
+    lock_data = {
+        "port": port,
+        "pid": pid,
+        "started_at": started_at,
+        "schema_version": schema_version,
+        "api_version": api_version,
+    }
     # Atomic write: write to temp file then rename to avoid race conditions
     tmp_path = lock_path.with_suffix(".tmp")
     tmp_path.write_text(json.dumps(lock_data), encoding="utf-8")
@@ -132,7 +159,15 @@ def main() -> None:
                     if socks:
                         addr = socks[0].getsockname()
                         port = addr[1]
-                        write_lockfile(self.lock_path, port, os.getpid())
+                        started_at = datetime.now(UTC).isoformat().replace("+00:00", "Z")
+                        write_lockfile(
+                            self.lock_path,
+                            port,
+                            os.getpid(),
+                            started_at,
+                            config.schema_version,
+                            config.api_version,
+                        )
                         logger.info(f"Backend listening on 127.0.0.1:{port}")
                         print(f"MemoPilot backend started on port {port}", flush=True)
                         break
