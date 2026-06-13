@@ -11,6 +11,7 @@ Security:
 
 from __future__ import annotations
 
+import hmac
 import logging
 import os
 from pathlib import Path
@@ -20,26 +21,26 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
 from .config import Config
+from .context_builder import ContextBuilderService
 from .cost_guard import CostGuardService
 from .db import DatabaseManager
+from .flow_builder import FlowBuilderService
 from .investigation_service import InvestigationService
 from .mcp_orchestrator import MCPOrchestrator, ToolCall
 from .memory_manager_service import MemoryManagerService
 from .migration_runner import run_migrations
+from .patch_assessor import PatchAssessorService
+from .policy_packs import PolicyPacksService
 from .privacy_dashboard_service import PrivacyDashboardService
+from .provider_registry import ProviderCapabilityRecord, ProviderRegistryService
 from .provider_resilience import ProviderCallError, ProviderResilienceService
 from .response_cache import ResponseCacheService
 from .security_policy import CredentialRedactor, DatabaseWriteBlocker
-from .wave2_service import Wave2Service
-from .wave4_service import Wave4Service
-from .waveb_service import (
-    ProviderCapabilityRecord,
-    WaveBService,
-)
-from .wavec_service import WaveCService
+from .skill_loader import SkillLoaderService
 from .workspace_indexer import WorkspaceIndexer
 from .workspace_init import ensure_global_config
 from .workspace_profile_service import WorkspaceProfileService
+from .workspace_roots import WorkspaceRootsService
 
 logger = logging.getLogger(__name__)
 
@@ -667,7 +668,7 @@ async def auth_middleware(request: Request, call_next):
         return JSONResponse(status_code=500, content={"detail": "MEMOPILOT_TOKEN not configured"})
 
     token = request.headers.get("X-Agent-Token")
-    if not token or token != _expected_token:
+    if not token or not hmac.compare_digest(token, _expected_token):
         return JSONResponse(status_code=401, content={"detail": "Unauthorized"})
 
     response = await call_next(request)
@@ -716,7 +717,7 @@ async def init_workspace() -> InitWorkspaceResponse:
     conn = await db.connect()
     schema_version = await run_migrations(conn)
     config.schema_version = schema_version
-    wave4_service = Wave4Service(config=config, db=db)
+    wave4_service = WorkspaceRootsService(config=config, db=db)
     await wave4_service.ensure_default_workspace_root()
 
     logger.info(
@@ -800,7 +801,7 @@ async def check_budget(request: BudgetCheckRequest) -> BudgetCheckResponse:
 
 @app.post("/v1/task-runs/start", response_model=StartTaskRunResponse)
 async def start_task_run(request: StartTaskRunRequest) -> StartTaskRunResponse:
-    policy_service = Wave2Service(config=_get_config(), db=_get_db())
+    policy_service = PolicyPacksService(config=_get_config(), db=_get_db())
     policy_result = await policy_service.evaluate_policy(
         stage="model_call",
         task_text=request.user_request,
@@ -1230,7 +1231,7 @@ async def run_investigation(request: RunInvestigationRequest) -> RunInvestigatio
 
 @app.get("/v1/context/templates", response_model=ContextTemplatesResponse)
 async def list_context_templates() -> ContextTemplatesResponse:
-    service = WaveBService(config=_get_config(), db=_get_db())
+    service = ContextBuilderService(config=_get_config(), db=_get_db())
     templates = await service.list_templates()
     return ContextTemplatesResponse(
         templates=[
@@ -1250,7 +1251,7 @@ async def list_context_templates() -> ContextTemplatesResponse:
 async def save_context_template(
     request: SaveContextTemplateRequest,
 ) -> SaveContextTemplateResponse:
-    service = WaveBService(config=_get_config(), db=_get_db())
+    service = ContextBuilderService(config=_get_config(), db=_get_db())
     try:
         template_id = await service.save_template(
             name=request.name,
@@ -1264,7 +1265,7 @@ async def save_context_template(
 
 @app.post("/v1/context/templates/select")
 async def select_context_template(request: SelectContextTemplateRequest) -> MemoryActionResponse:
-    service = WaveBService(config=_get_config(), db=_get_db())
+    service = ContextBuilderService(config=_get_config(), db=_get_db())
     try:
         await service.select_template(request.template_id)
     except ValueError as exc:
@@ -1276,7 +1277,7 @@ async def select_context_template(request: SelectContextTemplateRequest) -> Memo
 async def store_context_pack_version(
     request: ContextPackVersionStoreRequest,
 ) -> ContextPackVersionResponse:
-    service = WaveBService(config=_get_config(), db=_get_db())
+    service = ContextBuilderService(config=_get_config(), db=_get_db())
     version = await service.store_context_pack_version(
         task_run_id=request.task_run_id,
         context_pack_text=request.context_pack_text,
@@ -1302,7 +1303,7 @@ async def list_context_pack_versions(
     task_run_id: str | None = None,
     limit: int = 20,
 ) -> ContextPackVersionsResponse:
-    service = WaveBService(config=_get_config(), db=_get_db())
+    service = ContextBuilderService(config=_get_config(), db=_get_db())
     versions = await service.list_context_pack_versions(task_run_id=task_run_id, limit=limit)
     return ContextPackVersionsResponse(
         versions=[
@@ -1325,7 +1326,7 @@ async def list_context_pack_versions(
 async def diff_context_pack_versions(
     request: ContextPackDiffRequest,
 ) -> ContextPackDiffResponse:
-    service = WaveBService(config=_get_config(), db=_get_db())
+    service = ContextBuilderService(config=_get_config(), db=_get_db())
     try:
         diff_result = await service.diff_context_pack_versions(
             left_version_id=request.left_version_id,
@@ -1344,7 +1345,7 @@ async def diff_context_pack_versions(
 async def assess_patch_risk_and_compliance(
     request: PatchAssessmentRequest,
 ) -> PatchAssessmentResponse:
-    policy_service = Wave2Service(config=_get_config(), db=_get_db())
+    policy_service = PolicyPacksService(config=_get_config(), db=_get_db())
     policy_result = await policy_service.evaluate_policy(
         stage="patch_execution",
         task_text="",
@@ -1361,7 +1362,7 @@ async def assess_patch_risk_and_compliance(
             ),
         )
 
-    service = WaveBService(config=_get_config(), db=_get_db())
+    service = PatchAssessorService(config=_get_config(), db=_get_db())
     result = await service.assess_patch(
         task_run_id=request.task_run_id,
         diff_text=request.diff_text,
@@ -1378,7 +1379,7 @@ async def assess_patch_risk_and_compliance(
 
 @app.get("/v1/providers/capabilities", response_model=ProviderCapabilitiesResponse)
 async def list_provider_capabilities(limit: int = 100) -> ProviderCapabilitiesResponse:
-    service = WaveBService(config=_get_config(), db=_get_db())
+    service = ProviderRegistryService(config=_get_config(), db=_get_db())
     items = await service.list_provider_capabilities(limit=limit)
     return ProviderCapabilitiesResponse(
         items=[
@@ -1404,7 +1405,7 @@ async def list_provider_capabilities(limit: int = 100) -> ProviderCapabilitiesRe
 async def upsert_provider_capability(
     request: ProviderCapabilityItemResponse,
 ) -> MemoryActionResponse:
-    service = WaveBService(config=_get_config(), db=_get_db())
+    service = ProviderRegistryService(config=_get_config(), db=_get_db())
     await service.upsert_provider_capability(
         ProviderCapabilityRecord(
             model_id=request.model_id,
@@ -1425,7 +1426,7 @@ async def upsert_provider_capability(
 
 @app.get("/v1/ai/replay/{ai_call_id}", response_model=ReplayAICallResponse)
 async def replay_ai_call(ai_call_id: str) -> ReplayAICallResponse:
-    service = WaveBService(config=_get_config(), db=_get_db())
+    service = ProviderRegistryService(config=_get_config(), db=_get_db())
     try:
         replay = await service.replay_ai_call(ai_call_id)
     except ValueError as exc:
@@ -1444,7 +1445,7 @@ async def replay_ai_call(ai_call_id: str) -> ReplayAICallResponse:
 
 @app.get("/v1/skills/store", response_model=SkillStoreListResponse)
 async def list_skill_store(limit: int = 100) -> SkillStoreListResponse:
-    service = WaveCService(config=_get_config(), db=_get_db())
+    service = SkillLoaderService(config=_get_config(), db=_get_db())
     items = await service.list_skills(limit=limit)
     return SkillStoreListResponse(
         items=[
@@ -1465,7 +1466,7 @@ async def list_skill_store(limit: int = 100) -> SkillStoreListResponse:
 async def upsert_skill_store_item(
     request: SkillStoreUpsertRequest,
 ) -> SkillStoreItemResponse:
-    service = WaveCService(config=_get_config(), db=_get_db())
+    service = SkillLoaderService(config=_get_config(), db=_get_db())
     try:
         item = await service.create_or_update_skill(
             name=request.name,
@@ -1487,7 +1488,7 @@ async def upsert_skill_store_item(
 
 @app.post("/v1/memory/backup", response_model=BackupMemoryResponse)
 async def backup_memory() -> BackupMemoryResponse:
-    service = WaveCService(config=_get_config(), db=_get_db())
+    service = MemoryManagerService(config=_get_config(), db=_get_db())
     backup = await service.backup_memory()
     return BackupMemoryResponse(
         backup_id=backup.backup_id,
@@ -1499,7 +1500,7 @@ async def backup_memory() -> BackupMemoryResponse:
 
 @app.post("/v1/memory/restore", response_model=RestoreMemoryResponse)
 async def restore_memory(request: RestoreMemoryRequest) -> RestoreMemoryResponse:
-    service = WaveCService(config=_get_config(), db=_get_db())
+    service = MemoryManagerService(config=_get_config(), db=_get_db())
     try:
         restored_count = await service.restore_memory(backup_path=request.backup_path)
     except ValueError as exc:
@@ -1511,7 +1512,7 @@ async def restore_memory(request: RestoreMemoryRequest) -> RestoreMemoryResponse
 async def optimize_tools_and_skills(
     request: ToolSkillOptimizeRequest,
 ) -> ToolSkillOptimizeResponse:
-    service = WaveCService(config=_get_config(), db=_get_db())
+    service = SkillLoaderService(config=_get_config(), db=_get_db())
     result = await service.optimize_tools_and_skills(
         task_text=request.task_text,
         available_tools=request.available_tools,
@@ -1525,7 +1526,7 @@ async def optimize_tools_and_skills(
 
 @app.get("/v1/budget/profiles", response_model=BudgetProfilesResponse)
 async def get_budget_profiles() -> BudgetProfilesResponse:
-    service = WaveCService(config=_get_config(), db=_get_db())
+    service = CostGuardService(config=_get_config(), db=_get_db())
     result = await service.get_budget_profiles()
     return BudgetProfilesResponse(
         active_profile=result.active_profile,
@@ -1538,7 +1539,7 @@ async def get_budget_profiles() -> BudgetProfilesResponse:
 
 @app.post("/v1/budget/profiles", response_model=BudgetProfilesResponse)
 async def set_budget_profile(request: SetBudgetProfileRequest) -> BudgetProfilesResponse:
-    service = WaveCService(config=_get_config(), db=_get_db())
+    service = CostGuardService(config=_get_config(), db=_get_db())
     try:
         result = await service.set_budget_profile(request.profile)
     except ValueError as exc:
@@ -1559,7 +1560,7 @@ async def classify_evidence_source(request: EvidenceClassifyRequest) -> Evidence
             status_code=400,
             detail="Either evidence_path or source_url is required",
         )
-    service = WaveCService(config=_get_config(), db=_get_db())
+    service = SkillLoaderService(config=_get_config(), db=_get_db())
     source_type, trust_level, extraction_method = service.classify_evidence_source(
         evidence_path=request.evidence_path,
         source_url=request.source_url,
@@ -1573,7 +1574,7 @@ async def classify_evidence_source(request: EvidenceClassifyRequest) -> Evidence
 
 @app.get("/v1/policies/packs", response_model=PolicyPacksResponse)
 async def list_policy_packs(limit: int = 100) -> PolicyPacksResponse:
-    service = Wave2Service(config=_get_config(), db=_get_db())
+    service = PolicyPacksService(config=_get_config(), db=_get_db())
     items = await service.list_policy_packs(limit=limit)
     return PolicyPacksResponse(
         items=[
@@ -1593,7 +1594,7 @@ async def list_policy_packs(limit: int = 100) -> PolicyPacksResponse:
 
 @app.post("/v1/policies/packs", response_model=PolicyPackItemResponse)
 async def upsert_policy_pack(request: PolicyPackUpsertRequest) -> PolicyPackItemResponse:
-    service = Wave2Service(config=_get_config(), db=_get_db())
+    service = PolicyPacksService(config=_get_config(), db=_get_db())
     try:
         item = await service.save_policy_pack(
             name=request.name,
@@ -1616,7 +1617,7 @@ async def upsert_policy_pack(request: PolicyPackUpsertRequest) -> PolicyPackItem
 
 @app.post("/v1/policies/packs/activate")
 async def activate_policy_pack(request: ActivatePolicyPackRequest) -> MemoryActionResponse:
-    service = Wave2Service(config=_get_config(), db=_get_db())
+    service = PolicyPacksService(config=_get_config(), db=_get_db())
     try:
         await service.activate_policy_pack(pack_id=request.pack_id)
     except ValueError as exc:
@@ -1626,7 +1627,7 @@ async def activate_policy_pack(request: ActivatePolicyPackRequest) -> MemoryActi
 
 @app.post("/v1/policies/evaluate", response_model=PolicyEvaluateResponse)
 async def evaluate_policy_pack(request: PolicyEvaluateRequest) -> PolicyEvaluateResponse:
-    service = Wave2Service(config=_get_config(), db=_get_db())
+    service = PolicyPacksService(config=_get_config(), db=_get_db())
     result = await service.evaluate_policy(
         stage=request.stage,
         task_text=request.task_text,
@@ -1646,7 +1647,7 @@ async def evaluate_policy_pack(request: PolicyEvaluateRequest) -> PolicyEvaluate
 
 @app.get("/v1/flows/local", response_model=LocalFlowsResponse)
 async def list_local_flows(limit: int = 100) -> LocalFlowsResponse:
-    service = Wave2Service(config=_get_config(), db=_get_db())
+    service = FlowBuilderService(config=_get_config(), db=_get_db())
     items = await service.list_flows(limit=limit)
     return LocalFlowsResponse(
         items=[
@@ -1664,7 +1665,7 @@ async def list_local_flows(limit: int = 100) -> LocalFlowsResponse:
 
 @app.post("/v1/flows/local", response_model=LocalFlowItemResponse)
 async def save_local_flow(request: SaveLocalFlowRequest) -> LocalFlowItemResponse:
-    service = Wave2Service(config=_get_config(), db=_get_db())
+    service = FlowBuilderService(config=_get_config(), db=_get_db())
     try:
         item = await service.save_flow(
             name=request.name,
@@ -1684,7 +1685,7 @@ async def save_local_flow(request: SaveLocalFlowRequest) -> LocalFlowItemRespons
 
 @app.post("/v1/flows/local/run", response_model=RunLocalFlowResponse)
 async def run_local_flow(request: RunLocalFlowRequest) -> RunLocalFlowResponse:
-    service = Wave2Service(config=_get_config(), db=_get_db())
+    service = FlowBuilderService(config=_get_config(), db=_get_db())
     try:
         result = await service.run_flow(
             flow_id=request.flow_id,
@@ -1706,7 +1707,7 @@ async def run_local_flow(request: RunLocalFlowRequest) -> RunLocalFlowResponse:
 
 @app.get("/v1/workspaces", response_model=WorkspaceRootsResponse)
 async def list_workspace_roots(limit: int = 100) -> WorkspaceRootsResponse:
-    service = Wave4Service(config=_get_config(), db=_get_db())
+    service = WorkspaceRootsService(config=_get_config(), db=_get_db())
     items = await service.list_workspace_roots(limit=limit)
     return WorkspaceRootsResponse(
         items=[
@@ -1723,7 +1724,7 @@ async def list_workspace_roots(limit: int = 100) -> WorkspaceRootsResponse:
 
 @app.post("/v1/workspaces", response_model=WorkspaceRootItemResponse)
 async def add_workspace_root(request: AddWorkspaceRootRequest) -> WorkspaceRootItemResponse:
-    service = Wave4Service(config=_get_config(), db=_get_db())
+    service = WorkspaceRootsService(config=_get_config(), db=_get_db())
     try:
         item = await service.add_workspace_root(
             root_path=request.root_path,
@@ -1744,7 +1745,7 @@ async def add_workspace_root(request: AddWorkspaceRootRequest) -> WorkspaceRootI
 async def activate_workspace_root(
     request: ActivateWorkspaceRootRequest,
 ) -> WorkspaceRootItemResponse:
-    service = Wave4Service(config=_get_config(), db=_get_db())
+    service = WorkspaceRootsService(config=_get_config(), db=_get_db())
     try:
         item = await service.activate_workspace_root(workspace_id=request.workspace_id)
     except ValueError as exc:

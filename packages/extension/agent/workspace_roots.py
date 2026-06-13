@@ -1,4 +1,4 @@
-"""Wave 4 services for multi-workspace root support."""
+"""Multi-workspace root management (v2 capability)."""
 
 from __future__ import annotations
 
@@ -18,7 +18,7 @@ class WorkspaceRootItem:
     active: bool
 
 
-class Wave4Service:
+class WorkspaceRootsService:
     """Tracks known workspace roots and active workspace selection."""
 
     def __init__(self, *, config: Config, db: DatabaseManager) -> None:
@@ -64,7 +64,14 @@ class Wave4Service:
         candidate = Path(root_path)
         if not candidate.is_absolute():
             candidate = (self._config.workspace_path / candidate).resolve()
+            # Guard against relative path traversal escaping the workspace
+            workspace_resolved = self._config.workspace_path.resolve()
+            if not candidate.is_relative_to(workspace_resolved):
+                raise ValueError(
+                    f"Path traversal denied: {candidate} is outside workspace {workspace_resolved}"
+                )
         resolved = candidate.resolve()
+
         if not resolved.exists() or not resolved.is_dir():
             raise ValueError(f"Workspace root not found: {resolved}")
 

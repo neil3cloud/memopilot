@@ -88,10 +88,13 @@ def _ensure_pip_available() -> None:
 
 
 def write_lockfile(lock_path: Path, port: int, pid: int) -> None:
-    """Write port and PID to the agent lockfile."""
+    """Write port and PID to the agent lockfile atomically."""
     lock_path.parent.mkdir(parents=True, exist_ok=True)
     lock_data = {"port": port, "pid": pid}
-    lock_path.write_text(json.dumps(lock_data), encoding="utf-8")
+    # Atomic write: write to temp file then rename to avoid race conditions
+    tmp_path = lock_path.with_suffix(".tmp")
+    tmp_path.write_text(json.dumps(lock_data), encoding="utf-8")
+    tmp_path.replace(lock_path)
 
 
 def cleanup_lockfile(lock_path: Path) -> None:

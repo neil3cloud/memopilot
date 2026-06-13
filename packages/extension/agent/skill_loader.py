@@ -1,14 +1,10 @@
-"""Wave C services for v1.5 capability expansion."""
+"""Skill store, versioning, conflict detection, and tool/skill optimizer (v1.5 capability)."""
 
 from __future__ import annotations
 
 import json
 import uuid
 from dataclasses import dataclass
-from datetime import UTC, datetime
-from pathlib import Path
-
-import yaml
 
 from .config import Config
 from .db import DatabaseManager
@@ -26,42 +22,19 @@ class SkillStoreItem:
 
 
 @dataclass(frozen=True)
-class BackupResult:
-    backup_id: str
-    backup_path: str
-    item_count: int
-    created_at: str
-
-
-@dataclass(frozen=True)
 class OptimizerResult:
     suggested_tools: list[str]
     suggested_skills: list[str]
     reasons: list[str]
 
 
-@dataclass(frozen=True)
-class BudgetProfileResult:
-    active_profile: str
-    monthly_budget_usd: float
-    effective_budget_usd: float
-    multiplier: float
-    profiles: dict[str, float]
-
-
-class WaveCService:
-    """Implements Phase 17 wave-C capabilities."""
+class SkillLoaderService:
+    """Manages the skill store, versioning, and task-aware tool/skill optimization."""
 
     def __init__(self, *, config: Config, db: DatabaseManager) -> None:
         self._config = config
         self._db = db
         self._classifier = EvidenceSourceClassifier()
-        self._profiles: dict[str, float] = {
-            "cost_saver": 0.7,
-            "balanced": 1.0,
-            "frontier": 1.5,
-        }
-        self._budget_settings_path = self._config.memopilot_dir / "settings.yaml"
 
     async def create_or_update_skill(
         self,
@@ -205,99 +178,6 @@ class WaveCService:
             for row in rows
         ]
 
-    async def backup_memory(self) -> BackupResult:
-        conn = await self._db.connect()
-        cursor = await conn.execute(
-            """
-            SELECT
-                id, type, title, body, source, source_path,
-                trust_level, tags_json, stale, created_at, updated_at
-            FROM memory_items
-            ORDER BY updated_at DESC
-            """
-        )
-        rows = await cursor.fetchall()
-        payload = [
-            {
-                "id": row["id"],
-                "type": row["type"],
-                "title": row["title"],
-                "body": row["body"],
-                "source": row["source"],
-                "source_path": row["source_path"],
-                "trust_level": row["trust_level"],
-                "tags_json": row["tags_json"],
-                "stale": row["stale"],
-                "created_at": row["created_at"],
-                "updated_at": row["updated_at"],
-            }
-            for row in rows
-        ]
-
-        backup_id = datetime.now(UTC).strftime("%Y%m%d-%H%M%S")
-        backup_dir = self._config.memopilot_dir / "snapshots" / "memory-backups"
-        backup_dir.mkdir(parents=True, exist_ok=True)
-        backup_path = backup_dir / f"{backup_id}.json"
-        backup_path.write_text(
-            json.dumps(
-                {
-                    "backup_id": backup_id,
-                    "created_at": datetime.now(UTC).isoformat(),
-                    "item_count": len(payload),
-                    "items": payload,
-                },
-                indent=2,
-            ),
-            encoding="utf-8",
-        )
-        return BackupResult(
-            backup_id=backup_id,
-            backup_path=str(backup_path),
-            item_count=len(payload),
-            created_at=datetime.now(UTC).isoformat(),
-        )
-
-    async def restore_memory(self, *, backup_path: str) -> int:
-        source = Path(backup_path)
-        if not source.is_absolute():
-            source = (self._config.workspace_path / source).resolve()
-        if not source.exists():
-            raise ValueError(f"backup file not found: {source}")
-
-        payload = json.loads(source.read_text(encoding="utf-8"))
-        items = payload.get("items")
-        if not isinstance(items, list):
-            raise ValueError("invalid backup payload")
-
-        conn = await self._db.connect()
-        await conn.execute("DELETE FROM memory_items")
-        for item in items:
-            await conn.execute(
-                """
-                INSERT INTO memory_items
-                (
-                    id, type, title, body, source, source_path, trust_level,
-                    tags_json, stale, created_at, updated_at
-                )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    item.get("id") or uuid.uuid4().hex,
-                    item.get("type", "note"),
-                    item.get("title", "untitled"),
-                    item.get("body", ""),
-                    item.get("source", "backup"),
-                    item.get("source_path"),
-                    int(item.get("trust_level", 3)),
-                    item.get("tags_json"),
-                    int(item.get("stale", 0)),
-                    item.get("created_at", datetime.now(UTC).isoformat()),
-                    item.get("updated_at", datetime.now(UTC).isoformat()),
-                ),
-            )
-        await conn.commit()
-        return len(items)
-
     async def optimize_tools_and_skills(
         self,
         *,
@@ -339,7 +219,7 @@ class WaveCService:
         suggested_skills: list[str] = []
         for row in rows:
             applies_when = str(row["applies_when"] or "").lower()
-            tokens = [token for token in re_split_words(applies_when) if len(token) > 2]
+            tokens = [token for token in _split_words(applies_when) if len(token) > 2]
             if tokens and any(token in task_lower for token in tokens):
                 suggested_skills.append(str(row["name"]))
         suggested_skills = sorted(set(suggested_skills))[:20]
@@ -366,41 +246,14 @@ class WaveCService:
             reasons=reasons,
         )
 
-    async def get_budget_profiles(self) -> BudgetProfileResult:
-        active = self._active_budget_profile()
-        multiplier = self._profiles.get(active, 1.0)
-        monthly = max(self._config.monthly_budget_usd, 0.0)
-        return BudgetProfileResult(
-            active_profile=active,
-            monthly_budget_usd=monthly,
-            effective_budget_usd=round(monthly * multiplier, 4),
-            multiplier=multiplier,
-            profiles=self._profiles.copy(),
-        )
-
-    async def set_budget_profile(self, profile: str) -> BudgetProfileResult:
-        if profile not in self._profiles:
-            raise ValueError(f"Unknown profile: {profile}")
-        settings = self._read_workspace_settings()
-        budget = settings.get("budget")
-        if not isinstance(budget, dict):
-            budget = {}
-        budget["profile"] = profile
-        settings["budget"] = budget
-        self._budget_settings_path.parent.mkdir(parents=True, exist_ok=True)
-        self._budget_settings_path.write_text(
-            yaml.safe_dump(settings, sort_keys=False),
-            encoding="utf-8",
-        )
-        self._config.budget_profile = profile
-        return await self.get_budget_profiles()
-
     def classify_evidence_source(
         self,
         *,
         evidence_path: str | None,
         source_url: str | None,
     ) -> tuple[str, int, str]:
+        from pathlib import Path
+
         resolved: Path | None = None
         if evidence_path:
             candidate = Path(evidence_path)
@@ -444,27 +297,9 @@ class WaveCService:
         normalized = json.dumps(payload, sort_keys=True, separators=(",", ":"))
         return str(uuid.uuid5(uuid.NAMESPACE_OID, normalized))
 
-    def _active_budget_profile(self) -> str:
-        settings = self._read_workspace_settings()
-        budget = settings.get("budget")
-        if isinstance(budget, dict):
-            profile = budget.get("profile")
-            if isinstance(profile, str) and profile in self._profiles:
-                return profile
-        if self._config.budget_profile in self._profiles:
-            return self._config.budget_profile
-        return "balanced"
 
-    def _read_workspace_settings(self) -> dict:
-        if not self._budget_settings_path.exists():
-            return {}
-        loaded = yaml.safe_load(self._budget_settings_path.read_text(encoding="utf-8"))
-        if isinstance(loaded, dict):
-            return loaded
-        return {}
-
-
-def re_split_words(text: str) -> list[str]:
+def _split_words(text: str) -> list[str]:
+    """Tokenize text into alphanumeric words."""
     token = ""
     output: list[str] = []
     for char in text:

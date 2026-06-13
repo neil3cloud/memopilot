@@ -22,7 +22,7 @@ from .config import Config
 from .db import DatabaseManager
 from .evidence_classifier import EvidenceSourceClassifier
 from .security_policy import CredentialRedactor
-from .wave4_service import Wave4Service
+from .workspace_roots import WorkspaceRootsService
 
 MAX_EVIDENCE_FILE_SIZE_BYTES = 10 * 1024 * 1024
 
@@ -268,7 +268,7 @@ class InvestigationService:
 
     async def _resolve_evidence_path(self, evidence_path: str) -> Path:
         candidate = Path(evidence_path)
-        workspace_service = Wave4Service(config=self._config, db=self._db)
+        workspace_service = WorkspaceRootsService(config=self._config, db=self._db)
         allowed_roots = await workspace_service.allowed_workspace_paths()
         if not candidate.is_absolute():
             if self._contains_parent_reference(candidate):
