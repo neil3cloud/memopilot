@@ -38,7 +38,9 @@ export class TaskHistoryTreeProvider implements vscode.TreeDataProvider<vscode.T
 
     getChildren(): vscode.TreeItem[] {
         if (this.error) {
-            return [new vscode.TreeItem(`$(error) ${this.error}`)];
+            const item = new vscode.TreeItem(this.error);
+            item.iconPath = new vscode.ThemeIcon('error');
+            return [item];
         }
 
         if (this.entries.length === 0) {
@@ -46,14 +48,15 @@ export class TaskHistoryTreeProvider implements vscode.TreeDataProvider<vscode.T
         }
 
         return this.entries.map(entry => {
-            const statusIcon = entry.status === 'completed' ? '$(check)'
-                : entry.status === 'rejected' ? '$(close)' : '$(error)';
+            const statusIcon = entry.status === 'completed' ? 'check'
+                : entry.status === 'rejected' ? 'close' : 'error';
 
-            const item = new vscode.TreeItem(`${statusIcon} ${entry.description}`);
+            const item = new vscode.TreeItem(entry.description);
 
             const time = this.formatRelativeTime(entry.created_at);
             const costStr = entry.cost_usd > 0 ? ` · $${entry.cost_usd.toFixed(4)}` : ' · free';
             item.description = `${time} · ${entry.files_changed} files${costStr}`;
+            item.iconPath = new vscode.ThemeIcon(statusIcon);
 
             const model = entry.model_used || 'unknown';
             const duration = entry.duration_ms > 0 ? `${(entry.duration_ms / 1000).toFixed(1)}s` : 'N/A';

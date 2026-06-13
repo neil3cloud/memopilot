@@ -69,9 +69,7 @@ export class MemoPilotPanel extends MemoPilotPanelBase {
                 this.sendWorkspaceStatus();
                 break;
             case 'navigate':
-                this.activeViewId = message.payload.viewId;
-                this.sendActiveView();
-                this.sendViewContent(message.payload.viewId);
+                this.handleNavigation(message.payload.viewId);
                 break;
             case 'request-workspace-status':
                 this.sendWorkspaceStatus();
@@ -82,6 +80,43 @@ export class MemoPilotPanel extends MemoPilotPanelBase {
             default:
                 break;
         }
+    }
+
+    private handleNavigation(viewId: string): void {
+        // Views that open their own panels/commands instead of inline content
+        const externalViews: Record<string, string> = {
+            'task-entry': 'memopilot.analyzeTask',
+            'cost-dashboard': 'memopilot.showCostReport',
+            'provider-matrix': 'memopilot.showProviderCapabilities',
+            'rules-skills': 'memopilot.openRules',
+        };
+
+        if (externalViews[viewId]) {
+            void vscode.commands.executeCommand(externalViews[viewId]);
+            return;
+        }
+
+        // Views that focus sidebar tree views
+        const treeViews: Record<string, string> = {
+            'local-memory': 'memopilot-memory',
+            'context-pack': 'memopilot-context',
+            'model-routing': 'memopilot-cost',
+            'task-history': 'memopilot-history',
+            'memory-manager': 'memopilot-memory',
+            'workspace-profile': 'memopilot-profile',
+            'privacy-boundary': 'memopilot-privacy',
+            'evidence-board': 'memopilot-evidence',
+            'mcp-tools': 'memopilot-mcp',
+        };
+
+        if (treeViews[viewId]) {
+            void vscode.commands.executeCommand(`${treeViews[viewId]}.focus`);
+        }
+
+        // Update inline content for all views
+        this.activeViewId = viewId;
+        this.sendActiveView();
+        this.sendViewContent(viewId);
     }
 
     protected onDidBecomeVisible(): void {
@@ -146,30 +181,41 @@ export class MemoPilotPanel extends MemoPilotPanelBase {
         const item = NAVIGATION_ITEMS.find(n => n.id === viewId);
         if (!item) { return ''; }
 
-        if (!item.enabled) {
-            return `
-                <div class="mp-placeholder">
-                    <h3>${this.escapeHtml(item.label)}</h3>
-                    <p>Coming soon — ${this.escapeHtml(item.description)}</p>
-                </div>`;
-        }
-
-        // Enabled views get content rendered based on viewId
         switch (viewId) {
             case 'workspace-status':
                 return this.getWorkspaceStatusHtml();
             case 'local-memory':
-                return this.getSimpleRedirectHtml('Memory Manager', 'Use the Memory Manager tree view in the sidebar, or run "MemoPilot: Review Memory" from the command palette.');
+                return this.getInfoHtml('Local App Memory', 'The Memory Manager sidebar shows indexed symbols, file summaries, and learned patterns. Click items to approve, edit, or filter.', 'memopilot-memory');
             case 'rules-skills':
-                return this.getSimpleRedirectHtml('Rules & Skills', 'Use the Rules & Skills tree view in the sidebar, or run "MemoPilot: Open Rules" from the command palette.');
+                return this.getInfoHtml('Rules & Skills', 'Active global rules, project rules, and detected skills are shown in the sidebar tree. Refresh to reload from backend.', 'memopilot-rules');
+            case 'task-entry':
+                return this.getInfoHtml('New Task', 'Opening the Task Entry panel where you can enter a natural language task with constraints and mode selection.', undefined);
+            case 'context-pack':
+                return this.getInfoHtml('Context Pack', 'The Context Pack sidebar shows files, tokens, and cost that will be sent to the AI model. It populates after task analysis.', 'memopilot-context');
+            case 'model-routing':
+                return this.getInfoHtml('Model Routing', 'The Cost Guard sidebar shows budget usage. Model routing selects the optimal model based on context size, task type, and privacy.', 'memopilot-cost');
+            case 'patch-preview':
+                return this.getInfoHtml('Diff Preview', 'After patch generation, a dedicated Diff Preview panel opens showing colored diffs with approve/reject buttons.', undefined);
+            case 'approval-gate':
+                return this.getInfoHtml('Approval Gate', 'No patches are applied without explicit approval. The Approve/Reject controls appear in the Diff Preview panel.', undefined);
+            case 'validation':
+                return this.getInfoHtml('Validation', 'After approval, syntax, lint, test impact, and security checks run automatically. Results appear inline in the Diff Preview.', undefined);
+            case 'task-history':
+                return this.getInfoHtml('Tasks & History', 'Recent tasks with status, model used, cost, and duration are shown in the Task History sidebar tree.', 'memopilot-history');
+            case 'cost-dashboard':
+                return this.getInfoHtml('Cost Dashboard', 'Opening the Cost Dashboard panel with metrics, daily trends, and per-model breakdown.', undefined);
             case 'memory-manager':
-                return this.getSimpleRedirectHtml('Memory Manager', 'Use the Memory Manager tree view in the sidebar for full CRUD operations.');
+                return this.getInfoHtml('Memory Manager', 'Use the Memory Manager sidebar for full CRUD operations: approve, reject, edit, filter, backup.', 'memopilot-memory');
             case 'workspace-profile':
-                return this.getSimpleRedirectHtml('Workspace Profile', 'Use the Workspace Profile tree view in the sidebar, or run "MemoPilot: Open Workspace Profile" from the command palette.');
+                return this.getInfoHtml('Workspace Profile', 'The Workspace Profile sidebar shows detected frameworks, dependencies, and configuration.', 'memopilot-profile');
             case 'privacy-boundary':
-                return this.getSimpleRedirectHtml('Privacy Dashboard', 'Use the Privacy Dashboard tree view in the sidebar, or run "MemoPilot: Show Privacy Dashboard" from the command palette.');
+                return this.getInfoHtml('Privacy Dashboard', 'The Privacy Dashboard sidebar shows data classification: what stays local vs. what may leave.', 'memopilot-privacy');
+            case 'provider-matrix':
+                return this.getInfoHtml('Provider Matrix', 'Opening the Provider Matrix panel showing model capabilities, costs, and privacy levels.', undefined);
             case 'evidence-board':
-                return this.getSimpleRedirectHtml('Evidence Board', 'Use the Evidence Board tree view in the sidebar, or run "MemoPilot: Attach Evidence" from the command palette.');
+                return this.getInfoHtml('Evidence Board', 'Attached evidence sources with trust classification are shown in the Evidence Board sidebar.', 'memopilot-evidence');
+            case 'mcp-tools':
+                return this.getInfoHtml('MCP & Tools', 'Connected MCP servers and available tools are shown in the MCP Tools sidebar tree.', 'memopilot-mcp');
             default:
                 return `<div class="mp-placeholder"><p>View not implemented yet.</p></div>`;
         }
@@ -182,11 +228,15 @@ export class MemoPilotPanel extends MemoPilotPanelBase {
             </div>`;
     }
 
-    private getSimpleRedirectHtml(title: string, message: string): string {
+    private getInfoHtml(title: string, message: string, treeViewId: string | undefined): string {
+        const focusBtn = treeViewId
+            ? `<button class="mp-btn mp-focus-btn" data-tree="${treeViewId}">Focus Sidebar View</button>`
+            : '';
         return `
             <div class="mp-placeholder">
                 <h3>${this.escapeHtml(title)}</h3>
                 <p>${this.escapeHtml(message)}</p>
+                ${focusBtn}
             </div>`;
     }
 
@@ -196,8 +246,10 @@ export class MemoPilotPanel extends MemoPilotPanelBase {
             if (item.id === this.activeViewId) { classes.push('active'); }
             if (!item.enabled) { classes.push('disabled'); }
             const badge = item.badge ? `<span class="badge">${this.escapeHtml(item.badge)}</span>` : '';
-            return `<div class="${classes.join(' ')}" data-view-id="${this.escapeHtml(item.id)}" onclick="navigate('${this.escapeHtml(item.id)}')">
-                <span class="icon">${this.escapeHtml(item.icon)}</span>
+            // Convert $(icon-name) to codicon span
+            const iconName = item.icon.replace('$(', '').replace(')', '');
+            return `<div class="${classes.join(' ')}" data-view-id="${this.escapeHtml(item.id)}">
+                <span class="icon codicon codicon-${this.escapeHtml(iconName)}"></span>
                 <span>${this.escapeHtml(item.label)}</span>
                 ${badge}
             </div>`;
@@ -219,6 +271,27 @@ export class MemoPilotPanel extends MemoPilotPanelBase {
 
     private buildExtraScript(): string {
         return `<script nonce="REPLACED_BY_BASE">
+        // Delegated click handler for nav items (CSP blocks inline onclick)
+        document.addEventListener('click', function(e) {
+            var navItem = e.target.closest('.mp-nav-item');
+            if (navItem && !navItem.classList.contains('disabled')) {
+                var viewId = navItem.dataset.viewId;
+                if (viewId) { navigate(viewId); }
+                return;
+            }
+            var focusBtn = e.target.closest('.mp-focus-btn');
+            if (focusBtn) {
+                var tree = focusBtn.dataset.tree;
+                if (tree) { navigate(tree); }
+                return;
+            }
+            var restartBtn = e.target.closest('.mp-restart-btn');
+            if (restartBtn) {
+                postMsg('restart-backend');
+                return;
+            }
+        });
+
         window.handleMessage = function(msg) {
             switch (msg.type) {
                 case 'workspace-status':
@@ -269,7 +342,7 @@ export class MemoPilotPanel extends MemoPilotPanelBase {
                 html += '<div style="font-size:11px;color:var(--mp-muted);">' + status.filesScanned + ' / ' + status.totalFiles + ' files • ' + status.symbolsExtracted + ' symbols</div>';
             }
             if (!status.connected) {
-                html += '<div style="margin-top:12px;"><button onclick="postMsg(\\'restart-backend\\')" style="background:var(--mp-button-bg);color:var(--mp-button-fg);border:none;padding:6px 12px;border-radius:4px;cursor:pointer;">Restart Backend</button></div>';
+                html += '<div style="margin-top:12px;"><button class="mp-restart-btn" style="background:var(--mp-button-bg);color:var(--mp-button-fg);border:none;padding:6px 12px;border-radius:4px;cursor:pointer;">Restart Backend</button></div>';
             }
             el.innerHTML = html;
         }

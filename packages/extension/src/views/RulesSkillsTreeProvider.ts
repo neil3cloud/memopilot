@@ -93,12 +93,14 @@ export class RulesSkillsTreeProvider implements vscode.TreeDataProvider<RulesTre
 
     getChildren(element?: RulesTreeElement): RulesTreeElement[] {
         if (this.loading) {
-            const item = new vscode.TreeItem('$(sync~spin) Loading rules...');
+            const item = new vscode.TreeItem('Loading rules...');
+            item.iconPath = new vscode.ThemeIcon('sync~spin');
             return [item as unknown as RulesTreeElement];
         }
 
         if (this.error) {
-            const item = new vscode.TreeItem(`$(error) ${this.error}`);
+            const item = new vscode.TreeItem(this.error);
+            item.iconPath = new vscode.ThemeIcon('error');
             return [item as unknown as RulesTreeElement];
         }
 

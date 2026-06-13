@@ -21,14 +21,15 @@ export class StatusTreeProvider implements vscode.TreeDataProvider<vscode.TreeIt
 
     getChildren(): vscode.TreeItem[] {
         const iconMap: Record<BackendStatus, string> = {
-            connecting: '$(sync~spin)',
-            connected: '$(check)',
-            error: '$(error)',
-            'no-workspace': '$(info)',
+            connecting: 'sync~spin',
+            connected: 'pass',
+            error: 'error',
+            'no-workspace': 'info',
         };
 
-        const item = new vscode.TreeItem(`${iconMap[this.status]} ${this.message}`);
+        const item = new vscode.TreeItem(this.message);
         item.contextValue = this.status;
+        item.iconPath = new vscode.ThemeIcon(iconMap[this.status]);
         return [item];
     }
 }

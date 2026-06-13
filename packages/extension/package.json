@@ -13,8 +13,12 @@
   "engines": {
     "vscode": "^1.85.0"
   },
-  "categories": ["Other"],
-  "activationEvents": ["onStartupFinished"],
+  "categories": [
+    "Other"
+  ],
+  "activationEvents": [
+    "onStartupFinished"
+  ],
   "main": "./out/extension.js",
   "contributes": {
     "viewsContainers": {
@@ -190,7 +194,12 @@
         },
         "memopilot.backendLogLevel": {
           "type": "string",
-          "enum": ["debug", "info", "warning", "error"],
+          "enum": [
+            "debug",
+            "info",
+            "warning",
+            "error"
+          ],
           "default": "info",
           "description": "Log level for the Python backend."
         }
@@ -206,9 +215,10 @@
     "package": "pnpm run build && pnpm run prebundle-agent && vsce package --no-dependencies"
   },
   "devDependencies": {
-    "@types/node": "^20.11.0",
     "@types/mocha": "^10.0.10",
+    "@types/node": "^20.11.0",
     "@types/vscode": "^1.85.0",
+    "@vscode/codicons": "^0.0.45",
     "@vscode/test-electron": "^3.0.0",
     "@vscode/vsce": "^2.22.0",
     "esbuild": "^0.20.0",
