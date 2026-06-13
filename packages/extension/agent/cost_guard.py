@@ -17,6 +17,10 @@ class BudgetStatus:
     spent_usd: float
     saved_usd: float
     remaining_usd: float
+    warning_threshold_usd: float
+    warning_triggered: bool
+    blocked: bool
+    spend_ratio: float
 
 
 @dataclass(frozen=True)
@@ -47,12 +51,14 @@ class BudgetProfileResult:
 
 
 class CostGuardService:
-    """Handles budget checks, spend tracking, and savings reports."""
+    """Handles budget checks, spend tracking, savings reports, and profile enforcement."""
 
     def __init__(self, *, config: Config, db: DatabaseManager) -> None:
         self._config = config
         self._db = db
         self._profile_multipliers = {
+            "strict_local": 1.0,
+            "enterprise_privacy": 1.0,
             "cost_saver": 0.7,
             "balanced": 1.0,
             "frontier": 1.5,
@@ -62,23 +68,95 @@ class CostGuardService:
         spent_usd = await self._sum_ledger("spend")
         saved_usd = await self._sum_ledger("save")
         base_budget = max(self._config.monthly_budget_usd, 0.0)
-        multiplier = self._profile_multipliers.get(self._config.budget_profile, 1.0)
+        multiplier = self._profile_multipliers.get(self._active_budget_profile(), 1.0)
         monthly_budget = max(base_budget * multiplier, 0.0)
         remaining = max(monthly_budget - spent_usd, 0.0)
+        warning_threshold = round(monthly_budget * 0.8, 4)
+        spend_ratio = (
+            (spent_usd / monthly_budget) if monthly_budget > 0 else 1.0 if spent_usd > 0 else 0.0
+        )
+        blocked = monthly_budget == 0.0 or spent_usd >= monthly_budget
+        warning_triggered = spent_usd >= warning_threshold if monthly_budget > 0 else spent_usd > 0
         return BudgetStatus(
             monthly_budget_usd=monthly_budget,
             spent_usd=spent_usd,
             saved_usd=saved_usd,
             remaining_usd=remaining,
+            warning_threshold_usd=warning_threshold,
+            warning_triggered=warning_triggered,
+            blocked=blocked,
+            spend_ratio=round(spend_ratio, 4),
         )
 
     async def check_budget(self, estimated_cost_usd: float) -> BudgetCheck:
         status = await self.get_budget_status()
         estimated_cost_usd = max(estimated_cost_usd, 0.0)
         allowed = estimated_cost_usd <= status.remaining_usd
-        reason = "within_budget" if allowed else "monthly_budget_exceeded"
+        reason = "within_budget"
+        if not allowed:
+            reason = "monthly_budget_exceeded"
+        elif estimated_cost_usd > 0 and status.warning_triggered:
+            reason = "monthly_budget_warning"
         return BudgetCheck(
             allowed=allowed,
+            reason=reason,
+            estimated_cost_usd=estimated_cost_usd,
+            status=status,
+        )
+
+    async def check_provider_budget(
+        self,
+        *,
+        provider: str | None,
+        model: str | None,
+        privacy_level: str | None,
+        estimated_cost_usd: float,
+        requires_approval: bool = False,
+        approval_granted: bool = False,
+    ) -> BudgetCheck:
+        status = await self.get_budget_status()
+        estimated_cost_usd = max(estimated_cost_usd, 0.0)
+        is_local = self._is_local_provider(provider=provider, privacy_level=privacy_level)
+        profile_reason = self._profile_restriction_reason(
+            provider=provider,
+            model=model,
+            privacy_level=privacy_level,
+            requires_approval=requires_approval,
+            approval_granted=approval_granted,
+        )
+        if profile_reason is not None:
+            return BudgetCheck(
+                allowed=False,
+                reason=profile_reason,
+                estimated_cost_usd=estimated_cost_usd,
+                status=status,
+            )
+        if is_local:
+            return BudgetCheck(
+                allowed=True,
+                reason="local_provider_allowed",
+                estimated_cost_usd=estimated_cost_usd,
+                status=status,
+            )
+        if status.blocked and estimated_cost_usd > 0:
+            return BudgetCheck(
+                allowed=False,
+                reason="monthly_budget_exceeded",
+                estimated_cost_usd=estimated_cost_usd,
+                status=status,
+            )
+        if estimated_cost_usd > status.remaining_usd:
+            return BudgetCheck(
+                allowed=False,
+                reason="monthly_budget_exceeded",
+                estimated_cost_usd=estimated_cost_usd,
+                status=status,
+            )
+        reason = "cloud_provider_allowed"
+        if estimated_cost_usd > 0 and status.warning_triggered:
+            reason = "monthly_budget_warning"
+        return BudgetCheck(
+            allowed=True,
             reason=reason,
             estimated_cost_usd=estimated_cost_usd,
             status=status,
@@ -93,14 +171,18 @@ class CostGuardService:
         risk_level: str | None,
         selected_model: str | None,
         estimated_cost: float | None,
+        workspace_root: str | None = None,
     ) -> str:
         task_run_id = uuid.uuid4().hex
         conn = await self._db.connect()
         await conn.execute(
             """
             INSERT INTO task_runs
-            (id, user_request, task_type, mode, risk_level, selected_model, estimated_cost, status)
-            VALUES (?, ?, ?, ?, ?, ?, ?, 'running')
+            (
+                id, user_request, task_type, mode, risk_level,
+                selected_model, estimated_cost, status, workspace_root
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, 'running', ?)
             """,
             (
                 task_run_id,
@@ -110,6 +192,7 @@ class CostGuardService:
                 risk_level,
                 selected_model,
                 estimated_cost,
+                workspace_root,
             ),
         )
         await conn.commit()
@@ -298,3 +381,50 @@ class CostGuardService:
         if isinstance(loaded, dict):
             return loaded
         return {}
+
+    def _profile_restriction_reason(
+        self,
+        *,
+        provider: str | None,
+        model: str | None,
+        privacy_level: str | None,
+        requires_approval: bool,
+        approval_granted: bool,
+    ) -> str | None:
+        profile = self._active_budget_profile()
+        is_local = self._is_local_provider(provider=provider, privacy_level=privacy_level)
+        normalized_privacy = (privacy_level or "").strip().lower()
+        if profile == "strict_local" and not is_local:
+            return "profile_blocks_non_local_provider"
+        if profile == "enterprise_privacy" and normalized_privacy != "local":
+            return "profile_requires_local_privacy"
+        if (
+            profile == "cost_saver"
+            and not is_local
+            and self._is_frontier_model(model=model, requires_approval=requires_approval)
+            and not approval_granted
+        ):
+            return "frontier_model_requires_approval"
+        return None
+
+    def _is_local_provider(self, *, provider: str | None, privacy_level: str | None) -> bool:
+        normalized_provider = (provider or "").strip().lower()
+        normalized_privacy = (privacy_level or "").strip().lower()
+        if normalized_privacy == "local":
+            return True
+        return normalized_provider in {"ollama", "local", "llama.cpp"}
+
+    def _is_frontier_model(self, *, model: str | None, requires_approval: bool) -> bool:
+        if requires_approval:
+            return True
+        normalized = (model or "").strip().lower()
+        if not normalized:
+            return False
+        if any(local_marker in normalized for local_marker in ("llama", "mistral", "ollama")):
+            return False
+        if "mini" in normalized:
+            return False
+        return any(
+            marker in normalized
+            for marker in ("gpt-4", "gpt-5", "claude", "sonnet", "opus", "frontier")
+        )

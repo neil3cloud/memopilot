@@ -28,7 +28,7 @@ async def test_workspace_init_creates_directories(
     assert (memopilot_dir / "logs").exists()
     assert (memopilot_dir / "context-packs").exists()
     assert (memopilot_dir / "context-templates").exists()
-    assert (memopilot_dir / "snapshots").exists()
+    assert (memopilot_dir / "memory" / "snapshots").exists()
 
 
 @pytest.mark.asyncio

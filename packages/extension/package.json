@@ -2,7 +2,7 @@
   "name": "memopilot",
   "displayName": "MemoPilot",
   "description": "Rule-Aware, Local-Memory, Cost-Governed AI Development Agent",
-  "version": "0.1.0",
+  "version": "1.0.0",
   "publisher": "memopilot",
   "license": "MIT",
   "icon": "resources/marketplace-icon.png",

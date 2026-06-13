@@ -32,7 +32,21 @@ class WorkspaceRootsService:
             activate=True,
         )
 
-    async def list_workspace_roots(self, *, limit: int = 100) -> list[WorkspaceRootItem]:
+    async def list_roots(
+        self,
+        *,
+        limit: int = 100,
+        workspace_root: str | None = None,
+    ) -> list[WorkspaceRootItem]:
+        return await self.list_workspace_roots(limit=limit, workspace_root=workspace_root)
+
+    async def list_workspace_roots(
+        self,
+        *,
+        limit: int = 100,
+        workspace_root: str | None = None,
+    ) -> list[WorkspaceRootItem]:
+        del workspace_root
         conn = await self._db.connect()
         cursor = await conn.execute(
             """
@@ -60,18 +74,9 @@ class WorkspaceRootsService:
         root_path: str,
         label: str | None,
         activate: bool,
+        workspace_root: str | None = None,
     ) -> WorkspaceRootItem:
-        candidate = Path(root_path)
-        if not candidate.is_absolute():
-            candidate = (self._config.workspace_path / candidate).resolve()
-            # Guard against relative path traversal escaping the workspace
-            workspace_resolved = self._config.workspace_path.resolve()
-            if not candidate.is_relative_to(workspace_resolved):
-                raise ValueError(
-                    f"Path traversal denied: {candidate} is outside workspace {workspace_resolved}"
-                )
-        resolved = candidate.resolve()
-
+        resolved = self._resolve_candidate_root(root_path, workspace_root=workspace_root)
         if not resolved.exists() or not resolved.is_dir():
             raise ValueError(f"Workspace root not found: {resolved}")
 
@@ -113,15 +118,14 @@ class WorkspaceRootsService:
         )
         if activate:
             await conn.execute(
-                "UPDATE workspace_roots SET active = 0 WHERE root_path != ?",
-                (str(resolved),),
+                "UPDATE workspace_roots SET active = 0 WHERE root_path != ?", (str(resolved),)
             )
             await conn.execute(
-                (
-                    "UPDATE workspace_roots "
-                    "SET active = 1, updated_at = datetime('now') "
-                    "WHERE root_path = ?"
-                ),
+                """
+                UPDATE workspace_roots
+                SET active = 1, updated_at = datetime('now')
+                WHERE root_path = ?
+                """,
                 (str(resolved),),
             )
         await conn.commit()
@@ -133,7 +137,43 @@ class WorkspaceRootsService:
             active=active_flag,
         )
 
-    async def activate_workspace_root(self, *, workspace_id: str) -> WorkspaceRootItem:
+    async def set_active_root(
+        self,
+        root_path: str,
+        *,
+        workspace_root: str | None = None,
+    ) -> WorkspaceRootItem:
+        resolved = self._resolve_candidate_root(root_path, workspace_root=workspace_root)
+        conn = await self._db.connect()
+        cursor = await conn.execute(
+            """
+            SELECT id
+            FROM workspace_roots
+            WHERE root_path = ?
+            LIMIT 1
+            """,
+            (str(resolved),),
+        )
+        row = await cursor.fetchone()
+        if row is None:
+            return await self.add_workspace_root(
+                root_path=str(resolved),
+                label=resolved.name or "workspace",
+                activate=True,
+                workspace_root=workspace_root,
+            )
+        return await self.activate_workspace_root(
+            workspace_id=str(row["id"]),
+            workspace_root=workspace_root,
+        )
+
+    async def activate_workspace_root(
+        self,
+        *,
+        workspace_id: str,
+        workspace_root: str | None = None,
+    ) -> WorkspaceRootItem:
+        del workspace_root
         conn = await self._db.connect()
         cursor = await conn.execute(
             """
@@ -161,7 +201,14 @@ class WorkspaceRootsService:
             active=True,
         )
 
-    async def active_workspace_path(self) -> Path:
+    async def get_active_root(self, *, workspace_root: str | None = None) -> str:
+        return str(await self.active_workspace_path(workspace_root=workspace_root))
+
+    async def active_workspace_path(self, *, workspace_root: str | None = None) -> Path:
+        explicit = self._normalize_explicit_workspace_root(workspace_root)
+        if explicit is not None:
+            return explicit
+
         conn = await self._db.connect()
         cursor = await conn.execute(
             """
@@ -177,8 +224,42 @@ class WorkspaceRootsService:
             return self._config.workspace_path.resolve()
         return Path(str(row["root_path"])).resolve()
 
-    async def allowed_workspace_paths(self) -> list[Path]:
+    async def resolve_workspace_root(self, workspace_root: str | None) -> Path:
+        explicit = self._normalize_explicit_workspace_root(workspace_root)
+        if explicit is not None:
+            return explicit
+        return await self.active_workspace_path()
+
+    async def allowed_workspace_paths(self, *, workspace_root: str | None = None) -> list[Path]:
+        del workspace_root
         roots = await self.list_workspace_roots(limit=1000)
-        if not roots:
-            return [self._config.workspace_path.resolve()]
-        return [Path(item.root_path).resolve() for item in roots]
+        items = [Path(item.root_path).resolve() for item in roots]
+        default_root = self._config.workspace_path.resolve()
+        if default_root not in items:
+            items.insert(0, default_root)
+        return items
+
+    def _resolve_candidate_root(self, root_path: str, *, workspace_root: str | None = None) -> Path:
+        candidate = Path(root_path)
+        if candidate.is_absolute():
+            return candidate.resolve()
+        base_root = (
+            self._normalize_explicit_workspace_root(workspace_root)
+            or self._config.workspace_path.resolve()
+        )
+        resolved = (base_root / candidate).resolve()
+        if not resolved.is_relative_to(base_root):
+            raise ValueError(f"Path traversal denied: {resolved} is outside workspace {base_root}")
+        return resolved
+
+    def _normalize_explicit_workspace_root(self, workspace_root: str | None) -> Path | None:
+        if workspace_root is None or not workspace_root.strip():
+            return None
+        candidate = Path(workspace_root)
+        if not candidate.is_absolute():
+            candidate = (self._config.workspace_path / candidate).resolve()
+        else:
+            candidate = candidate.resolve()
+        if not candidate.exists() or not candidate.is_dir():
+            raise ValueError(f"Workspace root not found: {candidate}")
+        return candidate

@@ -136,3 +136,70 @@ async def test_task_analyze_complexity_estimation(client: AsyncClient, test_toke
         json={"description": complex_desc},
     )
     assert complex_resp.json()["estimated_complexity"] in ("medium", "high")
+
+
+@pytest.mark.asyncio
+async def test_task_analyze_prioritizes_test_files_over_sensitive_directories(
+    client: AsyncClient,
+    test_token: str,
+):
+    headers = {"X-Agent-Token": test_token}
+    await client.post("/v1/workspace/init", headers=headers)
+
+    response = await client.post(
+        "/v1/task/analyze",
+        headers=headers,
+        json={
+            "description": "Update auth regression coverage",
+            "changed_files": [r"src\auth\login_test.py"],
+        },
+    )
+    assert response.status_code == 200
+    data = response.json()
+    assert data["task_type"] == "test_generation"
+    assert data["risk"] == "low"
+    assert data["suggested_mode"] == "test"
+
+
+@pytest.mark.asyncio
+async def test_task_analyze_detects_schema_change_from_migration_paths(
+    client: AsyncClient,
+    test_token: str,
+):
+    headers = {"X-Agent-Token": test_token}
+    await client.post("/v1/workspace/init", headers=headers)
+
+    response = await client.post(
+        "/v1/task/analyze",
+        headers=headers,
+        json={
+            "description": "Adjust migration for investigation sessions",
+            "changed_files": [r"src\billing\migrations\20250101_add_session.py"],
+        },
+    )
+    assert response.status_code == 200
+    data = response.json()
+    assert data["task_type"] == "schema_change"
+    assert data["risk"] == "critical"
+
+
+@pytest.mark.asyncio
+async def test_task_analyze_uses_directory_signals_when_no_filename_match(
+    client: AsyncClient,
+    test_token: str,
+):
+    headers = {"X-Agent-Token": test_token}
+    await client.post("/v1/workspace/init", headers=headers)
+
+    response = await client.post(
+        "/v1/task/analyze",
+        headers=headers,
+        json={
+            "description": "Update invoice settlement flow",
+            "changed_files": [r"src\billing\invoice\processor.py"],
+        },
+    )
+    assert response.status_code == 200
+    data = response.json()
+    assert data["task_type"] == "billing_change"
+    assert data["risk"] == "high"

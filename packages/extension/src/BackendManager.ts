@@ -4,6 +4,14 @@ import * as path from 'path';
 import * as fs from 'fs';
 import { ChildProcess, spawn } from 'child_process';
 
+interface BackendLockfile {
+    port: number;
+    pid: number;
+    started_at?: string;
+    schema_version?: number;
+    api_version?: number;
+}
+
 export class BackendManager {
     private process: ChildProcess | undefined;
     private token: string;
@@ -333,16 +341,9 @@ export class BackendManager {
                     `Backend process exited with code ${this.process.exitCode}.\n${this.stderrBuffer.slice(-500)}`
                 );
             }
-            if (fs.existsSync(this.lockFilePath)) {
-                try {
-                    const content = fs.readFileSync(this.lockFilePath, 'utf8').trim();
-                    const data = JSON.parse(content);
-                    if (data.port && typeof data.port === 'number') {
-                        return data.port;
-                    }
-                } catch {
-                    // Lockfile not ready yet, keep polling
-                }
+            const lockfile = this.readLockfile();
+            if (lockfile) {
+                return lockfile.port;
             }
 
             const portFromLogs = this.extractPortFromLogs();
@@ -358,6 +359,46 @@ export class BackendManager {
             ? `\nLast stderr:\n${this.stderrBuffer.slice(-500)}`
             : '';
         throw new Error(`Backend failed to start within 10 seconds (no lockfile)${hint}`);
+    }
+
+    private readLockfile(): BackendLockfile | undefined {
+        if (!fs.existsSync(this.lockFilePath)) {
+            return undefined;
+        }
+        try {
+            const content = fs.readFileSync(this.lockFilePath, 'utf8').trim();
+            const data: unknown = JSON.parse(content);
+            if (!data || typeof data !== 'object') {
+                return undefined;
+            }
+
+            const lockfile = data as Partial<BackendLockfile>;
+            if (!Number.isInteger(lockfile.port) || !Number.isInteger(lockfile.pid)) {
+                return undefined;
+            }
+            if (lockfile.started_at !== undefined && typeof lockfile.started_at !== 'string') {
+                return undefined;
+            }
+            if (
+                lockfile.schema_version !== undefined &&
+                !Number.isInteger(lockfile.schema_version)
+            ) {
+                 return undefined;
+            }
+            if (lockfile.api_version !== undefined && !Number.isInteger(lockfile.api_version)) {
+                return undefined;
+            }
+
+            return {
+                port: lockfile.port,
+                pid: lockfile.pid,
+                started_at: lockfile.started_at,
+                schema_version: lockfile.schema_version,
+                api_version: lockfile.api_version,
+            };
+        } catch {
+            return undefined;
+        }
     }
 
     private extractPortFromLogs(): number | undefined {
