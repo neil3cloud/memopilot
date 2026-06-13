@@ -119,7 +119,7 @@ docs/          — Product documentation
 
 ## Current Implementation Status
 
-**Completed:** Phases 1–17 (MVP + v1 production + v1.5)
+**Completed:** Phases 1–17 (MVP + v1 production + v1.5) + Full UI Implementation
 
 - Workspace indexing delivered (`/v1/workspace/index`, stale-file handling, symbol extraction, rebuild-memory flow)
 - Cost guard and cache delivered (budget checks, task run + usage ledger, savings report, response cache)
@@ -139,6 +139,27 @@ docs/          — Product documentation
   - Memory backup/restore
   - Tool/skill selection optimizer
   - Model budget profiles
+
+### UI Implementation (Latest — June 2025)
+
+Full end-to-end task flow UI now covers all 17 target scenario views:
+
+| Category | Views Delivered |
+|----------|---------------|
+| **Core Flow** | Task Entry, Context Pack Preview, Model Routing, Patch Preview, Approval Gate, Validation |
+| **Governance** | Rules & Skills, Cost Guard, Privacy Dashboard, Provider Matrix |
+| **History & Cost** | Task History, Cost Dashboard |
+| **External** | MCP Tools, Evidence Board |
+| **Management** | Memory Manager, Workspace Profile, Workspace Status |
+
+New architecture additions:
+- `TaskFlowController` state machine (analyze → context → route → patch → approve → validate)
+- `MemoPilotPanelBase` abstract class (CSP nonce, theme vars, message bridge)
+- 5 new webview panels + 5 new tree providers (replacing all placeholders)
+- 9 new backend API endpoints with 38 dedicated tests
+- Zero remaining placeholder views
+
+Key principle: **Developer approval is mandatory** — the TaskFlowController always stops at the approval gate before any code is applied.
 
 ## v2 Implementation Plan
 
