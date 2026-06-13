@@ -45,7 +45,9 @@ export class CostGuardTreeProvider implements vscode.TreeDataProvider<vscode.Tre
 
     getChildren(): vscode.TreeItem[] {
         if (this.error) {
-            return [new vscode.TreeItem(`$(error) ${this.error}`)];
+            const item = new vscode.TreeItem(this.error);
+            item.iconPath = new vscode.ThemeIcon('error');
+            return [item];
         }
 
         if (!this.data) {
@@ -58,24 +60,28 @@ export class CostGuardTreeProvider implements vscode.TreeDataProvider<vscode.Tre
         const filled = Math.round((pct / 100) * barLen);
         const bar = '█'.repeat(filled) + '░'.repeat(barLen - filled);
 
-        const statusIcon = pct >= 90 ? '$(error)' : pct >= 70 ? '$(warning)' : '$(check)';
+        const statusIcon = pct >= 90 ? 'error' : pct >= 70 ? 'warning' : 'check';
 
         const items: vscode.TreeItem[] = [];
 
-        const budgetItem = new vscode.TreeItem(`${statusIcon} Budget: ${pct}% used`);
+        const budgetItem = new vscode.TreeItem(`Budget: ${pct}% used`);
         budgetItem.description = `[${bar}]`;
         budgetItem.tooltip = `$${spent_usd.toFixed(2)} / $${monthly_budget_usd.toFixed(2)}`;
+        budgetItem.iconPath = new vscode.ThemeIcon(statusIcon);
         items.push(budgetItem);
 
-        const spentItem = new vscode.TreeItem(`$(credit-card) Spent: $${spent_usd.toFixed(2)}`);
+        const spentItem = new vscode.TreeItem(`Spent: $${spent_usd.toFixed(2)}`);
         spentItem.description = `of $${monthly_budget_usd.toFixed(2)}`;
+        spentItem.iconPath = new vscode.ThemeIcon('credit-card');
         items.push(spentItem);
 
-        const remainItem = new vscode.TreeItem(`$(arrow-right) Remaining: $${remaining_usd.toFixed(2)}`);
+        const remainItem = new vscode.TreeItem(`Remaining: $${remaining_usd.toFixed(2)}`);
+        remainItem.iconPath = new vscode.ThemeIcon('arrow-right');
         items.push(remainItem);
 
-        const savedItem = new vscode.TreeItem(`$(sparkle) Saved (vs Frontier): $${saved_usd.toFixed(2)}`);
+        const savedItem = new vscode.TreeItem(`Saved (vs Frontier): $${saved_usd.toFixed(2)}`);
         savedItem.tooltip = 'Amount saved by using local/cheaper models instead of frontier models.';
+        savedItem.iconPath = new vscode.ThemeIcon('sparkle');
         items.push(savedItem);
 
         return items;

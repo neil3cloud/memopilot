@@ -44,10 +44,14 @@ export abstract class MemoPilotPanelBase implements vscode.Disposable {
     }
 
     /** Generate the full HTML for the webview */
-    protected renderHtml(bodyContent: string, extraScript: string = ''): string {
+    protected renderHtml(bodyContent: string, extraScript: string = '', extraStyles: string = ''): string {
         const nonce = crypto.randomBytes(16).toString('hex');
         const webview = this.panel.webview;
         const cspSource = webview.cspSource;
+        // Codicon font URI from bundled resources
+        const codiconFontUri = webview.asWebviewUri(
+            vscode.Uri.joinPath(this.extensionUri, 'resources', 'codicon.ttf'),
+        );
         // Replace placeholder nonce in extra scripts
         const resolvedExtraScript = extraScript.replace(/nonce="REPLACED_BY_BASE"/g, `nonce="${nonce}"`);
 
@@ -55,10 +59,40 @@ export abstract class MemoPilotPanelBase implements vscode.Disposable {
 <html lang="en">
 <head>
     <meta charset="UTF-8">
-    <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src ${cspSource} 'nonce-${nonce}'; script-src 'nonce-${nonce}'; font-src ${cspSource};">
+    <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src ${cspSource} 'unsafe-inline' 'nonce-${nonce}'; script-src 'nonce-${nonce}'; font-src ${cspSource};">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>MemoPilot</title>
     <style nonce="${nonce}">
+        @font-face {
+            font-family: "codicon";
+            src: url("${codiconFontUri}") format("truetype");
+        }
+        .codicon {
+            font: normal normal normal 16px/1 codicon;
+            display: inline-block;
+            text-decoration: none;
+            text-rendering: auto;
+            text-align: center;
+            -webkit-font-smoothing: antialiased;
+            -moz-osx-font-smoothing: grayscale;
+        }
+        .codicon-pulse:before { content: "\\eb01"; }
+        .codicon-database:before { content: "\\ea94"; }
+        .codicon-law:before { content: "\\ea9d"; }
+        .codicon-edit:before { content: "\\ea73"; }
+        .codicon-package:before { content: "\\eb29"; }
+        .codicon-server:before { content: "\\eb99"; }
+        .codicon-diff:before { content: "\\ea71"; }
+        .codicon-check:before { content: "\\eab2"; }
+        .codicon-beaker:before { content: "\\ea79"; }
+        .codicon-history:before { content: "\\ea82"; }
+        .codicon-graph:before { content: "\\ea61"; }
+        .codicon-archive:before { content: "\\ea98"; }
+        .codicon-file-code:before { content: "\\ea7b"; }
+        .codicon-shield:before { content: "\\ea82"; }
+        .codicon-table:before { content: "\\eb71"; }
+        .codicon-search:before { content: "\\ea6d"; }
+        .codicon-plug:before { content: "\\eb1e"; }
         :root {
             --mp-bg: var(--vscode-editor-background);
             --mp-fg: var(--vscode-editor-foreground);
@@ -174,6 +208,7 @@ export abstract class MemoPilotPanelBase implements vscode.Disposable {
         .mp-placeholder p {
             max-width: 400px;
             line-height: 1.5;
+            margin-bottom: 12px;
         }
         .mp-status-panel { padding: 12px 0; }
         .mp-status-panel .info-row {
@@ -196,6 +231,30 @@ export abstract class MemoPilotPanelBase implements vscode.Disposable {
             background: var(--mp-accent);
             transition: width 0.3s;
         }
+        .mp-btn {
+            background: var(--vscode-button-background);
+            color: var(--vscode-button-foreground);
+            border: none;
+            padding: 7px 16px;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 12px;
+            font-weight: 500;
+            transition: background 0.15s;
+        }
+        .mp-btn:hover { background: var(--vscode-button-hoverBackground); }
+        .mp-btn-secondary {
+            background: transparent;
+            color: var(--mp-fg);
+            border: 1px solid var(--mp-border);
+            padding: 7px 16px;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 12px;
+            transition: background 0.15s;
+        }
+        .mp-btn-secondary:hover { background: var(--vscode-list-hoverBackground); }
+        ${extraStyles}
     </style>
     ${resolvedExtraScript}
 </head>

@@ -45,7 +45,9 @@ export class McpToolsTreeProvider implements vscode.TreeDataProvider<vscode.Tree
 
     getChildren(element?: vscode.TreeItem): vscode.TreeItem[] {
         if (this.error) {
-            return [new vscode.TreeItem(`$(error) ${this.error}`)];
+            const item = new vscode.TreeItem(this.error);
+            item.iconPath = new vscode.ThemeIcon('error');
+            return [item];
         }
 
         if (!element) {
@@ -54,13 +56,14 @@ export class McpToolsTreeProvider implements vscode.TreeDataProvider<vscode.Tree
                 return [new vscode.TreeItem('No MCP servers configured.')];
             }
             return this.servers.map(server => {
-                const statusIcon = server.status === 'connected' ? '$(plug)' : '$(debug-disconnect)';
+                const statusIcon = server.status === 'connected' ? 'plug' : 'debug-disconnect';
                 const item = new vscode.TreeItem(
-                    `${statusIcon} ${server.name}`,
+                    server.name,
                     vscode.TreeItemCollapsibleState.Expanded,
                 );
                 item.description = `${server.tools.length} tools`;
                 item.contextValue = `mcp-server:${server.name}`;
+                item.iconPath = new vscode.ThemeIcon(statusIcon);
                 return item;
             });
         }
@@ -71,8 +74,9 @@ export class McpToolsTreeProvider implements vscode.TreeDataProvider<vscode.Tree
         if (!server) return [];
 
         return server.tools.map(tool => {
-            const item = new vscode.TreeItem(`$(symbol-method) ${tool}`);
+            const item = new vscode.TreeItem(tool);
             item.tooltip = `MCP tool: ${tool} (from ${server.name})`;
+            item.iconPath = new vscode.ThemeIcon('symbol-method');
             return item;
         });
     }

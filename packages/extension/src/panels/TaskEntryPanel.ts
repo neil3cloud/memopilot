@@ -35,6 +35,7 @@ export class TaskEntryPanel extends MemoPilotPanelBase {
             {
                 enableScripts: true,
                 retainContextWhenHidden: true,
+                localResourceRoots: [vscode.Uri.joinPath(extensionUri, 'resources')],
             },
         );
 
@@ -126,38 +127,92 @@ export class TaskEntryPanel extends MemoPilotPanelBase {
                 <ul style="margin:0;padding-left:16px;font-size:12px;">${filesHtml}</ul>
 
                 <div style="margin-top:16px;display:flex;gap:8px;">
-                    <button onclick="postMsg('cancel-task')" style="background:transparent;color:var(--mp-fg);border:1px solid var(--mp-border);padding:6px 12px;border-radius:4px;cursor:pointer;">← Edit Task</button>
+                    <button id="edit-task-btn" style="background:transparent;color:var(--mp-fg);border:1px solid var(--mp-border);padding:6px 12px;border-radius:4px;cursor:pointer;">← Edit Task</button>
                 </div>
             </div>`;
 
+        // Note: result area content is set via innerHTML so we add a delegated listener in the main script
         this.postMessage({ type: 'view-content', payload: { viewId: 'task-analysis', html } });
     }
 
     private render(): void {
-        this.panel.webview.html = this.renderHtml(this.buildFormHtml(), this.buildScript());
+        this.panel.webview.html = this.renderHtml(this.buildFormHtml(), this.buildScript(), this.getStyles());
+    }
+
+    private getStyles(): string {
+        return `
+            .task-container { max-width: 560px; margin: 0 auto; padding: 20px; }
+            .task-container h2 { margin-bottom: 4px; font-size: 18px; }
+            .task-container .subtitle { color: var(--mp-muted); margin-bottom: 20px; font-size: 12px; line-height: 1.5; }
+            .form-group { margin-bottom: 16px; }
+            .form-group label { display: block; font-size: 12px; margin-bottom: 6px; font-weight: 500; color: var(--mp-fg); }
+            .form-group textarea,
+            .form-group select {
+                width: 100%;
+                background: var(--vscode-input-background);
+                color: var(--vscode-input-foreground, var(--mp-fg));
+                border: 1px solid var(--vscode-input-border, var(--mp-border));
+                border-radius: 4px;
+                padding: 8px 10px;
+                font-family: var(--vscode-font-family);
+                font-size: 13px;
+                resize: vertical;
+            }
+            .form-group textarea:focus,
+            .form-group select:focus {
+                outline: none;
+                border-color: var(--vscode-focusBorder);
+            }
+            .constraints-group { margin-bottom: 20px; }
+            .constraints-group label.group-label { display: block; font-size: 12px; margin-bottom: 8px; font-weight: 500; }
+            .constraints-group .checkbox-item {
+                display: flex;
+                align-items: center;
+                gap: 8px;
+                font-size: 12px;
+                margin-bottom: 6px;
+                cursor: pointer;
+            }
+            .constraints-group .checkbox-item input[type="checkbox"] {
+                accent-color: var(--vscode-button-background);
+            }
+            .btn-primary {
+                background: var(--vscode-button-background);
+                color: var(--vscode-button-foreground);
+                border: none;
+                padding: 8px 20px;
+                border-radius: 4px;
+                cursor: pointer;
+                font-size: 13px;
+                font-weight: 500;
+                transition: background 0.15s;
+            }
+            .btn-primary:hover { background: var(--vscode-button-hoverBackground); }
+            .btn-primary:disabled { opacity: 0.6; cursor: not-allowed; }
+            #error-area { margin-top: 8px; color: var(--mp-error); font-size: 12px; }
+            #result-area { margin-top: 16px; }
+        `;
     }
 
     private buildFormHtml(): string {
         return `
-        <div style="max-width:600px;margin:0 auto;padding:16px;">
-            <h2 style="margin-bottom:4px;">New Task</h2>
-            <p style="color:var(--mp-muted);margin-bottom:16px;font-size:12px;">Describe what you want MemoPilot to do. Be specific about files, behavior, and constraints.</p>
+        <div class="task-container">
+            <h2>New Task</h2>
+            <p class="subtitle">Describe what you want MemoPilot to do. Be specific about files, behavior, and constraints.</p>
 
-            <div style="margin-bottom:12px;">
-                <label style="display:block;font-size:12px;margin-bottom:4px;font-weight:500;">Task Description</label>
-                <textarea id="task-desc" rows="4" placeholder="Add validation so expired items cannot be sold..."
-                    style="width:100%;background:var(--mp-input-bg);color:var(--mp-fg);border:1px solid var(--mp-input-border);border-radius:4px;padding:8px;font-family:var(--vscode-font-family);font-size:13px;resize:vertical;"></textarea>
+            <div class="form-group">
+                <label for="task-desc">Task Description</label>
+                <textarea id="task-desc" rows="4" placeholder="Add validation so expired items cannot be sold..."></textarea>
             </div>
 
-            <div style="margin-bottom:12px;">
-                <label style="display:block;font-size:12px;margin-bottom:4px;font-weight:500;">Additional Notes (optional)</label>
-                <textarea id="task-notes" rows="2" placeholder="Expiration date is in inventory/item.expiry_date..."
-                    style="width:100%;background:var(--mp-input-bg);color:var(--mp-fg);border:1px solid var(--mp-input-border);border-radius:4px;padding:8px;font-family:var(--vscode-font-family);font-size:13px;resize:vertical;"></textarea>
+            <div class="form-group">
+                <label for="task-notes">Additional Notes (optional)</label>
+                <textarea id="task-notes" rows="2" placeholder="Expiration date is in inventory/item.expiry_date..."></textarea>
             </div>
 
-            <div style="margin-bottom:12px;">
-                <label style="display:block;font-size:12px;margin-bottom:4px;font-weight:500;">Mode</label>
-                <select id="task-mode" style="width:100%;background:var(--mp-input-bg);color:var(--mp-fg);border:1px solid var(--mp-input-border);border-radius:4px;padding:6px 8px;font-size:13px;">
+            <div class="form-group">
+                <label for="task-mode">Mode</label>
+                <select id="task-mode">
                     <option value="">Auto-detect</option>
                     <option value="refactor">Refactor</option>
                     <option value="fix">Fix Bug</option>
@@ -166,30 +221,33 @@ export class TaskEntryPanel extends MemoPilotPanelBase {
                 </select>
             </div>
 
-            <div style="margin-bottom:16px;">
-                <label style="display:block;font-size:12px;margin-bottom:6px;font-weight:500;">Constraints</label>
-                <label style="display:flex;align-items:center;gap:6px;font-size:12px;margin-bottom:4px;cursor:pointer;">
+            <div class="constraints-group">
+                <label class="group-label">Constraints</label>
+                <label class="checkbox-item">
                     <input type="checkbox" id="constraint-rules" checked> Follow all project rules
                 </label>
-                <label style="display:flex;align-items:center;gap:6px;font-size:12px;margin-bottom:4px;cursor:pointer;">
+                <label class="checkbox-item">
                     <input type="checkbox" id="constraint-tests" checked> Run tests after applying changes
                 </label>
             </div>
 
-            <div style="display:flex;gap:8px;">
-                <button id="submit-btn" onclick="submitTask()"
-                    style="background:var(--mp-button-bg);color:var(--mp-button-fg);border:none;padding:8px 16px;border-radius:4px;cursor:pointer;font-size:13px;font-weight:500;">
-                    Analyze Task
-                </button>
-            </div>
+            <button id="submit-btn" class="btn-primary">Analyze Task</button>
 
-            <div id="result-area" style="margin-top:16px;"></div>
-            <div id="error-area" style="margin-top:8px;color:var(--mp-error);font-size:12px;"></div>
+            <div id="result-area"></div>
+            <div id="error-area"></div>
         </div>`;
     }
 
     private buildScript(): string {
         return `<script nonce="REPLACED_BY_BASE">
+        document.getElementById('submit-btn').addEventListener('click', submitTask);
+
+        // Delegated handler for dynamically-inserted buttons
+        document.addEventListener('click', function(e) {
+            var editBtn = e.target.closest('#edit-task-btn');
+            if (editBtn) { postMsg('cancel-task'); }
+        });
+
         function submitTask() {
             var desc = document.getElementById('task-desc').value;
             var notes = document.getElementById('task-notes').value;

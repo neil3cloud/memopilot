@@ -3,6 +3,8 @@ node_modules/
 *.vsix
 out/
 dist/
+.vscode-test/
+.vscode-test-workspace/
 
 # Python
 __pycache__/

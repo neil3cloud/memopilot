@@ -24,7 +24,7 @@ export class ProviderMatrixPanel extends MemoPilotPanelBase {
             ProviderMatrixPanel.viewType,
             'MemoPilot: Provider Matrix',
             column,
-            { enableScripts: true, retainContextWhenHidden: true },
+            { enableScripts: true, retainContextWhenHidden: true, localResourceRoots: [vscode.Uri.joinPath(extensionUri, 'resources')] },
         );
 
         ProviderMatrixPanel.instance = new ProviderMatrixPanel(panel, extensionUri);
@@ -61,7 +61,23 @@ export class ProviderMatrixPanel extends MemoPilotPanelBase {
     }
 
     private update(): void {
-        this.panel.webview.html = this.renderHtml(this.getContent());
+        this.panel.webview.html = this.renderHtml(this.getContent(), '', this.getStyles());
+    }
+
+    private getStyles(): string {
+        return `
+            .pm-container { max-width: 900px; padding: 16px; }
+            .pm-container h2 { margin-bottom: 4px; }
+            .pm-table { width: 100%; border-collapse: collapse; font-size: 13px; margin-top: 12px; }
+            .pm-table th, .pm-table td { padding: 10px 12px; text-align: left; border-bottom: 1px solid var(--vscode-panel-border, rgba(255,255,255,0.1)); }
+            .pm-table th { font-size: 11px; text-transform: uppercase; opacity: 0.7; white-space: nowrap; }
+            .pm-table td { white-space: nowrap; }
+            .pm-table tr:hover td { background: var(--vscode-list-hoverBackground); }
+            .pm-summary { margin-bottom: 16px; opacity: 0.7; font-size: 13px; }
+            .pm-check { color: #4caf50; }
+            .pm-dash { opacity: 0.4; }
+            .pm-approval-yes { color: #ff9800; font-weight: 500; }
+        `;
     }
 
     protected getContent(): string {
@@ -73,10 +89,10 @@ export class ProviderMatrixPanel extends MemoPilotPanelBase {
 
         const rows = this.providers.map(p => {
             const privacyColor = p.privacy_level === 'local' ? '#4caf50' : p.privacy_level === 'private_cloud' ? '#ff9800' : '#f44336';
-            const tools = p.supports_tool_calling ? '✓' : '—';
-            const json = p.supports_json_mode ? '✓' : '—';
-            const approval = p.requires_approval ? '⚠ Yes' : 'No';
-            const ctx = p.max_context_tokens ? `${(p.max_context_tokens / 1000).toFixed(0)}K` : '—';
+            const tools = p.supports_tool_calling ? '<span class="pm-check">✓</span>' : '<span class="pm-dash">—</span>';
+            const json = p.supports_json_mode ? '<span class="pm-check">✓</span>' : '<span class="pm-dash">—</span>';
+            const approval = p.requires_approval ? '<span class="pm-approval-yes">⚠ Yes</span>' : 'No';
+            const ctx = p.max_context_tokens ? `${(p.max_context_tokens / 1000).toFixed(0)}K` : '<span class="pm-dash">—</span>';
             const costIn = `$${p.estimated_cost_per_1m_input.toFixed(2)}`;
             const costOut = `$${p.estimated_cost_per_1m_output.toFixed(2)}`;
 
@@ -94,17 +110,11 @@ export class ProviderMatrixPanel extends MemoPilotPanelBase {
         }).join('');
 
         return `
-            <style>
-                table { width: 100%; border-collapse: collapse; font-size: 13px; }
-                th, td { padding: 8px 10px; text-align: left; border-bottom: 1px solid var(--vscode-panel-border); }
-                th { font-size: 11px; text-transform: uppercase; opacity: 0.7; white-space: nowrap; }
-                .summary { margin-bottom: 16px; opacity: 0.8; }
-            </style>
-
+            <div class="pm-container">
             <h2>Provider Capability Matrix</h2>
-            <p class="summary">${this.providers.length} model(s) configured</p>
+            <p class="pm-summary">${this.providers.length} model(s) configured</p>
 
-            <table>
+            <table class="pm-table">
                 <thead>
                     <tr>
                         <th>Model</th>
@@ -120,10 +130,7 @@ export class ProviderMatrixPanel extends MemoPilotPanelBase {
                 </thead>
                 <tbody>${rows}</tbody>
             </table>
-
-            <script nonce="REPLACED_BY_BASE">
-                const vscode = acquireVsCodeApi();
-            </script>
+            </div>
         `;
     }
 

@@ -29,7 +29,7 @@ export class PatchPreviewPanel extends MemoPilotPanelBase {
             PatchPreviewPanel.viewType,
             'MemoPilot: Patch Preview',
             column,
-            { enableScripts: true, retainContextWhenHidden: true },
+            { enableScripts: true, retainContextWhenHidden: true, localResourceRoots: [vscode.Uri.joinPath(extensionUri, 'resources')] },
         );
 
         PatchPreviewPanel.instance = new PatchPreviewPanel(panel, extensionUri);
@@ -129,15 +129,17 @@ export class PatchPreviewPanel extends MemoPilotPanelBase {
             ${validationHtml}
 
             <div class="actions">
-                <button class="btn btn-approve" onclick="sendMessage('approve')">✓ Approve & Apply</button>
-                <button class="btn btn-reject" onclick="sendMessage('reject')">✗ Reject</button>
+                <button class="btn btn-approve" id="approve-btn">✓ Approve & Apply</button>
+                <button class="btn btn-reject" id="reject-btn">✗ Reject</button>
             </div>
 
             <script nonce="REPLACED_BY_BASE">
-                const vscode = acquireVsCodeApi();
-                function sendMessage(action) {
-                    vscode.postMessage({ type: action });
-                }
+                document.getElementById('approve-btn').addEventListener('click', function() {
+                    postMsg('approve');
+                });
+                document.getElementById('reject-btn').addEventListener('click', function() {
+                    postMsg('reject');
+                });
             </script>
         `;
     }

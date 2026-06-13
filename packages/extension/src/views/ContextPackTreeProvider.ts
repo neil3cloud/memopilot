@@ -49,7 +49,9 @@ export class ContextPackTreeProvider implements vscode.TreeDataProvider<vscode.T
 
     getChildren(element?: vscode.TreeItem): vscode.TreeItem[] {
         if (this.error) {
-            return [new vscode.TreeItem(`$(error) ${this.error}`)];
+            const item = new vscode.TreeItem(this.error);
+            item.iconPath = new vscode.ThemeIcon('error');
+            return [item];
         }
 
         if (!this.data) {
@@ -61,25 +63,30 @@ export class ContextPackTreeProvider implements vscode.TreeDataProvider<vscode.T
             const items: vscode.TreeItem[] = [];
 
             const filesItem = new vscode.TreeItem(
-                `$(file-code) Files (${this.data.files.length})`,
+                `Files (${this.data.files.length})`,
                 vscode.TreeItemCollapsibleState.Expanded,
             );
             filesItem.contextValue = 'context-files';
+            filesItem.iconPath = new vscode.ThemeIcon('file-code');
             items.push(filesItem);
 
-            const rulesItem = new vscode.TreeItem(`$(law) Rules: ${this.data.rules_count}`);
+            const rulesItem = new vscode.TreeItem(`Rules: ${this.data.rules_count}`);
+            rulesItem.iconPath = new vscode.ThemeIcon('law');
             items.push(rulesItem);
 
-            const skillsItem = new vscode.TreeItem(`$(tools) Skills: ${this.data.skills_count}`);
+            const skillsItem = new vscode.TreeItem(`Skills: ${this.data.skills_count}`);
+            skillsItem.iconPath = new vscode.ThemeIcon('tools');
             items.push(skillsItem);
 
             const sep = new vscode.TreeItem('─────────────────────');
             items.push(sep);
 
-            const tokensItem = new vscode.TreeItem(`$(symbol-number) Tokens: ${this.data.total_tokens.toLocaleString()}`);
+            const tokensItem = new vscode.TreeItem(`Tokens: ${this.data.total_tokens.toLocaleString()}`);
+            tokensItem.iconPath = new vscode.ThemeIcon('symbol-number');
             items.push(tokensItem);
 
-            const costItem = new vscode.TreeItem(`$(credit-card) Est. Cost: $${this.data.estimated_cost_usd.toFixed(4)}`);
+            const costItem = new vscode.TreeItem(`Est. Cost: $${this.data.estimated_cost_usd.toFixed(4)}`);
+            costItem.iconPath = new vscode.ThemeIcon('credit-card');
             items.push(costItem);
 
             return items;
@@ -88,9 +95,10 @@ export class ContextPackTreeProvider implements vscode.TreeDataProvider<vscode.T
         // Children of "Files" node
         if (element.contextValue === 'context-files') {
             return this.data.files.map(f => {
-                const item = new vscode.TreeItem(`$(file) ${f.path}`);
+                const item = new vscode.TreeItem(f.path);
                 item.description = `${f.tokens} tokens`;
                 item.tooltip = `${f.path} — ${f.tokens} tokens`;
+                item.iconPath = new vscode.ThemeIcon('file');
                 return item;
             });
         }
