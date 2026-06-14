@@ -1,0 +1,22 @@
+workspace:
+  name: agents-check-git-status-command
+  primary_language: python
+  frameworks: []
+  test_commands:  # user-edited
+  - pytest
+  lint_commands:  # user-edited
+  - ruff check
+  typecheck_commands:  # user-edited
+  - mypy .
+  active_rules: []
+  active_skills: []
+  model_policy:  # user-edited
+    budget_profile: cost_saver
+    allow_frontier: true
+    frontier_requires_approval: true
+  privacy_policy:  # user-edited
+    cloud_context_preview_required: true
+    redact_secrets: true
+  mcp:  # user-edited
+    azure_devops_enabled: false
+    database_enabled: false

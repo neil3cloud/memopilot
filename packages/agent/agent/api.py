@@ -27,6 +27,12 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
+from .approval_gate import (
+    ComplianceWarning,
+    build_compliance_warnings,
+    determine_approval_tier,
+    rank_patch_files,
+)
 from .code_review_memory import (
     ReviewLesson as ReviewMemoryLesson,
 )
@@ -35,8 +41,14 @@ from .code_review_memory import (
     extract_review_lessons,
 )
 from .config import Config
+from .context_budget import (
+    ContextBudget,
+    ContextItem,
+    TIER_ORDER_BY_TASK_TYPE,
+    build_budget_aware_context_pack,
+)
 from .context_builder import ContextBuilderService
-from .cost_guard import CostGuardService
+from .cost_guard import CostGuardService, check_budget_gate, infer_selected_tier
 from .db import DatabaseManager
 from .document_ingestion import extract_csv, extract_docx, extract_excel, extract_pdf, extract_pptx
 from .endpoint_registry import ENDPOINT_STATUS
@@ -47,6 +59,7 @@ from .mcp_orchestrator import MCPOrchestrator, ToolCall
 from .memory_manager_service import MemoryManagerService
 from .memory_recall import MemoryRecallService, RecallRequest, RecallResponse
 from .migration_runner import run_migrations
+from .model_router import ModelTier, TIER_ORDER, get_outcome_routing_hint
 from .patch_assessor import PatchAssessorService
 from .policy_packs import PolicyPacksService
 from .privacy_dashboard_service import PrivacyDashboardService
@@ -112,6 +125,14 @@ class BudgetStatusResponse(BaseModel):
     warning_triggered: bool = False
     blocked: bool = False
     spend_ratio: float = 0.0
+    current_month_spend: float = 0.0
+    monthly_budget: float = 0.0
+    remaining: float = 0.0
+    pct_used: float = 0.0
+    at_limit: bool = False
+    warning_threshold: float = 0.80
+    at_warning: bool = False
+    last_updated_at: str | None = None
 
 
 class BudgetCheckRequest(BaseModel):
@@ -137,9 +158,28 @@ class StartTaskRunRequest(BaseModel):
     workspace_root: str | None = None
 
 
+class BudgetGateResponse(BaseModel):
+    blocked: bool
+    reason: str
+    requires_approval: bool = False
+    approval_prompt: str | None = None
+    show_warning: bool = False
+    warning_message: str | None = None
+
+
+class TaskRunCostResponse(BaseModel):
+    estimated_cost_usd: float = 0.0
+    actual_cost_usd: float = 0.0
+    selected_tier: str = "local"
+
+
 class StartTaskRunResponse(BaseModel):
     task_run_id: str
     status: str
+    estimated_cost: float | None = None
+    actual_cost: float = 0.0
+    cost: TaskRunCostResponse | None = None
+    budget_gate: BudgetGateResponse | None = None
 
 
 class TaskAnalyzeRequest(BaseModel):
@@ -169,12 +209,20 @@ class ContextBuildRequest(BaseModel):
     file_overrides: list[str] | None = None
     mode: str | None = None
     workspace_root: str | None = None
+    task_type: str | None = None
+    model_max_tokens: int | None = Field(default=None, ge=1)
 
 
 class ContextFileEntry(BaseModel):
     path: str
     tokens: int
     content: str | None = None
+
+
+class StaleExclusionsResponse(BaseModel):
+    count: int = 0
+    affected_modules: list[str] = Field(default_factory=list)
+    rebuild_command: str | None = None
 
 
 class ContextBuildResponse(BaseModel):
@@ -184,6 +232,10 @@ class ContextBuildResponse(BaseModel):
     total_tokens: int
     estimated_cost_usd: float
     context_pack_hash: str
+    budget_summary: dict[str, object] | None = None
+    stale_exclusions: StaleExclusionsResponse | None = None
+    included_items: list[dict[str, object]] | None = None
+    excluded_items: list[dict[str, object]] | None = None
 
 
 class ModelRouteRequest(BaseModel):
@@ -191,6 +243,8 @@ class ModelRouteRequest(BaseModel):
     task_type: str = "auto"
     privacy_level: str = "local_preferred"
     preferred_model: str | None = None
+    files_in_context: list[str] | None = None
+    model_override: bool = False
 
 
 class ModelChoice(BaseModel):
@@ -198,6 +252,14 @@ class ModelChoice(BaseModel):
     provider: str
     cost_estimate_usd: float
     reasons: list[str]
+    fits_context: bool = True
+
+
+class ModelRouteOption(BaseModel):
+    tier: str
+    model_id: str
+    provider: str
+    cost_estimate_usd: float
     fits_context: bool = True
 
 
@@ -210,6 +272,10 @@ class ModelRouteResponse(BaseModel):
     recommended: ModelChoice
     alternatives: list[ModelChoice]
     budget_check: BudgetCheck
+    options: list[ModelRouteOption] = Field(default_factory=list)
+    escalation_source: str | None = None
+    base_tier: str | None = None
+    model_override: bool = False
 
 
 class GeneratePatchRequest(BaseModel):
@@ -228,6 +294,27 @@ class FilePatch(BaseModel):
     diff: str
 
 
+class RankedFileResponse(BaseModel):
+    path: str
+    risk_level: str
+    risk_category: str
+
+
+class ComplianceActionResponse(BaseModel):
+    label: str
+    action_type: str
+    prefill_task_request: str
+    prefill_mode: str
+    prefill_context_hints: list[str] = Field(default_factory=list)
+
+
+class ComplianceWarningResponse(BaseModel):
+    rule_id: str
+    rule_text: str
+    warning_message: str
+    actions: list[ComplianceActionResponse] = Field(default_factory=list)
+
+
 class GeneratePatchResponse(BaseModel):
     patches: list[FilePatch]
     total_files_changed: int
@@ -236,6 +323,18 @@ class GeneratePatchResponse(BaseModel):
     model_used: str
     tokens_used: int
     cost_usd: float
+    approval_tier: str | None = None
+    ranked_files: list[RankedFileResponse] | None = None
+    compliance_warnings: list[ComplianceWarningResponse] | None = None
+
+
+class PatchRankFilesRequest(BaseModel):
+    changed_files: list[str] = Field(default_factory=list)
+
+
+class PatchRankFilesResponse(BaseModel):
+    ranked_files: list[RankedFileResponse]
+    approval_tier: str
 
 
 class ValidationCommandRequest(BaseModel):
@@ -297,6 +396,7 @@ class CostDashboardResponse(BaseModel):
     saved_usd: float
     by_day: list[CostDashboardEntry]
     by_model: list[CostDashboardEntry]
+    savings_report: SavingsReportResponse | None = None
 
 
 class RecordAICallRequest(BaseModel):
@@ -317,6 +417,14 @@ class RecordAICallResponse(BaseModel):
 
 
 class SavingsReportResponse(BaseModel):
+    actual_cost: float
+    hypothetical_frontier_cost: float
+    savings: float
+    reduction_pct: float
+    total_tasks: int
+    local_tasks: int
+    cheap_cloud_tasks: int
+    frontier_tasks: int
     month_cache_hits: int
     month_total_ai_calls: int
     cache_hit_rate: float
@@ -439,6 +547,13 @@ class WorkspaceProfileExportResponse(BaseModel):
     exported_path: str
 
 
+class MemoryUsageStatsResponse(BaseModel):
+    recalled_count: int
+    used_count: int
+    last_used_at: str | None = None
+    days_since_last_use: int | None = None
+
+
 class MemoryItemResponse(BaseModel):
     id: str
     type: str
@@ -456,6 +571,7 @@ class MemoryItemResponse(BaseModel):
     review_required: bool
     created_at: str
     updated_at: str
+    usage_stats: MemoryUsageStatsResponse
 
 
 class MemoryItemsResponse(BaseModel):
@@ -491,6 +607,11 @@ class MemoryEditRequest(BaseModel):
 
 class MemoryActionResponse(BaseModel):
     success: bool
+
+
+class BulkMemoryActionRequest(BaseModel):
+    memory_ids: list[str] = Field(default_factory=list, max_length=500)
+    workspace_root: str | None = None
 
 
 class MemoryReviewRequest(BaseModel):
@@ -696,6 +817,10 @@ class ContextPackVersionStoreRequest(BaseModel):
     token_estimate: int | None = None
     selected_model: str | None = None
     template_id: str | None = None
+    budget_summary_json: str | None = None
+    stale_exclusion_count: int | None = None
+    included_items_json: str | None = None
+    excluded_items_json: str | None = None
 
 
 class ContextPackVersionResponse(BaseModel):
@@ -707,6 +832,10 @@ class ContextPackVersionResponse(BaseModel):
     selected_model: str | None = None
     template_id: str | None = None
     created_at: str
+    budget_summary_json: str | None = None
+    stale_exclusion_count: int | None = None
+    included_items_json: str | None = None
+    excluded_items_json: str | None = None
 
 
 class ContextPackVersionsResponse(BaseModel):
@@ -741,6 +870,43 @@ class PatchAssessmentResponse(BaseModel):
     risk_level: str
     rule_compliance_score: float
     reasons: list[str]
+
+
+def _serialize_ranked_files(
+    ranked_files: list[tuple[str, str, str]],
+) -> list[RankedFileResponse]:
+    return [
+        RankedFileResponse(
+            path=file_path,
+            risk_level=risk_level,
+            risk_category=risk_category,
+        )
+        for file_path, risk_level, risk_category in ranked_files
+    ]
+
+
+
+def _serialize_compliance_warnings(
+    warnings: list[ComplianceWarning],
+) -> list[ComplianceWarningResponse]:
+    return [
+        ComplianceWarningResponse(
+            rule_id=warning.rule_id,
+            rule_text=warning.rule_text,
+            warning_message=warning.warning_message,
+            actions=[
+                ComplianceActionResponse(
+                    label=action.label,
+                    action_type=action.action_type,
+                    prefill_task_request=action.prefill_task_request,
+                    prefill_mode=action.prefill_mode,
+                    prefill_context_hints=action.prefill_context_hints,
+                )
+                for action in warning.actions
+            ],
+        )
+        for warning in warnings
+    ]
 
 
 class ProviderCapabilityItemResponse(BaseModel):
@@ -1280,11 +1446,7 @@ async def rebuild_memory() -> RebuildMemoryResponse:
     )
 
 
-@app.get("/v1/cost/budget/status", response_model=BudgetStatusResponse)
-@app.get("/v1/cost/budget-status", response_model=BudgetStatusResponse)
-async def budget_status() -> BudgetStatusResponse:
-    service = CostGuardService(config=_get_config(), db=_get_db())
-    status = await service.get_budget_status()
+def _to_budget_status_response(status) -> BudgetStatusResponse:
     return BudgetStatusResponse(
         monthly_budget_usd=status.monthly_budget_usd,
         spent_usd=status.spent_usd,
@@ -1294,6 +1456,41 @@ async def budget_status() -> BudgetStatusResponse:
         warning_triggered=status.warning_triggered,
         blocked=status.blocked,
         spend_ratio=status.spend_ratio,
+        current_month_spend=status.spent_usd,
+        monthly_budget=status.monthly_budget_usd,
+        remaining=status.remaining_usd,
+        pct_used=status.pct_used,
+        at_limit=status.at_limit,
+        warning_threshold=status.warning_threshold,
+        at_warning=status.at_warning,
+        last_updated_at=status.last_updated_at,
+    )
+
+
+@app.get("/v1/cost/budget/status", response_model=BudgetStatusResponse)
+@app.get("/v1/cost/budget-status", response_model=BudgetStatusResponse)
+async def budget_status() -> BudgetStatusResponse:
+    service = CostGuardService(config=_get_config(), db=_get_db())
+    status = await service.get_budget_status()
+    return _to_budget_status_response(status)
+
+
+def _to_savings_report_response(report) -> SavingsReportResponse:
+    return SavingsReportResponse(
+        actual_cost=report.actual_cost,
+        hypothetical_frontier_cost=report.hypothetical_frontier_cost,
+        savings=report.savings,
+        reduction_pct=report.reduction_pct,
+        total_tasks=report.total_tasks,
+        local_tasks=report.local_tasks,
+        cheap_cloud_tasks=report.cheap_cloud_tasks,
+        frontier_tasks=report.frontier_tasks,
+        month_cache_hits=report.month_cache_hits,
+        month_total_ai_calls=report.month_total_ai_calls,
+        cache_hit_rate=report.cache_hit_rate,
+        cache_savings_usd=report.cache_savings_usd,
+        month_spend_usd=report.month_spend_usd,
+        month_net_usd=report.month_net_usd,
     )
 
 
@@ -1305,16 +1502,7 @@ async def check_budget(request: BudgetCheckRequest) -> BudgetCheckResponse:
         allowed=result.allowed,
         reason=result.reason,
         estimated_cost_usd=result.estimated_cost_usd,
-        budget=BudgetStatusResponse(
-            monthly_budget_usd=result.status.monthly_budget_usd,
-            spent_usd=result.status.spent_usd,
-            saved_usd=result.status.saved_usd,
-            remaining_usd=result.status.remaining_usd,
-            warning_threshold_usd=result.status.warning_threshold_usd,
-            warning_triggered=result.status.warning_triggered,
-            blocked=result.status.blocked,
-            spend_ratio=result.status.spend_ratio,
-        ),
+        budget=_to_budget_status_response(result.status),
     )
 
 
@@ -1487,31 +1675,112 @@ async def analyze_task(request: TaskAnalyzeRequest) -> TaskAnalyzeResponse:
     )
 
 
+def _estimate_context_tokens(text: str) -> int:
+    return max(1, (len(text) + 3) // 4)
+
+
+def _serialize_context_item(item: ContextItem) -> dict[str, object]:
+    return {
+        "content": item.content,
+        "source": item.source,
+        "source_type": item.source_type,
+        "tokens": item.tokens,
+        "relevance_score": item.relevance_score,
+        "inclusion_reason": item.inclusion_reason,
+        "retrieval_method": item.retrieval_method,
+        "trust_level": item.trust_level,
+        "tier": item.tier,
+    }
+
+
+def _serialize_excluded_item(item) -> dict[str, object]:
+    return {
+        "source": item.source,
+        "source_type": item.source_type,
+        "exclusion_reason": item.exclusion_reason.value,
+        "tokens_would_have_used": item.tokens_would_have_used,
+    }
+
+
+def _build_stale_exclusions_response(
+    budget_summary: dict[str, object] | None,
+    workspace_root: str,
+) -> StaleExclusionsResponse | None:
+    if not budget_summary:
+        return None
+    stale_summary = budget_summary.get("stale_exclusions")
+    if not isinstance(stale_summary, dict):
+        return None
+    affected_modules = stale_summary.get("affected_modules", [])
+    if not isinstance(affected_modules, list):
+        affected_modules = []
+    return StaleExclusionsResponse(
+        count=int(stale_summary.get("count", 0) or 0),
+        affected_modules=[str(item) for item in affected_modules],
+        rebuild_command=(
+            f'memopilot workspace index --workspace-root "{workspace_root}"'
+            if workspace_root
+            else "memopilot workspace index"
+        ),
+    )
+
+
+def _build_stack_trace_items(request: ContextBuildRequest) -> list[ContextItem]:
+    description = request.task_description.strip()
+    if not description:
+        return []
+    lowered = description.lower()
+    if request.task_type == "bug_fix" or any(
+        marker in lowered for marker in ("traceback", "stack trace", "exception", "error:")
+    ):
+        return [
+            ContextItem(
+                content=description,
+                source="task_description",
+                source_type="stack_trace",
+                tokens=_estimate_context_tokens(description),
+                relevance_score=1.0,
+                inclusion_reason="",
+                retrieval_method="task_description",
+                trust_level=5,
+                tier="stack_trace",
+            )
+        ]
+    return []
+
+
+def _read_context_file_item(workspace_root: str, file_path: str) -> ContextItem:
+    full_path = os.path.join(workspace_root, file_path) if not os.path.isabs(file_path) else file_path
+    content = ""
+    try:
+        if os.path.exists(full_path) and os.path.isfile(full_path):
+            with open(full_path, encoding="utf-8", errors="replace") as handle:
+                content = handle.read(50_000)
+    except Exception:
+        content = f"# Could not read {file_path}"
+    tokens = _estimate_context_tokens(content)
+    return ContextItem(
+        content=content,
+        source=file_path,
+        source_type="file",
+        tokens=tokens,
+        relevance_score=1.0,
+        inclusion_reason="",
+        retrieval_method="filesystem",
+        trust_level=5,
+        tier="current_file",
+    )
+
+
 async def _generate_context_pack_response(request: ContextBuildRequest) -> ContextBuildResponse:
     """Build a context pack for preview with token estimates."""
     config = _get_config()
     db = _get_db()
-
     files_to_include = request.file_overrides if request.file_overrides else request.suggested_files
-
-    file_entries: list[ContextFileEntry] = []
     workspace_service = WorkspaceRootsService(config=config, db=db)
     workspace_root = str(await workspace_service.resolve_workspace_root(request.workspace_root))
-    import os
 
-    for file_path in files_to_include[:20]:
-        full_path = (
-            os.path.join(workspace_root, file_path) if not os.path.isabs(file_path) else file_path
-        )
-        content = ""
-        try:
-            if os.path.exists(full_path) and os.path.isfile(full_path):
-                with open(full_path, encoding="utf-8", errors="replace") as f:
-                    content = f.read(50_000)
-        except Exception:
-            content = f"# Could not read {file_path}"
-        tokens = max(1, len(content) // 4)
-        file_entries.append(ContextFileEntry(path=file_path, tokens=tokens, content=content))
+    file_items = [_read_context_file_item(workspace_root, file_path) for file_path in files_to_include[:20]]
 
     rules: list[str] = []
     try:
@@ -1531,17 +1800,141 @@ async def _generate_context_pack_response(request: ContextBuildRequest) -> Conte
     except Exception:
         pass
 
-    file_tokens = sum(f.tokens for f in file_entries)
-    rule_tokens = sum(len(r) // 4 for r in rules)
-    total_tokens = file_tokens + rule_tokens + len(skills) * 10
+    if request.model_max_tokens is None:
+        file_entries = [
+            ContextFileEntry(path=item.source, tokens=item.tokens, content=item.content)
+            for item in file_items
+        ]
+        file_tokens = sum(f.tokens for f in file_entries)
+        rule_tokens = sum(_estimate_context_tokens(rule) for rule in rules)
+        total_tokens = file_tokens + rule_tokens + len(skills) * 10
+        estimated_cost = (total_tokens / 1000) * 0.003
+        response_payload = {
+            "files": [entry.model_dump() for entry in file_entries],
+            "rules": rules[:15],
+            "skills": skills[:10],
+            "total_tokens": total_tokens,
+            "estimated_cost_usd": round(estimated_cost, 6),
+        }
+        context_pack_hash = hashlib.sha256(
+            json.dumps(response_payload, sort_keys=True).encode("utf-8")
+        ).hexdigest()
+        recall_service = MemoryRecallService(db)
+        await recall_service.record_recall_trace(
+            context_pack_hash=context_pack_hash,
+            request_json=request.model_dump_json(),
+            included_memory_ids=[],
+            excluded_memory_ids=[],
+        )
+        return ContextBuildResponse(
+            **response_payload,
+            context_pack_hash=context_pack_hash,
+        )
+
+    context_builder = ContextBuilderService(config=config, db=db)
+    task_type = (request.task_type or "default").strip().lower().replace("-", "_")
+    tier_order = TIER_ORDER_BY_TASK_TYPE.get(task_type, TIER_ORDER_BY_TASK_TYPE["default"])
+    budget = ContextBudget.from_model_max_tokens(
+        request.model_max_tokens,
+        task_type=task_type,
+        template_id=context_builder.get_selected_template_id(),
+        tier_order=tier_order,
+    )
+
+    recall_items: list[dict[str, object]] = []
+    try:
+        recall_service = MemoryRecallService(db)
+        recall_response = await recall_service.recall(
+            RecallRequest(
+                query=request.task_description,
+                include_stale=True,
+                limit=20,
+                min_trust_level=0,
+                workspace_root=request.workspace_root,
+            )
+        )
+        for item in recall_response.items:
+            source_path = item.provenance[0].source_path if item.provenance else None
+            recall_items.append(
+                {
+                    "content": f"{item.title}\n\n{item.body}".strip(),
+                    "source": source_path or item.memory_id,
+                    "source_type": "memory",
+                    "tokens": _estimate_context_tokens(f"{item.title}\n\n{item.body}".strip()),
+                    "relevance_score": item.relevance_score,
+                    "inclusion_reason": "",
+                    "retrieval_method": "fts",
+                    "trust_level": item.trust_level,
+                    "tier": "fts",
+                    "stale": item.memory_status == "stale",
+                }
+            )
+    except Exception:
+        recall_items = []
+
+    retrieval_results: dict[str, list[ContextItem | dict[str, object]]] = {
+        "current_file": file_items,
+        "stack_trace": _build_stack_trace_items(request),
+        "fts": recall_items,
+        "rules": [
+            ContextItem(
+                content=rule,
+                source=f"rule:{index}",
+                source_type="rule",
+                tokens=_estimate_context_tokens(rule),
+                relevance_score=max(0.2, 1.0 - (index * 0.05)),
+                inclusion_reason="",
+                retrieval_method="policy_pack",
+                trust_level=5,
+                tier="rules",
+            )
+            for index, rule in enumerate(rules[:15], start=1)
+        ],
+        "skills": [
+            ContextItem(
+                content=skill,
+                source=skill,
+                source_type="skill",
+                tokens=max(1, len(skill) // 4),
+                relevance_score=max(0.2, 1.0 - (index * 0.05)),
+                inclusion_reason="",
+                retrieval_method="skill_store",
+                trust_level=4,
+                tier="skills",
+            )
+            for index, skill in enumerate(skills[:10], start=1)
+        ],
+    }
+
+    included_items, excluded_items, budget_summary = build_budget_aware_context_pack(
+        tier_order=tier_order,
+        budget=budget,
+        retrieval_results=retrieval_results,
+    )
+
+    file_entries = [
+        ContextFileEntry(path=item.source, tokens=item.tokens, content=item.content)
+        for item in included_items
+        if item.source_type == "file"
+    ]
+    included_rules = [item.content for item in included_items if item.source_type == "rule"]
+    included_skills = [item.content for item in included_items if item.source_type == "skill"]
+    total_tokens = sum(item.tokens for item in included_items)
     estimated_cost = (total_tokens / 1000) * 0.003
+    serialized_included_items = [_serialize_context_item(item) for item in included_items]
+    serialized_excluded_items = [_serialize_excluded_item(item) for item in excluded_items]
+    stale_exclusions = _build_stale_exclusions_response(budget_summary, workspace_root)
 
     response_payload = {
         "files": [entry.model_dump() for entry in file_entries],
-        "rules": rules[:15],
-        "skills": skills[:10],
+        "rules": included_rules,
+        "skills": included_skills,
         "total_tokens": total_tokens,
         "estimated_cost_usd": round(estimated_cost, 6),
+        "budget_summary": budget_summary,
+        "stale_exclusions": None if stale_exclusions is None else stale_exclusions.model_dump(),
+        "included_items": serialized_included_items,
+        "excluded_items": serialized_excluded_items,
     }
     context_pack_hash = hashlib.sha256(
         json.dumps(response_payload, sort_keys=True).encode("utf-8")
@@ -1550,8 +1943,8 @@ async def _generate_context_pack_response(request: ContextBuildRequest) -> Conte
     await recall_service.record_recall_trace(
         context_pack_hash=context_pack_hash,
         request_json=request.model_dump_json(),
-        included_memory_ids=[],
-        excluded_memory_ids=[],
+        included_memory_ids=[item.source for item in included_items if item.source_type == "memory"],
+        excluded_memory_ids=[item.source for item in excluded_items if item.source_type == "memory"],
     )
 
     return ContextBuildResponse(
@@ -1668,6 +2061,55 @@ async def route_model(request: ModelRouteRequest) -> ModelRouteResponse:
                 recommended = candidate
                 break
 
+    def candidate_tier(candidate: ModelChoice) -> ModelTier:
+        if candidate.provider == "ollama":
+            return ModelTier.LOCAL
+        if candidate.provider == "anthropic":
+            return ModelTier.FRONTIER
+        return ModelTier.CHEAP_CLOUD
+
+    base_tier = candidate_tier(recommended)
+    escalation_source: str | None = None
+    routing_reason = {
+        ModelTier.LOCAL: (
+            "Routing to local based on context fit and privacy preferences. Frontier escalation "
+            "would only trigger after 2 failed non-frontier attempts on the same file within 30 "
+            "days, and local routes are not escalated automatically."
+        ),
+        ModelTier.CHEAP_CLOUD: (
+            "Routing to cheap_cloud based on the current context budget. Frontier escalation would "
+            "trigger after 2 failed non-frontier attempts on the same file within 30 days."
+        ),
+        ModelTier.FRONTIER: (
+            "Routing to frontier because the task already needs the highest-capability tier. "
+            "Frontier escalation would otherwise trigger after 2 failed non-frontier attempts on "
+            "the same file within 30 days, and no higher escalation tier exists."
+        ),
+    }[base_tier]
+
+    if request.files_in_context and base_tier != ModelTier.LOCAL:
+        conn = await db.connect()
+        hinted_tier, hinted_reason = await get_outcome_routing_hint(
+            task_type=task_type,
+            files_in_context=request.files_in_context,
+            db_conn=conn,
+        )
+        if hinted_tier is not None and TIER_ORDER[hinted_tier] > TIER_ORDER[base_tier]:
+            escalation_source = "recent_file_failures"
+            routing_reason = (
+                f"{hinted_reason} Without repeated file failures, this request would stay on "
+                f"{base_tier.value}."
+            )
+            for candidate in candidates:
+                if candidate_tier(candidate) == hinted_tier:
+                    recommended = candidate
+                    break
+
+    reason_list = [*recommended.reasons, routing_reason]
+    if request.model_override:
+        reason_list.append("Model override requested by caller.")
+    recommended = recommended.model_copy(update={"reasons": reason_list})
+
     alternatives = [
         candidate for candidate in candidates if candidate.model_id != recommended.model_id
     ]
@@ -1675,10 +2117,24 @@ async def route_model(request: ModelRouteRequest) -> ModelRouteResponse:
     budget_allowed = bool(
         getattr(recommended_check, "allowed", recommended.cost_estimate_usd <= remaining_usd)
     )
+    options = [
+        ModelRouteOption(
+            tier=candidate_tier(candidate).value,
+            model_id=candidate.model_id,
+            provider=candidate.provider,
+            cost_estimate_usd=candidate.cost_estimate_usd,
+            fits_context=candidate.fits_context,
+        )
+        for candidate in sorted(candidates, key=lambda item: TIER_ORDER[candidate_tier(item)])
+    ]
     return ModelRouteResponse(
         recommended=recommended,
         alternatives=alternatives,
         budget_check=BudgetCheck(allowed=budget_allowed, remaining_usd=round(remaining_usd, 2)),
+        options=options,
+        escalation_source=escalation_source,
+        base_tier=base_tier.value,
+        model_override=request.model_override,
     )
 
 
@@ -1742,6 +2198,20 @@ async def generate_patch(request: GeneratePatchRequest) -> GeneratePatchResponse
     if request.mode in ("refactor", "architecture"):
         risk = "high" if len(patches) > 2 else "medium"
 
+    ranked_files = rank_patch_files([patch.path for patch in patches])
+    approval_tier = determine_approval_tier(ranked_files)
+    compliance_warnings = build_compliance_warnings(ranked_files)
+
+    approval_risk = {
+        "low": "low",
+        "medium": "medium",
+        "high": "high",
+        "critical": "high",
+    }[approval_tier.value]
+    risk_priority = {"low": 0, "medium": 1, "high": 2}
+    if risk_priority[approval_risk] > risk_priority[risk]:
+        risk = approval_risk
+
     tokens_used = len(description) * 3 + sum(len(p.diff) for p in patches)
     cost = (tokens_used / 1_000_000) * 5.0  # mock at gpt-4o rate
 
@@ -1753,6 +2223,9 @@ async def generate_patch(request: GeneratePatchRequest) -> GeneratePatchResponse
         model_used=request.model_id or "codellama-13b-local",
         tokens_used=tokens_used,
         cost_usd=round(cost, 6),
+        approval_tier=approval_tier.value,
+        ranked_files=_serialize_ranked_files(ranked_files),
+        compliance_warnings=_serialize_compliance_warnings(compliance_warnings),
     )
 
 
@@ -1959,7 +2432,32 @@ async def start_task_run(request: StartTaskRunRequest) -> StartTaskRunResponse:
         estimated_cost=request.estimated_cost,
         workspace_root=workspace_root,
     )
-    return StartTaskRunResponse(task_run_id=task_run_id, status="running")
+    budget_info = await service.get_budget_status()
+    selected_tier = infer_selected_tier(provider=None, model=request.selected_model)
+    budget_gate = check_budget_gate(
+        selected_tier,
+        request.estimated_cost or 0.0,
+        budget_info,
+    )
+    return StartTaskRunResponse(
+        task_run_id=task_run_id,
+        status="running",
+        estimated_cost=request.estimated_cost,
+        actual_cost=0.0,
+        cost=TaskRunCostResponse(
+            estimated_cost_usd=request.estimated_cost or 0.0,
+            actual_cost_usd=0.0,
+            selected_tier=selected_tier,
+        ),
+        budget_gate=BudgetGateResponse(
+            blocked=budget_gate.blocked,
+            reason=budget_gate.reason,
+            requires_approval=budget_gate.requires_approval,
+            approval_prompt=budget_gate.approval_prompt,
+            show_warning=budget_gate.show_warning,
+            warning_message=budget_gate.warning_message,
+        ),
+    )
 
 
 @app.post("/v1/cost/usage/record", response_model=RecordAICallResponse)
@@ -1987,14 +2485,7 @@ async def record_usage(request: RecordAICallRequest) -> RecordAICallResponse:
 async def savings_report() -> SavingsReportResponse:
     service = CostGuardService(config=_get_config(), db=_get_db())
     report = await service.get_savings_report()
-    return SavingsReportResponse(
-        month_cache_hits=report.month_cache_hits,
-        month_total_ai_calls=report.month_total_ai_calls,
-        cache_hit_rate=report.cache_hit_rate,
-        cache_savings_usd=report.cache_savings_usd,
-        month_spend_usd=report.month_spend_usd,
-        month_net_usd=report.month_net_usd,
-    )
+    return _to_savings_report_response(report)
 
 
 @app.get("/v1/task/history", response_model=TaskHistoryResponse)
@@ -2089,6 +2580,9 @@ async def cost_dashboard(days: int = 30) -> CostDashboardResponse:
             )
         )
 
+    dashboard_start = now - datetime.timedelta(days=max(days, 1))
+    savings = await service.get_savings_report(start_date=dashboard_start, end_date=now)
+
     return CostDashboardResponse(
         period_days=days,
         total_cost_usd=round(budget.spent_usd, 4),
@@ -2097,6 +2591,7 @@ async def cost_dashboard(days: int = 30) -> CostDashboardResponse:
         saved_usd=round(budget.saved_usd, 4),
         by_day=by_day,
         by_model=by_model,
+        savings_report=_to_savings_report_response(savings),
     )
 
 
@@ -2315,6 +2810,36 @@ async def export_workspace_profile(
     return WorkspaceProfileExportResponse(exported_path=exported)
 
 
+def _memory_item_response(item) -> MemoryItemResponse:
+    return MemoryItemResponse(
+        id=item.id,
+        type=item.type,
+        title=item.title,
+        body=item.body,
+        source=item.source,
+        source_path=item.source_path,
+        trust_level=item.trust_level,
+        stale=item.stale,
+        tags=item.tags,
+        memory_class=item.memory_class,
+        memory_status=item.memory_status,
+        visibility_scope=item.visibility_scope,
+        reusable=item.reusable,
+        review_required=item.review_required,
+        created_at=item.created_at,
+        updated_at=item.updated_at,
+        usage_stats=MemoryUsageStatsResponse.model_validate(
+            item.usage_stats
+            or {
+                "recalled_count": 0,
+                "used_count": 0,
+                "last_used_at": None,
+                "days_since_last_use": None,
+            }
+        ),
+    )
+
+
 @app.get("/v1/memory/items", response_model=MemoryItemsResponse)
 async def list_memory_items(
     filter_name: str = "all",
@@ -2328,29 +2853,22 @@ async def list_memory_items(
         limit=query.limit,
         workspace_root=workspace_root,
     )
-    return MemoryItemsResponse(
-        items=[
-            MemoryItemResponse(
-                id=item.id,
-                type=item.type,
-                title=item.title,
-                body=item.body,
-                source=item.source,
-                source_path=item.source_path,
-                trust_level=item.trust_level,
-                stale=item.stale,
-                tags=item.tags,
-                memory_class=item.memory_class,
-                memory_status=item.memory_status,
-                visibility_scope=item.visibility_scope,
-                reusable=item.reusable,
-                review_required=item.review_required,
-                created_at=item.created_at,
-                updated_at=item.updated_at,
-            )
-            for item in items
-        ]
+    return MemoryItemsResponse(items=[_memory_item_response(item) for item in items])
+
+
+@app.get("/v1/memory/unused", response_model=MemoryItemsResponse)
+async def list_unused_memory_items(
+    days_threshold: int = 30,
+    limit: int = 100,
+    workspace_root: str | None = None,
+) -> MemoryItemsResponse:
+    service = MemoryManagerService(config=_get_config(), db=_get_db())
+    items = await service.list_unused_memories(
+        days_threshold=days_threshold,
+        limit=limit,
+        workspace_root=workspace_root,
     )
+    return MemoryItemsResponse(items=[_memory_item_response(item) for item in items])
 
 
 @app.post("/v1/memory/recall", response_model=RecallResponse)
@@ -2404,29 +2922,7 @@ async def list_memory_review_queue(
 ) -> MemoryItemsResponse:
     service = MemoryManagerService(config=_get_config(), db=_get_db())
     items = await service.list_review_items(limit=limit, workspace_root=workspace_root)
-    return MemoryItemsResponse(
-        items=[
-            MemoryItemResponse(
-                id=item.id,
-                type=item.type,
-                title=item.title,
-                body=item.body,
-                source=item.source,
-                source_path=item.source_path,
-                trust_level=item.trust_level,
-                stale=item.stale,
-                tags=item.tags,
-                memory_class=item.memory_class,
-                memory_status=item.memory_status,
-                visibility_scope=item.visibility_scope,
-                reusable=item.reusable,
-                review_required=item.review_required,
-                created_at=item.created_at,
-                updated_at=item.updated_at,
-            )
-            for item in items
-        ]
-    )
+    return MemoryItemsResponse(items=[_memory_item_response(item) for item in items])
 
 
 @app.patch("/v1/memory/items/{item_id}/review", response_model=MemoryActionResponse)
@@ -2468,6 +2964,27 @@ async def reject_memory_item(
         detail = str(exc)
         status_code = 404 if detail.startswith("Memory item not found") else 400
         raise HTTPException(status_code=status_code, detail=detail) from exc
+    return MemoryActionResponse(success=True)
+
+
+@app.post("/v1/memory/bulk-approve", response_model=MemoryActionResponse)
+async def bulk_approve_memory_items(request: BulkMemoryActionRequest) -> MemoryActionResponse:
+    service = MemoryManagerService(config=_get_config(), db=_get_db())
+    await service.bulk_approve(request.memory_ids, workspace_root=request.workspace_root)
+    return MemoryActionResponse(success=True)
+
+
+@app.post("/v1/memory/bulk-reject", response_model=MemoryActionResponse)
+async def bulk_reject_memory_items(request: BulkMemoryActionRequest) -> MemoryActionResponse:
+    service = MemoryManagerService(config=_get_config(), db=_get_db())
+    await service.bulk_reject(request.memory_ids, workspace_root=request.workspace_root)
+    return MemoryActionResponse(success=True)
+
+
+@app.post("/v1/memory/bulk-delete", response_model=MemoryActionResponse)
+async def bulk_delete_memory_items(request: BulkMemoryActionRequest) -> MemoryActionResponse:
+    service = MemoryManagerService(config=_get_config(), db=_get_db())
+    await service.bulk_delete(request.memory_ids, workspace_root=request.workspace_root)
     return MemoryActionResponse(success=True)
 
 
@@ -2931,6 +3448,10 @@ async def store_context_pack_version(
         token_estimate=request.token_estimate,
         selected_model=request.selected_model,
         template_id=request.template_id,
+        budget_summary_json=request.budget_summary_json,
+        stale_exclusion_count=request.stale_exclusion_count,
+        included_items_json=request.included_items_json,
+        excluded_items_json=request.excluded_items_json,
     )
     return ContextPackVersionResponse(
         version_id=version.version_id,
@@ -2941,6 +3462,10 @@ async def store_context_pack_version(
         selected_model=version.selected_model,
         template_id=version.template_id,
         created_at=version.created_at,
+        budget_summary_json=version.budget_summary_json,
+        stale_exclusion_count=version.stale_exclusion_count,
+        included_items_json=version.included_items_json,
+        excluded_items_json=version.excluded_items_json,
     )
 
 
@@ -2962,6 +3487,10 @@ async def list_context_pack_versions(
                 selected_model=item.selected_model,
                 template_id=item.template_id,
                 created_at=item.created_at,
+                budget_summary_json=item.budget_summary_json,
+                stale_exclusion_count=item.stale_exclusion_count,
+                included_items_json=item.included_items_json,
+                excluded_items_json=item.excluded_items_json,
             )
             for item in versions
         ]
@@ -3045,6 +3574,18 @@ async def assess_patch_risk_and_compliance(
         risk_level=result.risk_level,
         rule_compliance_score=result.rule_compliance_score,
         reasons=result.reasons,
+    )
+
+
+@app.post("/v1/patch/rank-files", response_model=PatchRankFilesResponse)
+async def rank_patch_files_endpoint(
+    request: PatchRankFilesRequest,
+) -> PatchRankFilesResponse:
+    ranked_files = rank_patch_files(request.changed_files)
+    approval_tier = determine_approval_tier(ranked_files)
+    return PatchRankFilesResponse(
+        ranked_files=_serialize_ranked_files(ranked_files),
+        approval_tier=approval_tier.value,
     )
 
 

@@ -37,6 +37,10 @@ class ContextPackVersionRecord:
     template_id: str | None
     created_at: str
     pack_content_snapshot: str | None = None
+    budget_summary_json: str | None = None
+    stale_exclusion_count: int | None = None
+    included_items_json: str | None = None
+    excluded_items_json: str | None = None
 
 
 @dataclass(frozen=True)
@@ -132,6 +136,9 @@ class ContextBuilderService:
             return template_id
         return None
 
+    def get_selected_template_id(self) -> str | None:
+        return self._active_template_id()
+
     async def store_context_pack_version(
         self,
         *,
@@ -141,6 +148,10 @@ class ContextBuilderService:
         token_estimate: int | None,
         selected_model: str | None,
         template_id: str | None,
+        budget_summary_json: str | None = None,
+        stale_exclusion_count: int | None = None,
+        included_items_json: str | None = None,
+        excluded_items_json: str | None = None,
     ) -> ContextPackVersionRecord:
         version_id = uuid.uuid4().hex
         pack_hash = hashlib.sha256(context_pack_text.encode("utf-8")).hexdigest()
@@ -159,9 +170,11 @@ class ContextBuilderService:
             INSERT INTO context_pack_versions
             (
                 id, task_run_id, pack_path, pack_hash, token_estimate,
-                selected_model, template_id, pack_content_snapshot
+                selected_model, template_id, pack_content_snapshot,
+                budget_summary_json, stale_exclusion_count,
+                included_items_json, excluded_items_json
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 version_id,
@@ -172,6 +185,10 @@ class ContextBuilderService:
                 selected_model,
                 template_id,
                 context_pack_text,
+                budget_summary_json,
+                stale_exclusion_count,
+                included_items_json,
+                excluded_items_json,
             ),
         )
         await conn.commit()
@@ -184,7 +201,8 @@ class ContextBuilderService:
             SELECT
                 id, task_run_id, pack_path, pack_hash,
                 token_estimate, selected_model, template_id, created_at,
-                pack_content_snapshot
+                pack_content_snapshot, budget_summary_json,
+                stale_exclusion_count, included_items_json, excluded_items_json
             FROM context_pack_versions
             WHERE id = ?
             """,
@@ -208,7 +226,8 @@ class ContextBuilderService:
                 SELECT
                     id, task_run_id, pack_path, pack_hash,
                     token_estimate, selected_model, template_id, created_at,
-                    pack_content_snapshot
+                    pack_content_snapshot, budget_summary_json,
+                    stale_exclusion_count, included_items_json, excluded_items_json
                 FROM context_pack_versions
                 WHERE task_run_id = ?
                 ORDER BY created_at DESC
@@ -222,7 +241,8 @@ class ContextBuilderService:
                 SELECT
                     id, task_run_id, pack_path, pack_hash,
                     token_estimate, selected_model, template_id, created_at,
-                    pack_content_snapshot
+                    pack_content_snapshot, budget_summary_json,
+                    stale_exclusion_count, included_items_json, excluded_items_json
                 FROM context_pack_versions
                 ORDER BY created_at DESC
                 LIMIT ?
@@ -275,6 +295,10 @@ class ContextBuilderService:
             template_id=row["template_id"],
             created_at=row["created_at"],
             pack_content_snapshot=row["pack_content_snapshot"],
+            budget_summary_json=row["budget_summary_json"],
+            stale_exclusion_count=row["stale_exclusion_count"],
+            included_items_json=row["included_items_json"],
+            excluded_items_json=row["excluded_items_json"],
         )
 
     def _load_context_pack_text(self, version: ContextPackVersionRecord) -> str:

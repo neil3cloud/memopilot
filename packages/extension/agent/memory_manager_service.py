@@ -91,6 +91,7 @@ class MemoryItem:
     review_required: bool
     created_at: str
     updated_at: str
+    usage_stats: dict[str, Any] | None = None
 
 
 @dataclass(frozen=True)
@@ -165,7 +166,7 @@ class MemoryManagerService:
 
         cursor = await conn.execute(query, tuple(params))
         rows = await cursor.fetchall()
-        return [self._row_to_item(row) for row in rows]
+        return await self._rows_to_items(rows)
 
     async def suggest_memory_update(
         self,
@@ -267,6 +268,86 @@ class MemoryManagerService:
         )
         await conn.commit()
 
+    async def bulk_approve(
+        self,
+        memory_ids: list[str],
+        *,
+        workspace_root: str | None = None,
+    ) -> None:
+        if not memory_ids:
+            return
+        conn = await self._db.connect()
+        rows = await self._fetch_item_rows(memory_ids, workspace_root=workspace_root)
+        for row in rows:
+            current_status = str(row["memory_status"] or "discovered")
+            if not validate_status_transition(current_status, "confirmed"):
+                continue
+            tags = self._parse_tags(row["tags_json"])
+            if isinstance(tags, dict):
+                tags["pending_approval"] = False
+                tags["approved"] = True
+            await self._update_memory_status(
+                conn=conn,
+                item_id=str(row["id"]),
+                current_status=current_status,
+                new_status="confirmed",
+                tags=tags,
+                trust_level=3,
+                reusable=1,
+                review_required=0,
+            )
+        await conn.commit()
+
+    async def bulk_reject(
+        self,
+        memory_ids: list[str],
+        *,
+        workspace_root: str | None = None,
+    ) -> None:
+        if not memory_ids:
+            return
+        conn = await self._db.connect()
+        rows = await self._fetch_item_rows(memory_ids, workspace_root=workspace_root)
+        for row in rows:
+            current_status = str(row["memory_status"] or "discovered")
+            if not validate_status_transition(current_status, "rejected"):
+                continue
+            tags = self._parse_tags(row["tags_json"])
+            if isinstance(tags, dict):
+                tags["pending_approval"] = False
+                tags["approved"] = False
+                tags["rejected"] = True
+            await self._update_memory_status(
+                conn=conn,
+                item_id=str(row["id"]),
+                current_status=current_status,
+                new_status="rejected",
+                tags=tags,
+                reusable=0,
+                review_required=0,
+            )
+        await conn.commit()
+
+    async def bulk_delete(
+        self,
+        memory_ids: list[str],
+        *,
+        workspace_root: str | None = None,
+    ) -> None:
+        if not memory_ids:
+            return
+        conn = await self._db.connect()
+        normalized_root = self._normalize_workspace_root(workspace_root)
+        placeholders = ", ".join("?" for _ in memory_ids)
+        await conn.execute(
+            (
+                f"DELETE FROM memory_items WHERE id IN ({placeholders}) "
+                "AND (? IS NULL OR COALESCE(workspace_root, ?) = ?)"
+            ),
+            (*memory_ids, normalized_root, normalized_root, normalized_root),
+        )
+        await conn.commit()
+
     async def edit_item(
         self,
         item_id: str,
@@ -349,7 +430,98 @@ class MemoryManagerService:
         params.append(limit)
         cursor = await conn.execute(query, tuple(params))
         rows = await cursor.fetchall()
-        return [self._row_to_item(row) for row in rows]
+        return await self._rows_to_items(rows)
+
+    async def list_unused_memories(
+        self,
+        days_threshold: int = 30,
+        *,
+        workspace_root: str | None = None,
+        limit: int = 100,
+    ) -> list[MemoryItem]:
+        conn = await self._db.connect()
+        normalized_root = self._normalize_workspace_root(workspace_root)
+        query = """
+            SELECT
+                id, type, title, body, source, source_path, trust_level,
+                stale, tags_json, COALESCE(memory_class, 'fact') AS memory_class,
+                COALESCE(memory_status, 'discovered') AS memory_status,
+                COALESCE(visibility_scope, 'workspace') AS visibility_scope,
+                reusable, review_required, created_at, updated_at
+            FROM memory_items
+            WHERE (last_used_at IS NULL OR last_used_at <= datetime('now', '-' || ? || ' days'))
+        """
+        params: list[Any] = [days_threshold]
+        if normalized_root is not None:
+            query += " AND COALESCE(workspace_root, ?) = ?"
+            params.extend([normalized_root, normalized_root])
+        query += " ORDER BY COALESCE(last_used_at, created_at) ASC LIMIT ?"
+        params.append(limit)
+        cursor = await conn.execute(query, tuple(params))
+        rows = await cursor.fetchall()
+        return await self._rows_to_items(rows)
+
+    async def get_usage_stats(self, memory_id: str) -> dict[str, Any]:
+        conn = await self._db.connect()
+        cursor = await conn.execute(
+            "SELECT last_used_at, COALESCE(usage_count, 0) AS usage_count FROM memory_items WHERE id = ?",
+            (memory_id,),
+        )
+        row = await cursor.fetchone()
+        if row is None:
+            raise ValueError(f"Memory item not found: {memory_id}")
+
+        last_used_at = str(row["last_used_at"]) if row["last_used_at"] is not None else None
+        used_count = int(row["usage_count"] or 0)
+
+        cursor = await conn.execute(
+            """
+            SELECT COUNT(*) AS recalled_count
+            FROM recall_traces AS trace
+            JOIN json_each(COALESCE(trace.included_memory_ids_json, '[]')) AS included
+              ON 1 = 1
+            WHERE included.value = ?
+            """,
+            (memory_id,),
+        )
+        recall_row = await cursor.fetchone()
+        recalled_count = int(recall_row["recalled_count"] if recall_row is not None else 0)
+
+        if await self._table_exists(conn, "memory_usage_events"):
+            columns = await self._table_columns(conn, "memory_usage_events")
+            if {"memory_id", "event_type"}.issubset(columns):
+                timestamp_column = "created_at" if "created_at" in columns else None
+                last_used_expression = (
+                    f"MAX(CASE WHEN lower(event_type) IN ('used', 'applied', 'accepted') THEN {timestamp_column} END)"
+                    if timestamp_column is not None
+                    else "NULL"
+                )
+                cursor = await conn.execute(
+                    f"""
+                    SELECT
+                        COALESCE(SUM(CASE WHEN lower(event_type) = 'recalled' THEN 1 ELSE 0 END), 0) AS recalled_count,
+                        COALESCE(SUM(CASE WHEN lower(event_type) IN ('used', 'applied', 'accepted') THEN 1 ELSE 0 END), 0) AS used_count,
+                        {last_used_expression} AS last_used_at
+                    FROM memory_usage_events
+                    WHERE memory_id = ?
+                    """,
+                    (memory_id,),
+                )
+                usage_row = await cursor.fetchone()
+                if usage_row is not None:
+                    recalled_count = max(recalled_count, int(usage_row["recalled_count"] or 0))
+                    used_count = max(used_count, int(usage_row["used_count"] or 0))
+                    if usage_row["last_used_at"] is not None:
+                        event_last_used = str(usage_row["last_used_at"])
+                        if last_used_at is None or event_last_used > last_used_at:
+                            last_used_at = event_last_used
+
+        return {
+            "recalled_count": recalled_count,
+            "used_count": used_count,
+            "last_used_at": last_used_at,
+            "days_since_last_use": self._days_since(last_used_at),
+        }
 
     async def review_item(
         self,
@@ -366,21 +538,33 @@ class MemoryManagerService:
             return
         raise ValueError(f"Unsupported review decision: {decision}")
 
-    async def _fetch_item_row(self, item_id: str, *, workspace_root: str | None = None):
+    async def _fetch_item_rows(
+        self,
+        item_ids: list[str],
+        *,
+        workspace_root: str | None = None,
+    ):
+        if not item_ids:
+            return []
         conn = await self._db.connect()
         normalized_root = self._normalize_workspace_root(workspace_root)
+        placeholders = ", ".join("?" for _ in item_ids)
         cursor = await conn.execute(
-            """
+            f"""
             SELECT id, tags_json, COALESCE(memory_status, 'discovered') AS memory_status
             FROM memory_items
-            WHERE id = ? AND (? IS NULL OR COALESCE(workspace_root, ?) = ?)
+            WHERE id IN ({placeholders})
+              AND (? IS NULL OR COALESCE(workspace_root, ?) = ?)
             """,
-            (item_id, normalized_root, normalized_root, normalized_root),
+            (*item_ids, normalized_root, normalized_root, normalized_root),
         )
-        row = await cursor.fetchone()
-        if row is None:
+        return await cursor.fetchall()
+
+    async def _fetch_item_row(self, item_id: str, *, workspace_root: str | None = None):
+        rows = await self._fetch_item_rows([item_id], workspace_root=workspace_root)
+        if not rows:
             raise ValueError(f"Memory item not found: {item_id}")
-        return row
+        return rows[0]
 
     async def _require_item(self, item_id: str, *, workspace_root: str | None = None) -> None:
         await self._fetch_item_row(item_id, workspace_root=workspace_root)
@@ -393,7 +577,90 @@ class MemoryManagerService:
             return parsed
         return {}
 
-    def _row_to_item(self, row) -> MemoryItem:
+    async def _rows_to_items(self, rows, *, include_usage_stats: bool = True) -> list[MemoryItem]:
+        items: list[MemoryItem] = []
+        if include_usage_stats and rows:
+            batch_stats = await self._batch_usage_stats([str(row["id"]) for row in rows])
+        else:
+            batch_stats = {}
+        for row in rows:
+            items.append(
+                self._row_to_item(
+                    row,
+                    usage_stats=batch_stats.get(str(row["id"])),
+                )
+            )
+        return items
+
+    async def _batch_usage_stats(self, memory_ids: list[str]) -> dict[str, dict[str, Any]]:
+        """Fetch usage stats for multiple memory items in batched queries."""
+        if not memory_ids:
+            return {}
+        conn = await self._db.connect()
+        placeholders = ", ".join("?" for _ in memory_ids)
+
+        # Base stats from memory_items
+        cursor = await conn.execute(
+            f"SELECT id, last_used_at, COALESCE(usage_count, 0) AS usage_count "
+            f"FROM memory_items WHERE id IN ({placeholders})",
+            tuple(memory_ids),
+        )
+        rows = await cursor.fetchall()
+        result: dict[str, dict[str, Any]] = {}
+        for row in rows:
+            mid = str(row["id"])
+            last_used_at = str(row["last_used_at"]) if row["last_used_at"] is not None else None
+            result[mid] = {
+                "recalled_count": int(row["usage_count"] or 0),
+                "used_count": int(row["usage_count"] or 0),
+                "last_used_at": last_used_at,
+                "days_since_last_use": self._days_since(last_used_at),
+            }
+
+        # Enrich from memory_usage_events if available
+        if await self._table_exists(conn, "memory_usage_events"):
+            columns = await self._table_columns(conn, "memory_usage_events")
+            if {"memory_id", "event_type"}.issubset(columns):
+                timestamp_col = "created_at" if "created_at" in columns else None
+                last_used_expr = (
+                    f"MAX(CASE WHEN lower(event_type) IN ('used', 'applied', 'accepted') THEN {timestamp_col} END)"
+                    if timestamp_col
+                    else "NULL"
+                )
+                cursor = await conn.execute(
+                    f"""
+                    SELECT
+                        memory_id,
+                        COALESCE(SUM(CASE WHEN lower(event_type) = 'recalled' THEN 1 ELSE 0 END), 0) AS recalled_count,
+                        COALESCE(SUM(CASE WHEN lower(event_type) IN ('used', 'applied', 'accepted') THEN 1 ELSE 0 END), 0) AS used_count,
+                        {last_used_expr} AS last_used_at
+                    FROM memory_usage_events
+                    WHERE memory_id IN ({placeholders})
+                    GROUP BY memory_id
+                    """,
+                    tuple(memory_ids),
+                )
+                event_rows = await cursor.fetchall()
+                for erow in event_rows:
+                    mid = str(erow["memory_id"])
+                    if mid not in result:
+                        continue
+                    result[mid]["recalled_count"] = max(
+                        result[mid]["recalled_count"], int(erow["recalled_count"] or 0)
+                    )
+                    result[mid]["used_count"] = max(
+                        result[mid]["used_count"], int(erow["used_count"] or 0)
+                    )
+                    if erow["last_used_at"] is not None:
+                        event_last = str(erow["last_used_at"])
+                        current_last = result[mid]["last_used_at"]
+                        if current_last is None or event_last > current_last:
+                            result[mid]["last_used_at"] = event_last
+                            result[mid]["days_since_last_use"] = self._days_since(event_last)
+
+        return result
+
+    def _row_to_item(self, row, *, usage_stats: dict[str, Any] | None = None) -> MemoryItem:
         return MemoryItem(
             id=str(row["id"]),
             type=str(row["type"]),
@@ -411,6 +678,7 @@ class MemoryManagerService:
             review_required=bool(row["review_required"]),
             created_at=str(row["created_at"]),
             updated_at=str(row["updated_at"]),
+            usage_stats=usage_stats,
         )
 
     def _get_blocked_reason(self, *, title: str, body: str) -> str | None:
@@ -612,3 +880,26 @@ class MemoryManagerService:
                 location = str(row[2] or "").strip()
                 return location in {"", ":memory:"}
         return False
+
+    async def _table_exists(self, conn, table_name: str) -> bool:
+        cursor = await conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?",
+            (table_name,),
+        )
+        return await cursor.fetchone() is not None
+
+    async def _table_columns(self, conn, table_name: str) -> set[str]:
+        cursor = await conn.execute(f"PRAGMA table_info({table_name})")
+        rows = await cursor.fetchall()
+        return {str(row[1]) for row in rows}
+
+    def _days_since(self, timestamp: str | None) -> int | None:
+        if not timestamp:
+            return None
+        try:
+            parsed = datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=UTC)
+        return max((datetime.now(UTC) - parsed.astimezone(UTC)).days, 0)

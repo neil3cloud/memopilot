@@ -17,7 +17,7 @@ async def test_health_returns_ok(client: AsyncClient, test_token: str):
     data = response.json()
     assert data["status"] == "ok"
     assert data["api_version"] == 1
-    assert data["schema_version"] == 9
+    assert data["schema_version"] == 15
 
 
 @pytest.mark.asyncio
