@@ -180,8 +180,85 @@
         "title": "MemoPilot: Open Panel"
       },
       {
+        "command": "memopilot.reviewAppliedPatch",
+        "title": "MemoPilot: Review Applied Patch",
+        "icon": "$(shield)"
+      },
+      {
+        "command": "memopilot.refreshMemoryReviewQueue",
+        "title": "MemoPilot: Refresh Memory Review Queue",
+        "icon": "$(refresh)"
+      },
+      {
         "command": "memopilot.restartBackend",
         "title": "MemoPilot: Restart Backend"
+      }
+    ],
+    "languageModelTools": [
+      {
+        "name": "memopilot_context",
+        "displayName": "MemoPilot Context",
+        "modelDescription": "Retrieves governed, rule-aware, secret-redacted context from MemoPilot local project memory. Call before generating a patch.",
+        "inputSchema": {
+          "type": "object",
+          "properties": {
+            "task_description": { "type": "string", "description": "The task or question being answered." },
+            "files_in_focus": { "type": "array", "items": { "type": "string" }, "description": "Relevant file paths." },
+            "task_type_hint": { "type": "string", "enum": ["bug_fix", "feature", "test_generation", "refactor", "security_review", "investigation", "documentation", "general"] }
+          },
+          "required": ["task_description"]
+        }
+      },
+      {
+        "name": "memopilot_rules",
+        "displayName": "MemoPilot Rules",
+        "modelDescription": "Returns active project rules and skills for the current workspace.",
+        "inputSchema": { "type": "object", "properties": {} }
+      },
+      {
+        "name": "memopilot_memory_search",
+        "displayName": "MemoPilot Memory Search",
+        "modelDescription": "Searches MemoPilot local memory. Use when encountering an unfamiliar symbol or concept.",
+        "inputSchema": {
+          "type": "object",
+          "properties": {
+            "query": { "type": "string", "description": "Symbol, concept, or phrase to search for." },
+            "limit": { "type": "integer", "minimum": 1, "maximum": 20, "default": 10 }
+          },
+          "required": ["query"]
+        }
+      },
+      {
+        "name": "memopilot_workspace_profile",
+        "displayName": "MemoPilot Workspace Profile",
+        "modelDescription": "Returns workspace profile: language, frameworks, test commands, memory health.",
+        "inputSchema": { "type": "object", "properties": {} }
+      },
+      {
+        "name": "memopilot_patch_review",
+        "displayName": "MemoPilot Patch Review",
+        "modelDescription": "Reviews an applied patch against project rules. Call after applying changes to check compliance and risk.",
+        "inputSchema": {
+          "type": "object",
+          "properties": {
+            "git_diff": { "type": "string", "description": "Optional diff text. If omitted, reads current git diff." }
+          }
+        }
+      },
+      {
+        "name": "memopilot_writeback",
+        "displayName": "MemoPilot Writeback",
+        "modelDescription": "IMPORTANT: Call after applying a patch that used memopilot_context. Records what changed in project memory.",
+        "inputSchema": {
+          "type": "object",
+          "properties": {
+            "outcome_summary": { "type": "string", "description": "What was accomplished." },
+            "outcome_status": { "type": "string", "enum": ["success", "partial", "reverted"] },
+            "context_pack_hash": { "type": "string", "description": "Optional hash from preceding memopilot_context call." },
+            "git_diff": { "type": "string", "description": "Optional diff text." }
+          },
+          "required": ["outcome_summary", "outcome_status"]
+        }
       }
     ],
     "configuration": {

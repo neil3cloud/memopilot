@@ -1,6 +1,6 @@
 # MemoPilot: Master Product and Implementation Reference
 
-**Document Version:** 2.3 (Feature Refinement Complete) **Target Product:** MemoPilot — Rule-Aware, Local-Memory, Cost-Governed AI Development Agent Extension for VS Code/Cursor **Status:** Production Reference
+**Document Version:** 2.4 (Tool Mode Integration) **Target Product:** MemoPilot — Rule-Aware, Local-Memory, Cost-Governed AI Development Agent Extension for VS Code/Cursor **Status:** Production Reference
 
 ---
 
@@ -35,6 +35,7 @@
 27. [UI Implementation Progress (v2.1)](#27-ui-implementation-progress-v21--june-2025)
 28. [Remediation and Feature Hardening (v2.2)](#28-remediation-and-feature-hardening-v22--june-2026)
 29. [Feature Refinement Phase (v2.3)](#29-feature-refinement-phase-v23--june-2026)
+30. [Tool Mode Integration (v2.4)](#30-tool-mode-integration-v24--june-2026)
 
 ---
 
@@ -3584,3 +3585,131 @@ Three issues identified during code review and resolved:
 1. **Unbounded bulk action list**: `BulkMemoryActionRequest.memory_ids` capped at `max_length=500` to stay within SQLite parameter limits.
 2. **N+1 query in memory listing**: `_rows_to_items()` replaced with batched `_batch_usage_stats()` — single query for base stats + single query for events table.
 3. **Stale schema version default**: `config.py` schema_version updated from 13 to 15 to match latest migration.
+
+---
+
+## 30\. Tool Mode Integration (v2.4 — June 2026)
+
+### Overview
+
+MemoPilot v2.4 adds **Tool Mode**: MemoPilot can now act as a callable tool surface for both Copilot Chat and Cursor Chat while preserving the same local-memory, rules, privacy, and governance model used by the native MemoPilot task flow. Tool Mode is additive: the extension UI remains the primary guided experience, while tool callers get bounded Markdown responses optimized for LLM consumption.
+
+### Tool Surface
+
+| Tool | Purpose |
+|---|---|
+| `memopilot-context` | Build a governed context pack for a task description |
+| `memopilot-recall` | Search local project memory by query |
+| `memopilot-rules` | Retrieve active rules applicable to a file or task |
+| `memopilot-workspace-profile` | Return the workspace technology profile, commands, and memory health |
+| `memopilot-memory-search` | Deep memory search with semantic + keyword matching |
+| `memopilot-review-applied-patch` | Submit a diff for post-hoc review and writeback proposals |
+
+### LM Tools API Integration
+
+Tool Mode registers six callable tools through the **VS Code Language Model Tools API** using `src/tools/LanguageModelToolsRegistrar.ts`. Registration is feature-gated for VS Code 1.99+ so older editor versions silently skip tool registration rather than breaking extension startup. Each tool call is forwarded to the local MemoPilot backend and requests bounded Markdown output for direct model consumption.
+
+### MCP Server Architecture
+
+MemoPilot also exposes the same tool surface through a standalone **stdio MCP server** launched as:
+
+```bash
+python -m agent.mcp_server
+```
+
+The MCP server is a separate process that reads from stdin, writes to stdout, resolves the local backend port from `.memopilot/agent.lock`, authenticates with the backend token, and forwards tool requests over localhost HTTP. This allows Cursor Chat to use MemoPilot without coupling the tool surface to the extension host process.
+
+### Context Renderer
+
+The new `context_renderer.py` module converts context packs, rules, workspace profiles, and memory search results into structured Markdown with hard output ceilings:
+
+- **8000 tokens** maximum for context pack output
+- **2000 tokens** maximum for rules, workspace profile, recall, and related tool responses
+- Truncation notices when files are omitted to stay inside the token budget
+- Governance and redaction notices so tool callers understand what was filtered
+
+### Writeback Pipeline
+
+Tool Mode adds a dedicated writeback path for post-hoc patch review and memory capture via `tool_mode_writeback.py`.
+
+- A submitted diff produces capped memory proposals instead of direct memory writes
+- Proposal mix is bounded for quality: **1 outcome**, **0–5 symbol changes**, **0–2 rule compliance**, **0–2 test coverage**
+- Maximum **10 proposals per diff**
+- Proposal bodies pass through a safety filter that strips raw diff markers and redacts secrets
+- Duplicate processing is prevented with a **SHA-256 diff hash**
+- No proposal is auto-confirmed; every item enters **`pending_review`**
+- A dismiss endpoint lets developers mark a writeback as not needed
+
+### Tool Call Logging and Session Management
+
+Tool Mode introduces auditable per-caller session tracking:
+
+- Every tool invocation is logged to `tool_call_events`
+- Session-level aggregates are tracked in `tool_mode_sessions`
+- Logged fields include caller, tool name, returned token counts, redaction counts, stale exclusions, and writeback/patch-review flags
+- First-use caller approval is explicit via approve/block endpoints
+- A session summary endpoint feeds the privacy dashboard with per-caller usage totals and pending writeback counts
+
+### Token Injection for Cursor
+
+`BackendManager.ts` now writes backend token data into `.memopilot/.cursor-mcp-env` for Cursor MCP launches. The file is workspace-local, supports automatic token injection for the MCP process, and is never committed to git.
+
+### New API Endpoints
+
+| Endpoint | Method | Purpose |
+|---|---|---|
+| `/v1/context-pack/generate` | POST | Tool-mode context generation with bounded Markdown output |
+| `/v1/memory/recall` | POST | Recall or search local project memory for tool callers |
+| `/v1/rules/active` | GET | Return active rules and matched skills |
+| `/v1/workspace/profile` | GET | Return workspace profile data rendered for tool mode |
+| `/v1/task/review-applied-patch` | POST | Review an applied diff and return risk/compliance guidance |
+| `/v1/tool-mode/writeback` | POST | Generate memory proposals from an applied diff outcome |
+| `/v1/tool-mode/dismiss-writeback` | POST | Mark a pending writeback as not needed |
+| `/v1/tool-mode/approve-caller` | POST | Approve first-use access for a tool caller |
+| `/v1/tool-mode/block-caller` | POST | Block a caller for the current session |
+| `/v1/tool-mode/session-summary` | GET | Return per-caller session totals for the privacy dashboard |
+
+### New Database Tables and Migrations
+
+| Migration | Version | Contents |
+|---|---|---|
+| `016_tool_mode.sql` | 16 | `task_runs` source/patch governance fields plus `tool_mode_sessions` and `tool_call_events` |
+| `017_tool_mode_writeback.sql` | 17 | `tool_mode_writebacks`, `task_runs` outcome/writeback fields, and `memory_items.writeback_id` |
+
+| Table | Purpose |
+|---|---|
+| `tool_mode_sessions` | Track active tool-mode sessions by caller and workspace |
+| `tool_call_events` | Record each tool call for audit, privacy, and usage reporting |
+| `tool_mode_writebacks` | Store deduplicated diff writebacks and proposal-generation metadata |
+
+### Key Architectural Decisions
+
+1. **Tool Mode is additive**: native MemoPilot task flow remains unchanged; tool integrations reuse the same backend primitives.
+2. **Two front ends, one governance path**: Copilot LM tools and Cursor MCP both flow through the same local APIs, filters, and logging.
+3. **Markdown over raw JSON**: tool output is rendered for direct LLM consumption, not for human-only UI views.
+4. **Bounded output is mandatory**: Tool Mode always caps output to avoid flooding chat context windows.
+5. **Writeback is review-first**: memory proposals are suggestions only and always enter `pending_review`.
+6. **Dedup happens at diff level**: the same patch cannot repeatedly generate duplicate proposals.
+7. **Caller approval is explicit**: first-use approval/blocking protects privacy when a new tool surface begins calling MemoPilot.
+8. **Cursor auth stays local**: token handoff uses `.memopilot/.cursor-mcp-env`, not committed config.
+
+### Test Coverage (post-tool-mode)
+
+| Test File | Tests | Scope |
+|---|---|---|
+| `test_tool_mode.py` | 22 | Renderer output, bounded Markdown, session tracking, audit logging, caller approval, tool-mode review flows |
+| `test_mcp_server.py` | 7 | MCP stdio bootstrap, tool definitions, schema validation, backend forwarding |
+| `test_tool_mode_writeback.py` | 17 | Proposal generation, safety filtering, deduplication, task status transitions, dismiss flow |
+| **Tool mode total** | **46** | Tool Mode acceptance coverage across T1–T5 |
+| **Full suite total** | **217** | Including all pre-existing tests |
+
+### Phase Structure
+
+```
+Phase 30:  Tool Mode — LM Tools + MCP + Writeback
+  T1: Bounded Markdown renderer + Copilot Chat LM tool surface
+  T2: Cursor Chat MCP server (stdio) + backend forwarding
+  T3: Tool call audit logging + per-caller session tracking
+  T4: First-use approval gate + privacy session summary
+  T5: Post-hoc patch review + memory writeback proposals
+```

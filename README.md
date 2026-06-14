@@ -130,9 +130,20 @@ docs/          — Product documentation
 | Failure categorisation with template-driven hints |
 | Per-task cost feedback and savings framing vs frontier baseline |
 
+### Tool Mode (v2.4)
+
+| Feature |
+|---------|
+| 6 callable LM Tools for Copilot Chat (VS Code Language Model Tools API) |
+| MCP Server for Cursor Chat (stdio transport, same 6 tools) |
+| Bounded context rendering (8000/2000 token caps) |
+| Memory writeback pipeline (proposals from applied diffs) |
+| Tool call audit logging with per-caller session tracking |
+| Automatic Cursor token injection (`.memopilot/.cursor-mcp-env`) |
+
 ## Current Implementation Status
 
-**Completed:** Phases 1–29 (All phases through v2 + Feature Refinement) — Full Remediation + Refinement
+**Completed:** Phases 1–30 (All phases through v2.4 + Feature Refinement + Tool Mode) — Full Remediation + Refinement + Tool Integration
 
 - **Schema Remediation (26 issues resolved):** Lockfile format with schema/api version, FTS5 sync triggers, governance migration (memory_class, memory_status, visibility_scope, reusable, review_required), trust level inverted (5=best), supersedes_id removed in favor of memory_relations, schema constraints, snapshots folder spec
 - **Workflow Correctness:** Patch apply via `git apply --check` with snapshot rollback, response cache quality filter (success-only, disabled for critical tasks), investigation sessions (pre-task evidence), 8 investigation API endpoints, task classifier two-pass priority (file type > directory), workspace profile YAML as source of truth, per-command validation timeouts, MCP per-context caps (pre_fetch=8, patch=5, investigation=12)
@@ -140,8 +151,9 @@ docs/          — Product documentation
 - **v1.5 Features:** Skill Store with versioning and conflict detection, Context Pack Diffing, Memory Backup/Restore, PDF/Excel/CSV extraction, Evidence Source Classifier (deterministic, <100ms), Tool/Skill Selection Optimizer, Model Budget Profiles (strict_local, monthly cap)
 - **v2 Features:** Image/screenshot analysis (LLaVA local + OCR), Team Policy Packs with precedence enforcement, Local Agent Flow Builder with YAML validation and approval gates, Multi-workspace support (isolated per-repo), Code Review Memory Mode (Phase 18B), Word/PowerPoint ingestion
 - **Feature Refinement (Phases 24–29):** Budget-aware context packs with per-tier token caps, tiered approval gate (scroll gate + type-to-confirm for critical patches), memory manager bulk actions with usage signals and ranked suggestions, outcome-based model routing with cost comparison, validation baseline diffing with auto-retry and failure categorisation, graduated cost guard with status bar integration and savings reporting
+- **Tool Mode (Phase 30):** 6 callable LM tools for Copilot Chat, Cursor MCP server, bounded Markdown renderer (8000/2000 caps), post-hoc patch review with memory writeback proposals, tool call audit logging, per-caller sessions, first-use approval, Cursor token injection
 - Full UI Implementation (17 views, zero placeholders)
-- 171 tests passing, 0 lint errors
+- 217 tests passing, 0 lint errors
 
 ### UI Implementation (Latest — June 2026)
 
@@ -191,6 +203,11 @@ All v2 waves are implemented:
 | `code_review_memory.py` | Review lesson extraction + write-back |
 | `endpoint_registry.py` | API implementation status register |
 | `validation_runner.py` | Per-command timeouts |
+| `context_renderer.py` | Bounded Markdown rendering for LLM tools |
+| `tool_call_logger.py` | Tool call audit logging |
+| `tool_mode_router.py` | Caller session management |
+| `tool_mode_writeback.py` | Memory writeback pipeline |
+| `mcp_server.py` | Standalone MCP server for Cursor |
 
 ## Development
 

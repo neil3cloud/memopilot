@@ -68,6 +68,9 @@ class RecallRequest(BaseModel):
     min_trust_level: int = 1
     include_stale: bool = False
     workspace_root: str | None = None
+    caller: str = "memopilot_ui"
+    output_format: str = "full"
+    max_output_tokens: int = 2000
 
 
 class RecallResponse(BaseModel):

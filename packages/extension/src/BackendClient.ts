@@ -480,6 +480,16 @@ export class BackendClient {
         this.manager = manager;
     }
 
+    async get<T = unknown>(urlPath: string): Promise<T> {
+        const result = await this.manager.request('GET', urlPath);
+        return result as T;
+    }
+
+    async post<T = unknown>(urlPath: string, body?: unknown): Promise<T> {
+        const result = await this.manager.request('POST', urlPath, body);
+        return result as T;
+    }
+
     async health(): Promise<HealthResponse> {
         const result = await this.manager.request('GET', '/v1/health');
         return result as HealthResponse;

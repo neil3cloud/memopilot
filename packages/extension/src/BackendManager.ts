@@ -105,6 +105,9 @@ export class BackendManager {
         // Wait for lockfile to appear with port
         this.port = await this.waitForPort(10000);
         this.outputChannel.appendLine(`[MemoPilot] Backend started on port ${this.port}`);
+
+        // Write .cursor-mcp-env for MCP server (Cursor integration)
+        this.writeCursorMcpEnv(memopilotDir);
     }
 
     async stop(): Promise<void> {
@@ -122,6 +125,9 @@ export class BackendManager {
                 // Ignore cleanup errors
             }
         }
+
+        // Clean .cursor-mcp-env
+        this.deleteCursorMcpEnv();
     }
 
     async request(method: string, urlPath: string, body?: unknown): Promise<unknown> {
@@ -373,28 +379,29 @@ export class BackendManager {
             }
 
             const lockfile = data as Partial<BackendLockfile>;
-            if (!Number.isInteger(lockfile.port) || !Number.isInteger(lockfile.pid)) {
+            const { port, pid, started_at, schema_version, api_version } = lockfile;
+            if (!Number.isInteger(port) || !Number.isInteger(pid)) {
                 return undefined;
             }
-            if (lockfile.started_at !== undefined && typeof lockfile.started_at !== 'string') {
+            if (started_at !== undefined && typeof started_at !== 'string') {
                 return undefined;
             }
             if (
-                lockfile.schema_version !== undefined &&
-                !Number.isInteger(lockfile.schema_version)
+                schema_version !== undefined &&
+                !Number.isInteger(schema_version)
             ) {
-                 return undefined;
+                return undefined;
             }
-            if (lockfile.api_version !== undefined && !Number.isInteger(lockfile.api_version)) {
+            if (api_version !== undefined && !Number.isInteger(api_version)) {
                 return undefined;
             }
 
             return {
-                port: lockfile.port,
-                pid: lockfile.pid,
-                started_at: lockfile.started_at,
-                schema_version: lockfile.schema_version,
-                api_version: lockfile.api_version,
+                port: port as number,
+                pid: pid as number,
+                started_at,
+                schema_version,
+                api_version,
             };
         } catch {
             return undefined;
@@ -430,5 +437,45 @@ export class BackendManager {
 
     private sleep(ms: number): Promise<void> {
         return new Promise(resolve => setTimeout(resolve, ms));
+    }
+
+    private writeCursorMcpEnv(memopilotDir: string): void {
+        try {
+            const envPath = path.join(memopilotDir, '.cursor-mcp-env');
+            const content = `MEMOPILOT_TOKEN=${this.token}\nMEMOPILOT_WORKSPACE=${this.workspacePath}\n`;
+            fs.writeFileSync(envPath, content, { mode: 0o600 });
+
+            // Auto-add to .gitignore if not already present
+            this.ensureGitignoreEntry(memopilotDir, '.cursor-mcp-env');
+        } catch {
+            // Non-critical: Cursor integration will just not work
+        }
+    }
+
+    private deleteCursorMcpEnv(): void {
+        try {
+            const envPath = path.join(this.workspacePath, '.memopilot', '.cursor-mcp-env');
+            if (fs.existsSync(envPath)) {
+                fs.unlinkSync(envPath);
+            }
+        } catch {
+            // Ignore cleanup errors
+        }
+    }
+
+    private ensureGitignoreEntry(memopilotDir: string, entry: string): void {
+        const gitignorePath = path.join(memopilotDir, '.gitignore');
+        try {
+            let content = '';
+            if (fs.existsSync(gitignorePath)) {
+                content = fs.readFileSync(gitignorePath, 'utf-8');
+            }
+            if (!content.includes(entry)) {
+                const newLine = content.endsWith('\n') || content === '' ? '' : '\n';
+                fs.writeFileSync(gitignorePath, `${content}${newLine}${entry}\n`);
+            }
+        } catch {
+            // Non-critical
+        }
     }
 }

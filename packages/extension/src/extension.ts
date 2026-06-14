@@ -2,6 +2,7 @@ import * as vscode from 'vscode';
 import * as path from 'path';
 import { BackendClient } from './BackendClient';
 import { BackendManager } from './BackendManager';
+import { registerLanguageModelTools } from './tools/LanguageModelToolsRegistrar';
 import { StatusTreeProvider } from './views/StatusTreeProvider';
 import { PlaceholderTreeProvider } from './views/PlaceholderTreeProvider';
 import { WorkspaceProfileTreeProvider } from './views/WorkspaceProfileTreeProvider';
@@ -865,6 +866,36 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         vscode.commands.registerCommand('memopilot.validateWorkspaceProfile', validateWorkspaceProfile),
         vscode.commands.registerCommand('memopilot.exportWorkspaceProfile', exportWorkspaceProfile),
         vscode.commands.registerCommand('memopilot.reviewMemory', reviewMemory),
+        vscode.commands.registerCommand('memopilot.reviewAppliedPatch', async () => {
+            const client = ensureBackendClient();
+            if (!client) { return; }
+
+            const workspaceRoot = getWorkspaceRoot();
+            const gitDiff = await getGitDiffForReview(workspaceRoot);
+
+            if (!gitDiff || !gitDiff.trim()) {
+                vscode.window.showInformationMessage('No uncommitted changes to review. Apply a patch first.');
+                return;
+            }
+
+            try {
+                const review = await client.post<{ rendered_report?: string }>('/v1/task/review-applied-patch', {
+                    git_diff: gitDiff,
+                    workspace_root: workspaceRoot,
+                    caller: 'memopilot_ui',
+                });
+                const patchReviewOutputChannel = vscode.window.createOutputChannel('MemoPilot Patch Review');
+                patchReviewOutputChannel.clear();
+                patchReviewOutputChannel.appendLine(review.rendered_report ?? 'No report available.');
+                patchReviewOutputChannel.show(true);
+            } catch (err: unknown) {
+                const msg = err instanceof Error ? err.message : String(err);
+                vscode.window.showErrorMessage(`MemoPilot patch review failed: ${msg}`);
+            }
+        }),
+        vscode.commands.registerCommand('memopilot.refreshMemoryReviewQueue', async () => {
+            await memoryProvider.refresh();
+        }),
         vscode.commands.registerCommand('memopilot.showPrivacyDashboard', showPrivacyDashboard),
         vscode.commands.registerCommand('memopilot.showProviderCapabilities', showProviderCapabilities),
         vscode.commands.registerCommand('memopilot.replayAICall', replayAICall),
@@ -892,6 +923,10 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
             );
         }),
     );
+
+    // Register Language Model Tools (VS Code 1.99+ Copilot Chat integration)
+    const toolDisposables = registerLanguageModelTools(context, () => backendClient);
+    context.subscriptions.push(...toolDisposables);
 
     // Start backend if workspace is open
     const workspaceFolder = vscode.workspace.workspaceFolders?.[0];
@@ -960,6 +995,27 @@ async function stopBackend(): Promise<void> {
         backendManager = undefined;
         backendClient = undefined;
     }
+}
+
+function getWorkspaceRoot(): string {
+    const folders = vscode.workspace.workspaceFolders;
+    if (folders && folders.length > 0) {
+        return folders[0].uri.fsPath;
+    }
+    return '';
+}
+
+async function getGitDiffForReview(workspaceRoot: string): Promise<string> {
+    if (!workspaceRoot) {
+        return '';
+    }
+
+    const { exec } = require('child_process') as typeof import('child_process');
+    return new Promise<string>((resolve) => {
+        exec('git diff HEAD', { cwd: workspaceRoot, maxBuffer: 1024 * 1024 }, (error: Error | null, stdout: string) => {
+            resolve(error ? '' : stdout);
+        });
+    });
 }
 
 export async function deactivate(): Promise<void> {
