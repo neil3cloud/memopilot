@@ -103,7 +103,7 @@ export class BackendManager {
         });
 
         // Wait for lockfile to appear with port
-        this.port = await this.waitForPort(10000);
+        this.port = await this.waitForPort(30000);
         this.outputChannel.appendLine(`[MemoPilot] Backend started on port ${this.port}`);
 
         // Write .cursor-mcp-env for MCP server (Cursor integration)
@@ -364,7 +364,7 @@ export class BackendManager {
         const hint = this.stderrBuffer
             ? `\nLast stderr:\n${this.stderrBuffer.slice(-500)}`
             : '';
-        throw new Error(`Backend failed to start within 10 seconds (no lockfile)${hint}`);
+        throw new Error(`Backend failed to start within 30 seconds (no lockfile)${hint}`);
     }
 
     private readLockfile(): BackendLockfile | undefined {
@@ -417,6 +417,10 @@ export class BackendManager {
         const startedMatch = combined.match(/MemoPilot backend started on port (\d+)/i);
         if (startedMatch) {
             return Number(startedMatch[1]);
+        }
+        const uvicornMatch = combined.match(/Uvicorn running on http:\/\/127\.0\.0\.1:(\d+)/i);
+        if (uvicornMatch) {
+            return Number(uvicornMatch[1]);
         }
         return undefined;
     }

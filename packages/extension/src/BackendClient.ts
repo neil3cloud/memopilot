@@ -11,6 +11,17 @@ export interface InitWorkspaceResponse {
     memopilot_dir: string;
 }
 
+export interface IndexWorkspaceResponse {
+    python_project: boolean;
+    total_files_scanned: number;
+    indexed_files: number;
+    unchanged_files: number;
+    stale_files: number;
+    skipped_files: number;
+    symbols_extracted: number;
+    duration_ms: number;
+}
+
 export interface RebuildMemoryResponse {
     rebuilt: boolean;
     total_files_scanned: number;
@@ -498,6 +509,11 @@ export class BackendClient {
     async initWorkspace(): Promise<InitWorkspaceResponse> {
         const result = await this.manager.request('POST', '/v1/workspace/init');
         return result as InitWorkspaceResponse;
+    }
+
+    async indexWorkspace(): Promise<IndexWorkspaceResponse> {
+        const result = await this.manager.request('POST', '/v1/workspace/index');
+        return result as IndexWorkspaceResponse;
     }
 
     async rebuildMemory(): Promise<RebuildMemoryResponse> {

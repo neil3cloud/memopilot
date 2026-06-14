@@ -3229,12 +3229,12 @@ This is not AI-assisted development with guardrails bolted on. This is **AI-assi
 
 ### Overview
 
-The MemoPilot extension UI has been expanded from basic tree views and static panels to a **full end-to-end task flow UI** covering all 17 target scenario views. The UI now supports the complete developer workflow:
+The MemoPilot extension UI has been expanded from basic tree views and static panels to cover all 17 target scenario views. The UI currently supports a **guided analysis-first workflow**, with some end-to-end orchestration components implemented but not yet wired to the New Task panel.
 
 ```
-Workspace indexing → Rules/Skills resolution → Task entry → Context pack preview
-→ Model routing & cost guard → AI patch preview → Approval gate → Validation
-→ Memory/history update → Cost reporting
+Workspace indexing → Rules/Skills resolution → Task entry (analysis output)
+→ Context/model/routing/patch orchestration available in TaskFlowController
+→ patch preview/approval commands available (wiring to New Task pending)
 ```
 
 ### New Extension Architecture
@@ -3283,10 +3283,10 @@ packages/extension/src/
 | Workspace Status / Indexing | MemoPilotPanel (shell) | Webview ✅ |
 | Local App Memory | MemoryManagerTreeProvider | Tree ✅ |
 | Rules & Skills | RulesSkillsTreeProvider | Tree ✅ |
-| Task Entry | TaskEntryPanel | Webview ✅ |
+| Task Entry | TaskEntryPanel (analyze-only) | Webview ✅ |
 | Context Pack Preview | ContextPackTreeProvider | Tree ✅ |
 | Model Routing & Cost Guard | CostGuardTreeProvider + routeModel() | Tree ✅ |
-| AI Patch / Diff Preview | PatchPreviewPanel | Webview ✅ |
+| AI Patch / Diff Preview | PatchPreviewPanel (implemented, not invoked from New Task flow) | Webview ✅ |
 | Approval Gate | PatchPreviewPanel (approve/reject) | Webview ✅ |
 | Validation Results | PatchPreviewPanel (inline) | Webview ✅ |
 | Memory / Task History | TaskHistoryTreeProvider | Tree ✅ |
@@ -3298,7 +3298,7 @@ packages/extension/src/
 | Workspace Profile | WorkspaceProfileTreeProvider | Tree ✅ |
 | MCP / External Context | McpToolsTreeProvider | Tree ✅ |
 
-**All 17 target views now have live implementations** (zero remaining placeholders).
+**All 17 target views have live UI implementations.** End-to-end New Task → generated patch linkage is still pending.
 
 ### TaskFlowController State Machine
 
@@ -3309,7 +3309,7 @@ idle → analyzing → context_building → routing → generating_patch
     → reject → idle
 ```
 
-The flow automatically proceeds through analysis, context building, model routing, and patch generation, then **stops at the approval gate**. No code is applied without explicit developer consent.
+The state machine supports automatic progression through analysis, context building, model routing, and patch generation, then **stops at the approval gate**. This controller flow is implemented but is not yet triggered by the current New Task webview submit path.
 
 ### Test Coverage
 
@@ -3585,6 +3585,15 @@ Three issues identified during code review and resolved:
 1. **Unbounded bulk action list**: `BulkMemoryActionRequest.memory_ids` capped at `max_length=500` to stay within SQLite parameter limits.
 2. **N+1 query in memory listing**: `_rows_to_items()` replaced with batched `_batch_usage_stats()` — single query for base stats + single query for events table.
 3. **Stale schema version default**: `config.py` schema_version updated from 13 to 15 to match latest migration.
+
+### Session Update — New Task Webview Fix (June 2026)
+
+Changes implemented in this session:
+
+1. **Fixed Analyze Task click no-op**: `TaskEntryPanel.ts` now attaches the submit handler on `DOMContentLoaded`, ensuring the button listener is always bound when the form is rendered.
+2. **Hardened delegated click handling**: Added an `Element` guard before using `closest()` for dynamic action buttons (e.g., "Edit Task").
+3. **Documented current behavior**: The New Task panel currently performs **analysis only** (intent/mode/complexity/rules/files) and does not yet trigger patch generation/apply directly.
+4. **Current practical task-to-patch path**: Analyze in New Task, then use existing flows/commands for implementation and post-hoc review (`memopilot.reviewAppliedPatch`).
 
 ---
 

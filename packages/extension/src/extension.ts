@@ -64,8 +64,35 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     );
 
     // Commands
-    const notImplemented = (name: string) => () => {
-        vscode.window.showInformationMessage(`MemoPilot: "${name}" is not yet implemented.`);
+    const indexWorkspace = async () => {
+        if (!backendClient) {
+            vscode.window.showWarningMessage('MemoPilot backend is not connected.');
+            return;
+        }
+
+        try {
+            await vscode.window.withProgress(
+                { location: vscode.ProgressLocation.Notification, title: 'MemoPilot: Indexing workspace...' },
+                async () => {
+                    const result = await backendClient!.indexWorkspace();
+                    const parts: string[] = [];
+                    parts.push(`${result.total_files_scanned} files scanned`);
+                    if (result.indexed_files > 0) {
+                        parts.push(`${result.indexed_files} new/changed`);
+                    }
+                    if (result.unchanged_files > 0) {
+                        parts.push(`${result.unchanged_files} unchanged`);
+                    }
+                    parts.push(`${result.symbols_extracted} symbols`);
+                    vscode.window.showInformationMessage(
+                        `MemoPilot: ${parts.join(', ')} (${result.duration_ms}ms).`,
+                    );
+                },
+            );
+        } catch (err: unknown) {
+            const msg = err instanceof Error ? err.message : String(err);
+            vscode.window.showErrorMessage(`MemoPilot workspace indexing failed: ${msg}`);
+        }
     };
 
     const rebuildMemory = async () => {
@@ -832,7 +859,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     };
 
     context.subscriptions.push(
-        vscode.commands.registerCommand('memopilot.indexWorkspace', notImplemented('Index Workspace Memory')),
+        vscode.commands.registerCommand('memopilot.indexWorkspace', indexWorkspace),
         vscode.commands.registerCommand('memopilot.analyzeTask', () => {
             TaskEntryPanel.createOrShow(context.extensionUri, backendClient);
         }),
