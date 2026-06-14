@@ -1,6 +1,6 @@
 # MemoPilot: Master Product and Implementation Reference
 
-**Document Version:** 2.2 (Remediation + Feature Hardening Complete) **Target Product:** MemoPilot — Rule-Aware, Local-Memory, Cost-Governed AI Development Agent Extension for VS Code/Cursor **Status:** Production Reference
+**Document Version:** 2.3 (Feature Refinement Complete) **Target Product:** MemoPilot — Rule-Aware, Local-Memory, Cost-Governed AI Development Agent Extension for VS Code/Cursor **Status:** Production Reference
 
 ---
 
@@ -34,6 +34,7 @@
 26. [Final Product Positioning](#26-final-product-positioning)
 27. [UI Implementation Progress (v2.1)](#27-ui-implementation-progress-v21--june-2025)
 28. [Remediation and Feature Hardening (v2.2)](#28-remediation-and-feature-hardening-v22--june-2026)
+29. [Feature Refinement Phase (v2.3)](#29-feature-refinement-phase-v23--june-2026)
 
 ---
 
@@ -3480,3 +3481,106 @@ Phase 21:  Local Agent Flow Builder
 Phase 22:  Multi-Workspace Support
 Phase 23:  Word and PowerPoint Ingestion
 ```
+
+---
+
+## 29\. Feature Refinement Phase (v2.3 — June 2026)
+
+### Overview
+
+A post-validation refinement phase addressing six feature areas identified through production usage. All refinements are additive and backward-compatible. Result: 6 new migrations (010–015), 4 new modules, 44 new tests (171 total passing), 0 regressions.
+
+### Refinement Summary
+
+| # | Area | Key Change | New Tests |
+|---|------|-----------|-----------|
+| 1 | Context Pack Quality | Budget-aware tier allocation with per-tier token caps, selection-time inclusion/exclusion reasons, stale memory surfacing, task-type-aware tier reordering | 7 |
+| 2 | Approval Gate | Tiered approval (LOW/MEDIUM/HIGH/CRITICAL), scroll gate for high-risk patches, type-to-confirm for critical patches, risk-sorted diff ordering, actionable compliance warnings with task handoff | 8 |
+| 3 | Memory Manager | Bulk actions (approve/reject/delete with confirmation), usage signal per memory item, ranked suggested updates with deterministic scoring, review queue decay detection, keyboard shortcuts | 7 |
+| 4 | Model Routing | Outcome-based frontier escalation (2+ failures trigger upgrade), per-model cost comparison UI, inline routing override, routing reason explains escalation conditions | 6 |
+| 5 | Validation Runner | Pre-patch baseline run (isolate new vs pre-existing failures), configurable auto-retry policy, failure output categorisation with template-driven hints | 8 |
+| 6 | Cost Guard | Status bar cost integration with graduated states, savings framing (dollar value vs frontier baseline), per-task cost feedback, graduated budget enforcement (80%/90%/100% tiers) | 8 |
+
+### New Modules
+
+| Module | Purpose |
+|--------|---------|
+| `context_budget.py` | Budget-aware context pack allocation with `ContextBudget`, `ContextItem`, `ExcludedItem`, `ExclusionReason` enum, task-type tier ordering, roll-forward budget logic |
+| `model_router.py` | Outcome-based routing with `ModelTier` enum, `get_outcome_routing_hint()` (failure-history query), `RoutingDecision` dataclass, escalation source tracking |
+| `approval_gate.py` | Tiered approval with `ApprovalTier` enum, `FILE_RISK_SIGNALS` pattern matching, `rank_patch_files()`, `ApprovalConfig`, `ComplianceWarning`/`ComplianceAction` for task handoff |
+| `memory_suggestions.py` | Deterministic memory suggestion ranking (5 factors: file change, memory class, task frequency, validation source, contradiction), review queue decay detection |
+
+### New Migrations
+
+| Migration | Version | Contents |
+|-----------|---------|----------|
+| `010_context_pack_budget.sql` | 10 | budget_summary_json, stale_exclusion_count, included_items_json, excluded_items_json on context_pack_versions |
+| `011_model_routing_outcome.sql` | 11 | routing_escalation_source, routing_base_tier, model_override on task_runs |
+| `012_cost_guard_savings.sql` | 12 | hypothetical_frontier_cost on ai_calls |
+| `013_validation_baseline.sql` | 13 | baseline_validation_json, pre_existing_failures_json, new_failures_json, fixed_by_patch_json, retry_count, auto_retry_stopped_reason on patch_attempts |
+| `014_approval_gate_tiers.sql` | 14 | approval_tier, scroll_gate_cleared, type_confirm_required, type_confirm_completed, compliance_warnings_dismissed_json, compliance_actions_triggered_json, ranked_files_json on patch_attempts |
+| `015_memory_manager_usage.sql` | 15 | last_used_at, usage_count on memory_items; indexes on last_used_at and (memory_status, created_at) |
+
+### New API Endpoints
+
+| Endpoint | Method | Purpose |
+|----------|--------|---------|
+| `/v1/patch/rank-files` | POST | Rank changed files by risk level, return approval tier |
+| `/v1/memory/bulk-approve` | POST | Bulk approve memory items (max 500) |
+| `/v1/memory/bulk-reject` | POST | Bulk reject memory items |
+| `/v1/memory/bulk-delete` | POST | Bulk delete memory items |
+| `/v1/memory/unused` | GET | List memory items unused for 30+ days |
+
+### Extended API Responses
+
+| Endpoint | New Fields |
+|----------|-----------|
+| `POST /v1/context-pack/generate` | budget_summary, stale_exclusions, included_items, excluded_items (opt-in via model_max_tokens) |
+| `POST /v1/model/route` | options (all tiers with costs), base_tier, escalation_source, model_override |
+| `GET /v1/cost/budget-status` | pct_used, at_limit, at_warning, warning_threshold |
+| `GET /v1/cost/dashboard` | savings_report (actual vs hypothetical frontier cost, reduction percentage) |
+| `POST /v1/task/validate` | pre_existing_failures, new_failures, fixed_by_patch, failure categories with hints |
+| `GET /v1/memory/items` | usage_stats per item (recalled_count, used_count, last_used_at, days_since_last_use) |
+
+### Key Architectural Decisions
+
+1. **Budget allocation is opt-in**: Existing context build behavior is preserved unless `model_max_tokens` is provided in the request. This ensures backward compatibility.
+2. **Tier roll-forward**: Unused budget from any context tier passes to the next tier in task-type-specific order, preventing waste.
+3. **Selection-time reasons**: Inclusion and exclusion reasons are generated at retrieval time, not post-hoc — ensuring transparency accuracy.
+4. **Deterministic ranking**: Memory suggestion ranking uses a 5-factor scoring algorithm with no model calls. Contradicting suggestions always surface first.
+5. **Graduated budget enforcement**: Three-tier response (80% warning → 90% frontier approval → 100% block) replaces binary cutoff. Local models are never blocked.
+6. **Pre-patch baseline**: Validation runs before and after patch to isolate new failures from pre-existing ones. Capped at 30 seconds for large test suites.
+7. **Failure categorisation**: Template-driven hints per failure category (assertion, import, fixture, syntax, type, lint, timeout) — no AI call needed.
+8. **Batched usage stats**: Memory item listing uses batched queries instead of N+1 pattern, keeping response time under 500ms for 100 items.
+
+### Test Coverage (post-refinement)
+
+| Test File | Tests | Scope |
+|-----------|-------|-------|
+| test_context_builder_budget.py | 7 | Budget allocation, tier caps, roll-forward, stale exclusions, task-type reordering |
+| test_model_router.py | 6 | Outcome escalation, per-model options, inline override, escalation conditions |
+| test_cost_guard_budget.py | 8 | Budget gate (80/90/100%), savings calculation, per-task cost, local model immunity |
+| test_validation_runner_baseline.py | 8 | Baseline diff, failure categorisation, auto-retry, escalation approval |
+| test_approval_gate.py | 8 | Tier configs, risk classification, file ranking, compliance actions |
+| test_memory_manager_bulk.py | 7 | Bulk actions, usage stats, unused filter, ranking, decay detection |
+| **Refinement total** | **44** | All acceptance criteria covered |
+| **Full suite total** | **171** | Including all pre-existing tests |
+
+### Phase Structure (Updated)
+
+```
+Phase 24:  Feature Refinement — Context Pack Quality (budget allocation, selection-time reasons, stale surfacing)
+Phase 25:  Feature Refinement — Model Routing (outcome escalation, cost comparison, inline override)
+Phase 26:  Feature Refinement — Cost Guard (status bar, savings framing, graduated enforcement)
+Phase 27:  Feature Refinement — Validation Runner (pre-patch baseline, auto-retry, failure categorisation)
+Phase 28:  Feature Refinement — Approval Gate (tiered approval, scroll gate, type-to-confirm, actionable warnings)
+Phase 29:  Feature Refinement — Memory Manager (bulk actions, usage signals, ranking, decay, keyboard nav)
+```
+
+### Code Review Fixes Applied
+
+Three issues identified during code review and resolved:
+
+1. **Unbounded bulk action list**: `BulkMemoryActionRequest.memory_ids` capped at `max_length=500` to stay within SQLite parameter limits.
+2. **N+1 query in memory listing**: `_rows_to_items()` replaced with batched `_batch_usage_stats()` — single query for base stats + single query for events table.
+3. **Stale schema version default**: `config.py` schema_version updated from 13 to 15 to match latest migration.

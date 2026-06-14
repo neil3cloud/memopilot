@@ -50,21 +50,34 @@ AI coding assistants are powerful — but uncontrolled. They send too much conte
 
 ### 📦 Governed Context Packs
 - Assembles only relevant files, symbols, rules, and memory into a minimal context
+- **Budget-aware allocation** — per-tier token caps prevent any single source from crowding out others
 - Shows token cost estimates before any AI call
-- Explains why each item is included or excluded
+- Explains why each item is included or excluded — reasons generated at selection time, not post-hoc
+- Stale memory items surfaced with rebuild prompt
+- Task-type-aware tier ordering (bug fixes prioritise stack traces; investigations prioritise history)
 - Context pack diffing shows what changed between versions
 
 ### 🤖 Cost-Aware Model Routing
 - Routes tasks: local model → cheap cloud → frontier (only when needed)
-- Monthly budget enforcement with 80% warning and 100% hard block
+- **Outcome-based escalation** — if a module fails 2+ times with cheaper models, automatically routes to frontier
+- Per-model cost comparison shown before every AI call (all tiers side by side)
+- Inline model override — switch models without restarting the task
+- Routing reason explains both the decision and what would trigger escalation
+- Monthly budget enforcement with graduated response (80% warning → 90% frontier approval → 100% block)
 - Budget profiles: `balanced`, `cost_saver`, `strict_local`, `enterprise_privacy`
 - Provider capability matrix shows what each model can do
 
 ### 🔒 Patch Safety & Approval
 - Task classifier determines risk level deterministically (no LLM needed)
+- **Tiered approval** — LOW (one-click), MEDIUM (expanded diff), HIGH (scroll gate), CRITICAL (type filename to confirm)
+- Diff files sorted by risk level descending — riskiest changes shown first
+- Compliance warnings with inline actions (generate missing test, add docstring)
 - `git apply --check` pre-validation before any patch
 - File snapshots for instant rollback on failure
 - **Developer must approve** before any code is applied
+- **Pre-patch baseline** — validation runs before AND after patch to isolate new failures from pre-existing ones
+- Auto-retry with configurable policy (up to 2 retries + optional frontier escalation)
+- Failure categorisation with template-driven hints (assertion, import, fixture, syntax, type errors)
 - Validation runner (pytest, mypy, ruff) with per-command timeouts
 
 ### 🔍 Evidence-Aware Investigation
@@ -78,6 +91,15 @@ AI coding assistants are powerful — but uncontrolled. They send too much conte
 - Skill Store with versioning and conflict detection
 - Memory review queue — AI suggestions stay `pending_review` until you approve
 - Write-back safety filter blocks secrets, raw transcripts, and oversized diffs
+
+### 📊 Memory Manager
+- **Bulk actions** — multi-select approve, reject, or delete (confirmation for 6+ items)
+- **Usage signals** — every memory item shows recall count, last used date, and days since use
+- "Unused (30+ days)" filter identifies candidates for cleanup
+- **Ranked suggestions** — post-task memory updates scored by 5 factors (file change, class, frequency, validation, contradiction)
+- "Approve High Priority Only" and "Dismiss All Low Priority" batch buttons
+- **Decay detection** — pending review items older than 14 days with changed source flagged as DECAYED
+- Keyboard shortcuts: `A` approve, `R` reject, `E` edit, `D` delete, `Space` preview
 
 ### 📄 Document & Artifact Ingestion
 
@@ -137,7 +159,7 @@ AI coding assistants are powerful — but uncontrolled. They send too much conte
 
 1. Install from the VS Code Marketplace, or:
    ```
-   code --install-extension memopilot-0.1.0.vsix
+   code --install-extension memopilot-1.0.0.vsix
    ```
 2. Open a workspace. MemoPilot activates automatically.
 3. The backend starts, creates `.memopilot/`, and indexes your workspace.
@@ -281,7 +303,7 @@ validation:
 | **Memory Manager** | Browse, filter, approve/reject memory items |
 | **Rules & Skills** | Active rules by source, skills with match criteria |
 | **Context Pack** | Files, tokens, rules, cost for current context |
-| **Cost Guard** | Budget bar — spent / saved / remaining |
+| **Cost Guard** | Budget bar with graduated states (green/orange/red), savings vs frontier baseline, per-task cost feedback |
 | **Privacy Dashboard** | Local-only vs. sent-to-provider data |
 | **Evidence Board** | Attached evidence with classification + trust |
 | **Task History** | Past tasks with status, model, cost, duration |

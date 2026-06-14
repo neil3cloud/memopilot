@@ -117,19 +117,33 @@ docs/          — Product documentation
 | Multi-workspace support v2 |
 | Word/PowerPoint ingestion |
 
+### Feature Refinement (v2.3)
+
+| Feature |
+|---------|
+| Budget-aware context pack allocation with per-tier token caps and roll-forward |
+| Tiered approval gate (LOW/MEDIUM/HIGH/CRITICAL) with scroll gate and type-to-confirm |
+| Memory Manager bulk actions with usage signals and ranked suggestions |
+| Outcome-based model routing with failure history escalation |
+| Pre-patch validation baseline (isolate new vs pre-existing failures) |
+| Graduated cost guard (80% warning → 90% frontier approval → 100% block) |
+| Failure categorisation with template-driven hints |
+| Per-task cost feedback and savings framing vs frontier baseline |
+
 ## Current Implementation Status
 
-**Completed:** Phases 1–23 (All phases through v2) — Full Remediation + Feature Delivery
+**Completed:** Phases 1–29 (All phases through v2 + Feature Refinement) — Full Remediation + Refinement
 
 - **Schema Remediation (26 issues resolved):** Lockfile format with schema/api version, FTS5 sync triggers, governance migration (memory_class, memory_status, visibility_scope, reusable, review_required), trust level inverted (5=best), supersedes_id removed in favor of memory_relations, schema constraints, snapshots folder spec
 - **Workflow Correctness:** Patch apply via `git apply --check` with snapshot rollback, response cache quality filter (success-only, disabled for critical tasks), investigation sessions (pre-task evidence), 8 investigation API endpoints, task classifier two-pass priority (file type > directory), workspace profile YAML as source of truth, per-command validation timeouts, MCP per-context caps (pre_fetch=8, patch=5, investigation=12)
 - **Governance Hardening (Phase 18A):** Memory recall with UsePolicy and VisibilityScope filtering, write-back safety filter (blocks secrets, full diffs, raw transcripts), memory review queue, recall trace recording, retention policy enforcement (90/180 day + row caps), memory status lifecycle validation
 - **v1.5 Features:** Skill Store with versioning and conflict detection, Context Pack Diffing, Memory Backup/Restore, PDF/Excel/CSV extraction, Evidence Source Classifier (deterministic, <100ms), Tool/Skill Selection Optimizer, Model Budget Profiles (strict_local, monthly cap)
 - **v2 Features:** Image/screenshot analysis (LLaVA local + OCR), Team Policy Packs with precedence enforcement, Local Agent Flow Builder with YAML validation and approval gates, Multi-workspace support (isolated per-repo), Code Review Memory Mode (Phase 18B), Word/PowerPoint ingestion
+- **Feature Refinement (Phases 24–29):** Budget-aware context packs with per-tier token caps, tiered approval gate (scroll gate + type-to-confirm for critical patches), memory manager bulk actions with usage signals and ranked suggestions, outcome-based model routing with cost comparison, validation baseline diffing with auto-retry and failure categorisation, graduated cost guard with status bar integration and savings reporting
 - Full UI Implementation (17 views, zero placeholders)
-- 127 tests passing, 0 lint errors
+- 171 tests passing, 0 lint errors
 
-### UI Implementation (Latest — June 2025)
+### UI Implementation (Latest — June 2026)
 
 Full end-to-end task flow UI now covers all 17 target scenario views:
 
@@ -205,7 +219,7 @@ uv run pytest
 ### Install Extension
 
 ```bash
-code --install-extension packages/extension/memopilot-0.1.0.vsix
+code --install-extension packages/extension/memopilot-1.0.0.vsix
 ```
 
 ## Documentation
