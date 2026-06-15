@@ -135,7 +135,7 @@ export class TaskEntryPanel extends MemoPilotPanelBase {
                 <ul style="margin:0;padding-left:16px;font-size:12px;">${filesHtml}</ul>
 
                 <div style="margin-top:16px;display:flex;gap:8px;">
-                    <button id="edit-task-btn" style="background:transparent;color:var(--mp-fg);border:1px solid var(--mp-border);padding:6px 12px;border-radius:4px;cursor:pointer;">← Edit Task</button>
+                    <button id="edit-task-btn" class="mp-btn-secondary">← Edit Task</button>
                 </div>
             </div>`;
 
@@ -184,19 +184,8 @@ export class TaskEntryPanel extends MemoPilotPanelBase {
             .constraints-group .checkbox-item input[type="checkbox"] {
                 accent-color: var(--vscode-button-background);
             }
-            .btn-primary {
-                background: var(--vscode-button-background);
-                color: var(--vscode-button-foreground);
-                border: none;
-                padding: 8px 20px;
-                border-radius: 4px;
-                cursor: pointer;
-                font-size: 13px;
-                font-weight: 500;
-                transition: background 0.15s;
-            }
-            .btn-primary:hover { background: var(--vscode-button-hoverBackground); }
-            .btn-primary:disabled { opacity: 0.6; cursor: not-allowed; }
+            #submit-btn { font-size: 13px; }
+            #submit-btn:disabled { opacity: 0.6; cursor: not-allowed; }
             #error-area { margin-top: 8px; color: var(--mp-error); font-size: 12px; }
             #result-area { margin-top: 16px; }
             @keyframes spin { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }
@@ -241,7 +230,7 @@ export class TaskEntryPanel extends MemoPilotPanelBase {
                 </label>
             </div>
 
-            <button id="submit-btn" class="btn-primary">Analyze Task</button>
+            <button id="submit-btn" class="mp-btn">Analyze Task</button>
 
             <div id="result-area"></div>
             <div id="error-area"></div>
