@@ -861,7 +861,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     context.subscriptions.push(
         vscode.commands.registerCommand('memopilot.indexWorkspace', indexWorkspace),
         vscode.commands.registerCommand('memopilot.analyzeTask', () => {
-            TaskEntryPanel.createOrShow(context.extensionUri, backendClient);
+            TaskEntryPanel.createOrShow(context.extensionUri, backendClient, taskFlowController);
         }),
         vscode.commands.registerCommand('memopilot.approvePatch', async () => {
             if (taskFlowController) {

@@ -1,6 +1,7 @@
 import * as vscode from 'vscode';
 import { MemoPilotPanelBase } from './MemoPilotPanelBase';
 import { BackendClient, TaskAnalyzeResponse } from '../BackendClient';
+import { TaskFlowController } from '../controllers/TaskFlowController';
 import type { WebviewOutboundMessage } from './types';
 
 /** Messages specific to the Task Entry panel */
@@ -19,13 +20,15 @@ export class TaskEntryPanel extends MemoPilotPanelBase {
     private static readonly viewType = 'memopilotTaskEntry';
 
     private client: BackendClient | undefined;
+    private flowController: TaskFlowController | undefined;
     private lastAnalysis: TaskAnalyzeResponse | undefined;
 
-    public static createOrShow(extensionUri: vscode.Uri, client: BackendClient | undefined): void {
+    public static createOrShow(extensionUri: vscode.Uri, client: BackendClient | undefined, flowController?: TaskFlowController): void {
         const column = vscode.window.activeTextEditor?.viewColumn ?? vscode.ViewColumn.Beside;
 
         if (TaskEntryPanel.currentPanel) {
             TaskEntryPanel.currentPanel.client = client;
+            TaskEntryPanel.currentPanel.flowController = flowController;
             TaskEntryPanel.currentPanel.panel.reveal(column);
             return;
         }
@@ -41,12 +44,13 @@ export class TaskEntryPanel extends MemoPilotPanelBase {
             },
         );
 
-        TaskEntryPanel.currentPanel = new TaskEntryPanel(panel, extensionUri, client);
+        TaskEntryPanel.currentPanel = new TaskEntryPanel(panel, extensionUri, client, flowController);
     }
 
-    private constructor(panel: vscode.WebviewPanel, extensionUri: vscode.Uri, client: BackendClient | undefined) {
+    private constructor(panel: vscode.WebviewPanel, extensionUri: vscode.Uri, client: BackendClient | undefined, flowController?: TaskFlowController) {
         super(panel, extensionUri);
         this.client = client;
+        this.flowController = flowController;
 
         this.panel.onDidDispose(() => {
             TaskEntryPanel.currentPanel = undefined;
@@ -69,15 +73,13 @@ export class TaskEntryPanel extends MemoPilotPanelBase {
             case 'generate-context':
                 if (this.lastAnalysis) {
                     this.postMessage({ type: 'view-content', payload: { viewId: 'btn-loading', html: 'context' } });
-                    vscode.commands.executeCommand('memopilot.generateContextPack');
-                    vscode.window.showInformationMessage('MemoPilot: Generating context pack...');
+                    this.runContextBuild();
                 }
                 break;
             case 'generate-patch':
                 if (this.lastAnalysis) {
                     this.postMessage({ type: 'view-content', payload: { viewId: 'btn-loading', html: 'patch' } });
-                    vscode.commands.executeCommand('memopilot.generateContextPack');
-                    vscode.window.showInformationMessage('MemoPilot: Generating patch...');
+                    this.runPatchGeneration();
                 }
                 break;
             default:
@@ -171,6 +173,70 @@ export class TaskEntryPanel extends MemoPilotPanelBase {
         if (targetFiles.length === 0) { return false; }
         const docExtensions = ['.md', '.txt', '.rst', '.adoc', '.mdx'];
         return targetFiles.every(f => docExtensions.some(ext => f.path.toLowerCase().endsWith(ext)));
+    }
+
+    private async runContextBuild(): Promise<void> {
+        if (!this.client || !this.lastAnalysis) { return; }
+
+        try {
+            vscode.window.showInformationMessage('MemoPilot: Building context pack...');
+            if (this.flowController) {
+                await this.flowController.buildContext();
+                const state = this.flowController.getState();
+                if (state.contextPack) {
+                    const tokens = state.contextPack.total_tokens.toLocaleString();
+                    const cost = state.contextPack.estimated_cost_usd.toFixed(4);
+                    this.postMessage({ type: 'view-content', payload: { viewId: 'context-done', html: JSON.stringify({ tokens, cost, files: state.contextPack.files.length }) } });
+                    vscode.window.showInformationMessage(`MemoPilot: Context pack ready — ${tokens} tokens, $${cost}`);
+                }
+            } else {
+                // Fallback: call backend directly
+                const pack = await this.client.buildContextPack({
+                    task_description: this.lastAnalysis.intent_summary,
+                    suggested_files: this.lastAnalysis.suggested_files,
+                    mode: this.lastAnalysis.suggested_mode,
+                });
+                const tokens = pack.total_tokens.toLocaleString();
+                const cost = pack.estimated_cost_usd.toFixed(4);
+                this.postMessage({ type: 'view-content', payload: { viewId: 'context-done', html: JSON.stringify({ tokens, cost, files: pack.files.length }) } });
+                vscode.window.showInformationMessage(`MemoPilot: Context pack ready — ${tokens} tokens, $${cost}`);
+            }
+        } catch (err: unknown) {
+            const msg = err instanceof Error ? err.message : String(err);
+            this.postMessage({ type: 'error', payload: { message: `Context build failed: ${msg}` } });
+        }
+    }
+
+    private async runPatchGeneration(): Promise<void> {
+        if (!this.client || !this.lastAnalysis) { return; }
+
+        try {
+            vscode.window.showInformationMessage('MemoPilot: Generating patch (context → route → patch)...');
+            if (this.flowController) {
+                // If not already past context, run full pipeline from context
+                const state = this.flowController.getState();
+                if (!state.contextPack) {
+                    await this.flowController.buildContext();
+                } else if (!state.modelDecision) {
+                    await this.flowController.routeModel();
+                } else {
+                    await this.flowController.generatePatch();
+                }
+                const finalState = this.flowController.getState();
+                if (finalState.patch) {
+                    const fileCount = finalState.patch.patches.length;
+                    this.postMessage({ type: 'view-content', payload: { viewId: 'patch-done', html: JSON.stringify({ fileCount }) } });
+                    vscode.window.showInformationMessage(`MemoPilot: Patch ready — ${fileCount} file(s) changed. Review in diff editor.`);
+                } else if (finalState.error) {
+                    this.postMessage({ type: 'error', payload: { message: finalState.error } });
+                }
+            } else {
+                vscode.window.showWarningMessage('MemoPilot: No flow controller available. Use the command palette to generate patches.');
+            }
+        } catch (err: unknown) {
+            const msg = err instanceof Error ? err.message : String(err);
+            this.postMessage({ type: 'error', payload: { message: `Patch generation failed: ${msg}` } });
+        }
     }
 
     private render(): void {
@@ -748,18 +814,47 @@ export class TaskEntryPanel extends MemoPilotPanelBase {
                             resetToInput();
                         }
                     } else if (msg.payload.viewId === 'btn-loading') {
-                        // Stepper advances to show progress
                         var which = msg.payload.html;
                         if (which === 'context') { updateStepper('context'); }
-                        else if (which === 'patch') { updateStepper('patch'); }
+                        else if (which === 'patch') { updateStepper('route'); }
+                    } else if (msg.payload.viewId === 'context-done') {
+                        updateStepper('context');
+                        restoreBtn('context-btn');
+                        try {
+                            var cdata = JSON.parse(msg.payload.html);
+                            var aiEl = document.getElementById('a-cost-status');
+                            if (aiEl) {
+                                aiEl.innerHTML = '<div class="ai-dot active"></div><span>Context ready — ' + cdata.tokens + ' tokens, $' + cdata.cost + ' (' + cdata.files + ' files)</span>';
+                            }
+                        } catch(e) {}
+                    } else if (msg.payload.viewId === 'patch-done') {
+                        updateStepper('approval');
+                        restoreBtn('patch-btn');
+                        try {
+                            var pdata = JSON.parse(msg.payload.html);
+                            var aiEl2 = document.getElementById('a-cost-status');
+                            if (aiEl2) {
+                                aiEl2.innerHTML = '<div class="ai-dot active"></div><span>Patch generated — ' + pdata.fileCount + ' file(s). Review required.</span>';
+                            }
+                        } catch(e) {}
                     }
                     break;
                 case 'error':
                     document.getElementById('error-area').textContent = msg.payload.message;
-                    resetToInput();
+                    restoreBtn('context-btn');
+                    restoreBtn('patch-btn');
                     break;
             }
         };
+
+        function restoreBtn(btnId) {
+            var btn = document.getElementById(btnId);
+            if (btn && btn.dataset.originalText) {
+                btn.textContent = btn.dataset.originalText;
+                btn.disabled = false;
+                btn.style.opacity = '1';
+            }
+        }
         </script>`;
     }
 }
