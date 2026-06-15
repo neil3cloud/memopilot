@@ -101,6 +101,8 @@ export interface TaskAnalyzeResponse {
     applicable_rules: string[];
     estimated_complexity: string;
     suggested_mode: string;
+    task_type: string;
+    risk: string;
 }
 
 export interface ContextBuildRequest {
