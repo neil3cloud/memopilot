@@ -213,63 +213,6 @@ class SymbolExtractor:
             obj = SymbolExtractor._name_of(node.value)
             return f"{obj}.{node.attr}" if obj else node.attr
         return None
-        try:
-            tree = ast.parse(source)
-        except SyntaxError:
-            return []
-        symbols: list[SymbolRecord] = []
-
-        for node in tree.body:
-            if isinstance(node, ast.Import):
-                symbols.extend(
-                    self._import_records(
-                        file_path=file_path,
-                        node=node,
-                        content_hash=content_hash,
-                    )
-                )
-            elif isinstance(node, ast.ImportFrom):
-                symbols.append(
-                    self._build_record(
-                        file_path=file_path,
-                        name=self._import_from_name(node),
-                        kind="import",
-                        node=node,
-                        signature=self._import_from_signature(node),
-                        content_hash=content_hash,
-                    )
-                )
-            elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                symbols.append(
-                    self._build_record(
-                        file_path=file_path,
-                        name=node.name,
-                        kind="function",
-                        node=node,
-                        signature=self._function_signature(node),
-                        content_hash=content_hash,
-                    )
-                )
-            elif isinstance(node, ast.ClassDef):
-                symbols.append(
-                    self._build_record(
-                        file_path=file_path,
-                        name=node.name,
-                        kind="class",
-                        node=node,
-                        signature=None,
-                        content_hash=content_hash,
-                    )
-                )
-                symbols.extend(
-                    self._class_method_records(
-                        file_path=file_path,
-                        class_node=node,
-                        content_hash=content_hash,
-                    )
-                )
-
-        return symbols
 
     def _class_method_records(
         self, *, file_path: str, class_node: ast.ClassDef, content_hash: str

@@ -2229,9 +2229,7 @@ async def _generate_context_pack_response(request: ContextBuildRequest) -> Conte
                 primary_row["id"], included_file_paths
             )
             callers_not_in_context = list({c.file_path for c in callers_missing})
-            graph_expansion_files = len(
-                {c.file_path for c in callers_missing if c.file_path in included_file_paths}
-            )
+            graph_expansion_files = len({c.file_path for c in callers_missing})
     except Exception:
         pass
 

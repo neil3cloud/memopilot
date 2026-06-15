@@ -380,13 +380,16 @@ class MemoryRecallService:
         rank = row["fts_rank"]
         relevance_score = 0.0
         if rank is not None:
-            normalized_rank = max(float(rank), 0.0)
+            # bm25() returns negative values — negate so higher = more relevant
+            normalized_rank = max(-float(rank), 0.0)
             base_score = 1.0 / (1.0 + normalized_rank)
             try:
                 updated_at = row["updated_at"] if "updated_at" in row.keys() else None
             except Exception:
                 updated_at = None
-            relevance_score = min(1.0, base_score * self._recency_boost(updated_at))
+            # Recency boost is additive to the score, not multiplicative, to avoid 1.0 ceiling clipping
+            boost = self._recency_boost(updated_at) - 1.0  # 0.0–0.2
+            relevance_score = min(1.0, base_score + base_score * boost)
 
         return RecallItem(
             memory_id=str(row["id"]),

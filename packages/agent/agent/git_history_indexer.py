@@ -113,19 +113,26 @@ class GitHistoryIndexer:
         max_days: int = _MAX_DAYS,
     ) -> int:
         """Index recent commits.  Returns the number of new commits stored."""
+        import asyncio
+        import functools
+        loop = asyncio.get_event_loop()
         try:
-            result = subprocess.run(
-                [
-                    "git", "log",
-                    f"--format=%H|%an|%ai|%s",
-                    "--numstat",
-                    f"--max-count={max_commits}",
-                    f"--since={max_days} days ago",
-                ],
-                cwd=workspace_root,
-                capture_output=True,
-                text=True,
-                timeout=30,
+            result = await loop.run_in_executor(
+                None,
+                functools.partial(
+                    subprocess.run,
+                    [
+                        "git", "log",
+                        f"--format=%H|%an|%ai|%s",
+                        "--numstat",
+                        f"--max-count={max_commits}",
+                        f"--since={max_days} days ago",
+                    ],
+                    cwd=workspace_root,
+                    capture_output=True,
+                    text=True,
+                    timeout=30,
+                ),
             )
         except (FileNotFoundError, subprocess.TimeoutExpired):
             return 0
@@ -255,18 +262,25 @@ class GitHistoryIndexer:
         workspace_root: str,
     ) -> list[BlameEntry]:
         """Return commit context for specific lines using git blame."""
+        import asyncio
+        import functools
+        loop = asyncio.get_event_loop()
         try:
-            result = subprocess.run(
-                [
-                    "git", "blame",
-                    "-L", f"{line_start},{line_end}",
-                    "--porcelain",
-                    file_path,
-                ],
-                cwd=workspace_root,
-                capture_output=True,
-                text=True,
-                timeout=15,
+            result = await loop.run_in_executor(
+                None,
+                functools.partial(
+                    subprocess.run,
+                    [
+                        "git", "blame",
+                        "-L", f"{line_start},{line_end}",
+                        "--porcelain",
+                        file_path,
+                    ],
+                    cwd=workspace_root,
+                    capture_output=True,
+                    text=True,
+                    timeout=15,
+                ),
             )
         except (FileNotFoundError, subprocess.TimeoutExpired):
             return []
@@ -339,11 +353,11 @@ def _cheap_summary(commit: CommitRecord) -> str | None:
 
 def _human_age(committed_at: str) -> str:
     """Convert a git ISO datetime string to a human-readable age."""
+    import re as _re
     try:
-        # git outputs e.g. "2026-06-12 10:30:00 +0800"
-        # parse naively by splitting off timezone
-        dt_str = committed_at.split("+")[0].split("-0")[0].strip()
-        dt = datetime.fromisoformat(dt_str)
+        # Strip trailing timezone offset ([+-]HH:MM or [+-]HHMM or Z) robustly
+        clean = _re.sub(r'[+-]\d{2}:?\d{2}$', '', committed_at.replace('T', ' ')).strip()
+        dt = datetime.fromisoformat(clean)
         now = datetime.now()
         delta_days = (now - dt).days
         if delta_days == 0:

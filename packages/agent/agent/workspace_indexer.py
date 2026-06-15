@@ -81,12 +81,13 @@ class WorkspaceIndexer:
             )
             symbols_extracted += len(symbols)
 
-            await conn.execute("DELETE FROM symbols WHERE file_path = ?", (file_path,))
+            # Delete stale relationships BEFORE deleting symbols (subquery needs them)
             await conn.execute(
                 "DELETE FROM symbol_relationships WHERE from_symbol_id IN "
                 "(SELECT id FROM symbols WHERE file_path = ?)",
                 (file_path,),
             )
+            await conn.execute("DELETE FROM symbols WHERE file_path = ?", (file_path,))
             for symbol in symbols:
                 await conn.execute(
                     """
