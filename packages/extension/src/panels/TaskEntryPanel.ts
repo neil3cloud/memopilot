@@ -18,10 +18,19 @@ type TaskEntryMessage = WebviewOutboundMessage
 export class TaskEntryPanel extends MemoPilotPanelBase {
     public static currentPanel: TaskEntryPanel | undefined;
     private static readonly viewType = 'memopilotTaskEntry';
+    private static outputChannel: vscode.OutputChannel | undefined;
 
     private client: BackendClient | undefined;
     private flowController: TaskFlowController | undefined;
     private lastAnalysis: TaskAnalyzeResponse | undefined;
+
+    private log(msg: string): void {
+        if (!TaskEntryPanel.outputChannel) {
+            TaskEntryPanel.outputChannel = vscode.window.createOutputChannel('MemoPilot Task');
+        }
+        const ts = new Date().toISOString().slice(11, 23);
+        TaskEntryPanel.outputChannel.appendLine(`[${ts}] ${msg}`);
+    }
 
     public static createOrShow(extensionUri: vscode.Uri, client: BackendClient | undefined, flowController?: TaskFlowController): void {
         const column = vscode.window.activeTextEditor?.viewColumn ?? vscode.ViewColumn.Beside;
@@ -100,6 +109,8 @@ export class TaskEntryPanel extends MemoPilotPanelBase {
             return;
         }
 
+        this.log(`analyzeTask: "${description}" mode=${mode || 'auto'}`);
+
         this.postMessage({
             type: 'view-content',
             payload: { viewId: 'task-loading', html: '' },
@@ -113,6 +124,7 @@ export class TaskEntryPanel extends MemoPilotPanelBase {
                 notes: notes || null,
             });
             this.lastAnalysis = result;
+            this.log(`analyzeTask: SUCCESS — intent="${result.intent_summary}" mode=${result.suggested_mode} files=[${result.suggested_files.join(', ')}]`);
             this.renderAnalysisResult(result, description);
         } catch (err: unknown) {
             const msg = err instanceof Error ? err.message : String(err);
@@ -176,21 +188,40 @@ export class TaskEntryPanel extends MemoPilotPanelBase {
     }
 
     private async runContextBuild(): Promise<void> {
-        if (!this.client || !this.lastAnalysis) { return; }
+        if (!this.client || !this.lastAnalysis) {
+            this.log('runContextBuild: aborted — no client or analysis');
+            return;
+        }
+
+        this.log('runContextBuild: starting...');
+        TaskEntryPanel.outputChannel?.show(true);
 
         try {
             vscode.window.showInformationMessage('MemoPilot: Building context pack...');
             if (this.flowController) {
+                this.log('runContextBuild: using TaskFlowController.buildContext()');
+                this.log(`  → task: "${this.lastAnalysis.intent_summary}"`);
+                this.log(`  → suggested_files: [${this.lastAnalysis.suggested_files.join(', ')}]`);
+                this.log(`  → mode: ${this.lastAnalysis.suggested_mode}`);
                 await this.flowController.buildContext();
                 const state = this.flowController.getState();
+                this.log(`runContextBuild: flow state = ${state.stage}`);
+                if (state.error) {
+                    this.log(`runContextBuild: ERROR from flow — ${state.error}`);
+                    this.postMessage({ type: 'error', payload: { message: state.error } });
+                    return;
+                }
                 if (state.contextPack) {
                     const tokens = state.contextPack.total_tokens.toLocaleString();
                     const cost = state.contextPack.estimated_cost_usd.toFixed(4);
+                    this.log(`runContextBuild: SUCCESS — ${tokens} tokens, $${cost}, ${state.contextPack.files.length} files`);
                     this.postMessage({ type: 'view-content', payload: { viewId: 'context-done', html: JSON.stringify({ tokens, cost, files: state.contextPack.files.length }) } });
                     vscode.window.showInformationMessage(`MemoPilot: Context pack ready — ${tokens} tokens, $${cost}`);
+                } else {
+                    this.log('runContextBuild: no contextPack in state after buildContext()');
                 }
             } else {
-                // Fallback: call backend directly
+                this.log('runContextBuild: no flowController — calling client.buildContextPack() directly');
                 const pack = await this.client.buildContextPack({
                     task_description: this.lastAnalysis.intent_summary,
                     suggested_files: this.lastAnalysis.suggested_files,
@@ -198,43 +229,59 @@ export class TaskEntryPanel extends MemoPilotPanelBase {
                 });
                 const tokens = pack.total_tokens.toLocaleString();
                 const cost = pack.estimated_cost_usd.toFixed(4);
+                this.log(`runContextBuild: direct SUCCESS — ${tokens} tokens, $${cost}, ${pack.files.length} files`);
                 this.postMessage({ type: 'view-content', payload: { viewId: 'context-done', html: JSON.stringify({ tokens, cost, files: pack.files.length }) } });
                 vscode.window.showInformationMessage(`MemoPilot: Context pack ready — ${tokens} tokens, $${cost}`);
             }
         } catch (err: unknown) {
             const msg = err instanceof Error ? err.message : String(err);
+            this.log(`runContextBuild: EXCEPTION — ${msg}`);
             this.postMessage({ type: 'error', payload: { message: `Context build failed: ${msg}` } });
         }
     }
 
     private async runPatchGeneration(): Promise<void> {
-        if (!this.client || !this.lastAnalysis) { return; }
+        if (!this.client || !this.lastAnalysis) {
+            this.log('runPatchGeneration: aborted — no client or analysis');
+            return;
+        }
+
+        this.log('runPatchGeneration: starting full pipeline...');
+        TaskEntryPanel.outputChannel?.show(true);
 
         try {
             vscode.window.showInformationMessage('MemoPilot: Generating patch (context → route → patch)...');
             if (this.flowController) {
-                // If not already past context, run full pipeline from context
                 const state = this.flowController.getState();
+                this.log(`runPatchGeneration: current flow state = ${state.stage}`);
                 if (!state.contextPack) {
+                    this.log('runPatchGeneration: no contextPack → calling buildContext()');
                     await this.flowController.buildContext();
                 } else if (!state.modelDecision) {
+                    this.log('runPatchGeneration: no modelDecision → calling routeModel()');
                     await this.flowController.routeModel();
                 } else {
+                    this.log('runPatchGeneration: context+route ready → calling generatePatch()');
                     await this.flowController.generatePatch();
                 }
                 const finalState = this.flowController.getState();
+                this.log(`runPatchGeneration: final state = ${finalState.stage}`);
                 if (finalState.patch) {
                     const fileCount = finalState.patch.patches.length;
+                    this.log(`runPatchGeneration: SUCCESS — ${fileCount} file(s)`);
                     this.postMessage({ type: 'view-content', payload: { viewId: 'patch-done', html: JSON.stringify({ fileCount }) } });
                     vscode.window.showInformationMessage(`MemoPilot: Patch ready — ${fileCount} file(s) changed. Review in diff editor.`);
                 } else if (finalState.error) {
+                    this.log(`runPatchGeneration: ERROR — ${finalState.error}`);
                     this.postMessage({ type: 'error', payload: { message: finalState.error } });
                 }
             } else {
+                this.log('runPatchGeneration: no flowController');
                 vscode.window.showWarningMessage('MemoPilot: No flow controller available. Use the command palette to generate patches.');
             }
         } catch (err: unknown) {
             const msg = err instanceof Error ? err.message : String(err);
+            this.log(`runPatchGeneration: EXCEPTION — ${msg}`);
             this.postMessage({ type: 'error', payload: { message: `Patch generation failed: ${msg}` } });
         }
     }
