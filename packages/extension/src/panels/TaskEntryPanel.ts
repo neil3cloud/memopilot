@@ -68,12 +68,16 @@ export class TaskEntryPanel extends MemoPilotPanelBase {
                 break;
             case 'generate-context':
                 if (this.lastAnalysis) {
-                    vscode.commands.executeCommand('memopilot.buildContextPack');
+                    this.postMessage({ type: 'view-content', payload: { viewId: 'btn-loading', html: 'context' } });
+                    vscode.commands.executeCommand('memopilot.generateContextPack');
+                    vscode.window.showInformationMessage('MemoPilot: Generating context pack...');
                 }
                 break;
             case 'generate-patch':
                 if (this.lastAnalysis) {
-                    vscode.commands.executeCommand('memopilot.generatePatch');
+                    this.postMessage({ type: 'view-content', payload: { viewId: 'btn-loading', html: 'patch' } });
+                    vscode.commands.executeCommand('memopilot.generateContextPack');
+                    vscode.window.showInformationMessage('MemoPilot: Generating patch...');
                 }
                 break;
             default:
@@ -573,8 +577,14 @@ export class TaskEntryPanel extends MemoPilotPanelBase {
                 var target = e.target;
                 if (!(target instanceof Element)) return;
                 if (target.closest('#edit-btn')) { postMsg('cancel-task'); }
-                if (target.closest('#context-btn')) { postMsg('generate-context'); }
-                if (target.closest('#patch-btn')) { postMsg('generate-patch'); }
+                if (target.closest('#context-btn')) {
+                    showBtnLoading('context-btn', 'Generating Context Pack...');
+                    postMsg('generate-context');
+                }
+                if (target.closest('#patch-btn')) {
+                    showBtnLoading('patch-btn', 'Generating Patch...');
+                    postMsg('generate-patch');
+                }
             });
 
             if (modeSelect) {
@@ -591,6 +601,16 @@ export class TaskEntryPanel extends MemoPilotPanelBase {
             'document': 'Generate documentation and code comments. No code changes.',
             'investigate': 'Deep-dive root-cause analysis before making changes.'
         };
+
+        function showBtnLoading(btnId, text) {
+            var btn = document.getElementById(btnId);
+            if (btn) {
+                btn.disabled = true;
+                btn.dataset.originalText = btn.textContent;
+                btn.innerHTML = '<span class="spinner" style="width:12px;height:12px;display:inline-block;vertical-align:middle;margin-right:6px;border-width:1.5px;"></span>' + text;
+                btn.style.opacity = '0.7';
+            }
+        }
 
         function updateModeHint() {
             var mode = document.getElementById('task-mode').value;
@@ -727,6 +747,11 @@ export class TaskEntryPanel extends MemoPilotPanelBase {
                             document.getElementById('error-area').textContent = 'Failed to render analysis.';
                             resetToInput();
                         }
+                    } else if (msg.payload.viewId === 'btn-loading') {
+                        // Stepper advances to show progress
+                        var which = msg.payload.html;
+                        if (which === 'context') { updateStepper('context'); }
+                        else if (which === 'patch') { updateStepper('patch'); }
                     }
                     break;
                 case 'error':
