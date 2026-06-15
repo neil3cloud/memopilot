@@ -23,6 +23,9 @@ export class TaskEntryPanel extends MemoPilotPanelBase {
     private client: BackendClient | undefined;
     private flowController: TaskFlowController | undefined;
     private lastAnalysis: TaskAnalyzeResponse | undefined;
+    private lastTaskDescription = '';
+    private lastConstraints: string[] = [];
+    private lastMode = 'auto';
 
     private log(msg: string): void {
         if (!TaskEntryPanel.outputChannel) {
@@ -124,7 +127,14 @@ export class TaskEntryPanel extends MemoPilotPanelBase {
                 notes: notes || null,
             });
             this.lastAnalysis = result;
+            this.lastTaskDescription = description;
+            this.lastConstraints = constraints;
+            this.lastMode = mode || 'auto';
             this.log(`analyzeTask: SUCCESS — intent="${result.intent_summary}" mode=${result.suggested_mode} files=[${result.suggested_files.join(', ')}]`);
+            // Seed flow controller so buildContext() has the analysis
+            if (this.flowController) {
+                this.flowController.setAnalysis(description, constraints, this.lastMode, result);
+            }
             this.renderAnalysisResult(result, description);
         } catch (err: unknown) {
             const msg = err instanceof Error ? err.message : String(err);
@@ -199,6 +209,12 @@ export class TaskEntryPanel extends MemoPilotPanelBase {
         try {
             vscode.window.showInformationMessage('MemoPilot: Building context pack...');
             if (this.flowController) {
+                // Ensure analysis is seeded (safety check in case controller was reset)
+                const currentState = this.flowController.getState();
+                if (!currentState.analysis && this.lastAnalysis) {
+                    this.log('runContextBuild: re-seeding flow controller with analysis');
+                    this.flowController.setAnalysis(this.lastTaskDescription, this.lastConstraints, this.lastMode, this.lastAnalysis);
+                }
                 this.log('runContextBuild: using TaskFlowController.buildContext()');
                 this.log(`  → task: "${this.lastAnalysis.intent_summary}"`);
                 this.log(`  → suggested_files: [${this.lastAnalysis.suggested_files.join(', ')}]`);

@@ -56,6 +56,23 @@ export class TaskFlowController {
         return this.state;
     }
 
+    /** Seed the controller with an analysis already obtained externally */
+    setAnalysis(description: string, constraints: string[], mode: string, analysis: TaskAnalyzeResponse): void {
+        this.state = {
+            ...this.state,
+            stage: 'context_building',
+            taskDescription: description,
+            constraints,
+            mode: analysis.suggested_mode || mode,
+            analysis,
+            contextPack: undefined,
+            modelDecision: undefined,
+            patch: undefined,
+            validation: undefined,
+            error: undefined,
+        };
+    }
+
     onStageChange(listener: StageChangeListener): vscode.Disposable {
         this.listeners.push(listener);
         return new vscode.Disposable(() => {
