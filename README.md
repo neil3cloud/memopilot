@@ -155,9 +155,21 @@ docs/          — Product documentation
 | BM25 polarity fix — memory recall relevance scores now correct (FTS5 returns negatives) |
 | Recency boost — recently-relevant memory items score higher in recall |
 
+### Workflow Intelligence + UI Redesign (v2.6)
+
+| Feature |
+|---------|
+| Plan Mode — store, recall, and enforce multi-step actionable plans |
+| Autofix classifier — safe/unsafe validation failure classification with auto-fix pipeline |
+| Structured rejection learning — per-category handlers with constraint injection |
+| Investigation → Plan loop — generate executable plans from investigation findings |
+| Task pattern detection — recurring task recognition and similar-task recall |
+| Smart memory timing — auto-confirm gate with derivation source validation |
+| TaskEntryPanel UI redesign — card-based workflow with stepper, guardrails, badges |
+
 ## Current Implementation Status
 
-**Completed:** Phases 1–31 (All phases through v2.5 + Feature Refinement + Tool Mode + Context Accuracy Refinement) — Full Remediation + Refinement + Tool Integration + Context Accuracy
+**Completed:** Phases 1–32 (All phases through v2.6 + Feature Refinement + Tool Mode + Context Accuracy + Workflow Intelligence) — Full Remediation + Refinement + Tool Integration + Context Accuracy + Workflow Intelligence
 
 - **Schema Remediation (26 issues resolved):** Lockfile format with schema/api version, FTS5 sync triggers, governance migration (memory_class, memory_status, visibility_scope, reusable, review_required), trust level inverted (5=best), supersedes_id removed in favor of memory_relations, schema constraints, snapshots folder spec
 - **Workflow Correctness:** Patch apply via `git apply --check` with snapshot rollback, response cache quality filter (success-only, disabled for critical tasks), investigation sessions (pre-task evidence), 8 investigation API endpoints, task classifier two-pass priority (file type > directory), workspace profile YAML as source of truth, per-command validation timeouts, MCP per-context caps (pre_fetch=8, patch=5, investigation=12)
@@ -167,8 +179,9 @@ docs/          — Product documentation
 - **Feature Refinement (Phases 24–29):** Budget-aware context packs with per-tier token caps, tiered approval gate (scroll gate + type-to-confirm for critical patches), memory manager bulk actions with usage signals and ranked suggestions, outcome-based model routing with cost comparison, validation baseline diffing with auto-retry and failure categorisation, graduated cost guard with status bar integration and savings reporting
 - **Tool Mode (Phase 30):** 6 callable LM tools for Copilot Chat, Cursor MCP server, bounded Markdown renderer (8000/2000 caps), post-hoc patch review with memory writeback proposals, tool call audit logging, per-caller sessions, first-use approval, Cursor token injection
 - **Context Accuracy Refinement (Phase 31):** Structural call graph (Layer 3: callers/callees via recursive CTE), git commit history (Layer 4: recency-weighted per-file history), content deduplication (5-gram shingling, 70% overlap), context quality scoring (6-factor, good/acceptable/poor/rebuild verdicts), rejection learning, Context Pack quality indicator in sidebar, LSP context enrichment provider
+- **Workflow Intelligence + UI Redesign (Phase 32):** Plan mode (store/recall/compliance), autofix classifier (safe/unsafe patterns), structured rejection with per-category learning, investigation-to-plan loop, task pattern detection, smart memory timing with auto-confirm gate, TaskEntryPanel card-based UI redesign with workflow stepper and theme-compliant color-mix() styling
 - Full UI Implementation (17 views, zero placeholders)
-- 249 tests passing, 0 lint errors
+- 286+ tests passing, 0 lint errors
 
 ### UI Implementation (Latest — June 2026)
 
@@ -233,6 +246,15 @@ All v2 waves are implemented:
 | `context_quality_scorer.py` | 6-factor context quality scoring with verdicts |
 | `context_deduplicator.py` | 5-gram shingling deduplication (70% overlap threshold) |
 | `git_history_indexer.py` | Git commit history indexing and retrieval; blame context |
+
+### New Backend Modules (Workflow Intelligence — June 2026)
+
+| Module | Purpose |
+|--------|---------|
+| `plan_service.py` | Store, recall, and check compliance of multi-step plans |
+| `autofix_classifier.py` | Classify validation failures as safe/unsafe for auto-fix |
+| `rejection_handler.py` | Per-category rejection learning with constraint injection |
+| `task_pattern_detector.py` | Recurring task pattern detection and similar-task recall |
 
 ## Development
 
