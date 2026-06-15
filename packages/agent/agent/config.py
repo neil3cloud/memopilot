@@ -25,7 +25,7 @@ class Config:
     global_dir: Path
     log_level: str = "info"
     api_version: int = 1
-    schema_version: int = 18
+    schema_version: int = 21
     monthly_budget_usd: float = 20.0
     budget_profile: str = "balanced"
     validation_default_timeout: int = 60

@@ -230,6 +230,78 @@ class MemoryManagerService:
         await conn.commit()
         return SuggestMemoryOutcome(memory_item_id=item_id, pending_approval=True)
 
+    async def suggest_memory_update_smart(
+        self,
+        *,
+        title: str,
+        body: str,
+        source: str,
+        source_path: str | None = None,
+        tags: dict[str, Any] | None = None,
+        task_run_id: str | None = None,
+        workspace_root: str | None = None,
+        memory_class: str = "fact",
+        derivation_source: str | None = None,
+    ) -> SuggestMemoryOutcome:
+        conn = await self._db.connect()
+        normalized_root = self._normalize_workspace_root(workspace_root)
+        blocked_reason = self._get_blocked_reason(title=title, body=body)
+        if blocked_reason is not None:
+            artifact_id = await self._store_blocked_artifact(
+                conn=conn,
+                title=title,
+                body=body,
+                blocked_reason=blocked_reason,
+                task_run_id=task_run_id,
+                workspace_root=normalized_root,
+            )
+            await conn.commit()
+            return SuggestMemoryOutcome(
+                memory_item_id=None,
+                pending_approval=False,
+                artifact_id=artifact_id,
+                blocked_reason=blocked_reason,
+            )
+
+        auto_confirm = memory_class == "fact" and derivation_source in {"git_diff", "call_graph"}
+        item_id = uuid.uuid4().hex
+        merged_tags: dict[str, Any] = dict(tags or {})
+        merged_tags["pending_approval"] = not auto_confirm
+        if auto_confirm:
+            merged_tags["approved"] = True
+        if derivation_source is not None:
+            merged_tags["derivation_source"] = derivation_source
+
+        await conn.execute(
+            """
+            INSERT INTO memory_items
+            (
+                id, type, title, body, source, source_path, source_hash,
+                trust_level, tags_json, stale, memory_class, memory_status,
+                visibility_scope, reusable, review_required, workspace_root
+            )
+            VALUES (
+                ?, 'ai_summary', ?, ?, ?, ?, NULL, 4, ?, 0, ?, ?,
+                'workspace', ?, ?, ?
+            )
+            """,
+            (
+                item_id,
+                title,
+                body,
+                source,
+                source_path,
+                json.dumps(merged_tags),
+                memory_class,
+                "confirmed" if auto_confirm else "pending_review",
+                1 if auto_confirm else 0,
+                0 if auto_confirm else 1,
+                normalized_root,
+            ),
+        )
+        await conn.commit()
+        return SuggestMemoryOutcome(memory_item_id=item_id, pending_approval=not auto_confirm)
+
     async def approve_item(self, item_id: str, *, workspace_root: str | None = None) -> None:
         conn = await self._db.connect()
         item = await self._fetch_item_row(item_id, workspace_root=workspace_root)
@@ -431,6 +503,66 @@ class MemoryManagerService:
         cursor = await conn.execute(query, tuple(params))
         rows = await cursor.fetchall()
         return await self._rows_to_items(rows)
+
+    async def get_pending_proposals_for_module(
+        self,
+        *,
+        module_path: str,
+        workspace_root: str | None = None,
+        limit: int = 10,
+    ) -> list[MemoryItem]:
+        normalized_module_path = module_path.strip().replace("\\", "/")
+        if not normalized_module_path:
+            return []
+
+        conn = await self._db.connect()
+        normalized_root = self._normalize_workspace_root(workspace_root)
+        query = """
+            SELECT
+                id, type, title, body, source, source_path, trust_level,
+                stale, tags_json, COALESCE(memory_class, 'fact') AS memory_class,
+                COALESCE(memory_status, 'discovered') AS memory_status,
+                COALESCE(visibility_scope, 'workspace') AS visibility_scope,
+                reusable, review_required, created_at, updated_at
+            FROM memory_items
+            WHERE memory_status = 'pending_review'
+              AND (
+                    REPLACE(COALESCE(source_path, ''), '\\', '/') LIKE ?
+                 OR REPLACE(body, '\\', '/') LIKE ?
+              )
+        """
+        params: list[Any] = [f"%{normalized_module_path}%", f"%{normalized_module_path}%"]
+        if normalized_root is not None:
+            query += " AND COALESCE(workspace_root, ?) = ?"
+            params.extend([normalized_root, normalized_root])
+        query += " ORDER BY updated_at DESC LIMIT ?"
+        params.append(limit)
+
+        cursor = await conn.execute(query, tuple(params))
+        rows = await cursor.fetchall()
+        items = await self._rows_to_items(rows)
+
+        grouped_items: dict[tuple[int, str], list[MemoryItem]] = {}
+        for item in items:
+            normalized_source_path = (item.source_path or "").replace("\\", "/")
+            if normalized_module_path in normalized_source_path:
+                matched_prefix = normalized_source_path.split(normalized_module_path, 1)[0]
+                group_key = (0, matched_prefix.rstrip("/"))
+            elif normalized_source_path:
+                group_key = (
+                    1,
+                    normalized_source_path.rsplit("/", 1)[0]
+                    if "/" in normalized_source_path
+                    else normalized_source_path,
+                )
+            else:
+                group_key = (2, "")
+            grouped_items.setdefault(group_key, []).append(item)
+
+        ordered_items: list[MemoryItem] = []
+        for group_key in sorted(grouped_items):
+            ordered_items.extend(grouped_items[group_key])
+        return ordered_items
 
     async def list_unused_memories(
         self,

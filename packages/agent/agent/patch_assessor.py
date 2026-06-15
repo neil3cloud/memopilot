@@ -68,14 +68,38 @@ class PatchAssessorService:
         score = max(0.0, min(1.0, score))
         patch_attempt_id = uuid.uuid4().hex
         conn = await self._db.connect()
+
+        # Check plan compliance if a plan is linked to this task
+        plan_memory_id = None
+        try:
+            cursor = await conn.execute(
+                "SELECT plan_memory_id FROM task_runs WHERE id = ?",
+                (task_run_id,),
+            )
+            row = await cursor.fetchone()
+            if row and row[0]:
+                plan_memory_id = row[0]
+                from .plan_service import PlanModeService
+                plan_service = PlanModeService(config=self._config, db=self._db)
+                plan_warnings = await plan_service.check_plan_compliance(
+                    plan_memory_id=plan_memory_id,
+                    files_changed=files_changed,
+                )
+                if plan_warnings:
+                    reasons.extend(plan_warnings)
+                    score = max(0.0, score - 0.15 * len(plan_warnings))
+        except Exception:
+            pass
+
         await conn.execute(
             """
             INSERT INTO patch_attempts
             (
                 id, task_run_id, patch_path, files_changed_json,
-                risk_level, rule_compliance_score, approved, applied, validation_status
+                risk_level, rule_compliance_score, approved, applied,
+                validation_status, plan_memory_id
             )
-            VALUES (?, ?, ?, ?, ?, ?, 0, 0, ?)
+            VALUES (?, ?, ?, ?, ?, ?, 0, 0, ?, ?)
             """,
             (
                 patch_attempt_id,
@@ -85,6 +109,7 @@ class PatchAssessorService:
                 risk_level,
                 score,
                 "pending",
+                plan_memory_id,
             ),
         )
         await conn.commit()
