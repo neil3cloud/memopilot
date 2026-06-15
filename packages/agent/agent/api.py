@@ -77,6 +77,15 @@ from .workspace_indexer import WorkspaceIndexer
 from .workspace_init import ensure_global_config
 from .workspace_profile_service import WorkspaceProfileService
 from .workspace_roots import WorkspaceRootsService
+from .context_quality_scorer import (
+    ContextPackSnapshot,
+    score_context_pack,
+    build_quality_warning,
+)
+from .context_deduplicator import deduplicate_text_list
+from .repo_map_generator import RepoMapGenerator
+from .git_history_indexer import GitHistoryIndexer
+from .graph_retriever import GraphRetriever
 
 logger = logging.getLogger(__name__)
 
@@ -230,6 +239,20 @@ class StaleExclusionsResponse(BaseModel):
     rebuild_command: str | None = None
 
 
+class ContextQualityScoreResponse(BaseModel):
+    total: float
+    has_primary_symbol: bool
+    has_callers: bool
+    has_related_tests: bool
+    has_active_rules: bool
+    has_recent_history: bool
+    stale_exclusion_pct: float
+    dedup_savings_pct: float
+    graph_expansion_files: int
+    verdict: str            # 'good' | 'acceptable' | 'poor' | 'rebuild'
+    missing_signals: list[str] = Field(default_factory=list)
+
+
 class ContextBuildResponse(BaseModel):
     files: list[ContextFileEntry]
     rules: list[str]
@@ -241,6 +264,10 @@ class ContextBuildResponse(BaseModel):
     stale_exclusions: StaleExclusionsResponse | None = None
     included_items: list[dict[str, object]] | None = None
     excluded_items: list[dict[str, object]] | None = None
+    quality_score: ContextQualityScoreResponse | None = None
+    callers_not_in_context: list[str] | None = None     # file paths of callers not included
+    repo_map: str | None = None                          # compact structural overview
+    commit_history: str | None = None                    # structured decision history
 
 
 class ModelRouteRequest(BaseModel):
@@ -1885,6 +1912,20 @@ def _estimate_context_tokens(text: str) -> int:
     return max(1, (len(text) + 3) // 4)
 
 
+def _extract_primary_symbol(task_description: str) -> str | None:
+    """Heuristically extract the primary symbol name from a task description."""
+    import re
+    # Look for CamelCase class names or snake_case function names in backticks or quotes
+    for pattern in (r"`([A-Za-z_][A-Za-z0-9_.]+)`", r"'([A-Za-z_][A-Za-z0-9_.]+)'",
+                    r'"([A-Za-z_][A-Za-z0-9_.]+)"'):
+        m = re.search(pattern, task_description)
+        if m:
+            return m.group(1)
+    # Fall back: first CamelCase word
+    m = re.search(r'\b([A-Z][a-z]+(?:[A-Z][a-z]+)+)\b', task_description)
+    return m.group(1) if m else None
+
+
 def _serialize_context_item(item: ContextItem) -> dict[str, object]:
     return {
         "content": item.content,
@@ -2164,9 +2205,107 @@ async def _generate_context_pack_response(request: ContextBuildRequest) -> Conte
         ],
     )
 
+    # ── Layer 3: structural graph (callers not in context) ────────────────────
+    callers_not_in_context: list[str] = []
+    graph_expansion_files = 0
+    try:
+        graph = GraphRetriever(db=db)
+        included_file_paths = {e.path for e in file_entries}
+        conn = await db.connect()
+        cursor = await conn.execute(
+            """
+            SELECT id FROM symbols
+            WHERE file_path IN ({})
+              AND kind IN ('function', 'class', 'method')
+            LIMIT 1
+            """.format(",".join("?" * len(list(included_file_paths)))),
+            list(included_file_paths) or ["__none__"],
+        )
+        primary_row = await cursor.fetchone()
+        if primary_row:
+            callers_missing = await graph.find_callers_not_in_context(
+                primary_row["id"], included_file_paths
+            )
+            callers_not_in_context = list({c.file_path for c in callers_missing})
+            graph_expansion_files = len(
+                {c.file_path for c in callers_missing if c.file_path in included_file_paths}
+            )
+    except Exception:
+        pass
+
+    # ── Layer 4: git history ──────────────────────────────────────────────────
+    commit_history_text: str | None = None
+    try:
+        git_indexer = GitHistoryIndexer(db=db)
+        commits = await git_indexer.get_relevant_commits(
+            file_paths=list(included_file_paths),
+            task_description=request.task_description,
+            workspace_root=workspace_root or "",
+        )
+        if commits:
+            commit_history_text = git_indexer.format_commit_history_for_context(
+                commits, list(included_file_paths)
+            )
+    except Exception:
+        pass
+
+    # ── Repo map ──────────────────────────────────────────────────────────────
+    repo_map_text: str | None = None
+    try:
+        repo_gen = RepoMapGenerator(db=db)
+        repo_map_text = await repo_gen.generate(
+            workspace_root=workspace_root or "", max_tokens=500
+        )
+    except Exception:
+        pass
+
+    # ── Deduplication ─────────────────────────────────────────────────────────
+    all_rule_texts = included_rules[:]
+    if all_rule_texts:
+        deduped_rules, dedup_savings_pct = deduplicate_text_list(all_rule_texts)
+        included_rules_final = deduped_rules
+    else:
+        dedup_savings_pct = 0.0
+        included_rules_final = included_rules
+
+    # ── Quality scoring ───────────────────────────────────────────────────────
+    stale_pct = 0.0
+    if budget_summary and isinstance(budget_summary, dict):
+        stale_count = budget_summary.get("stale_exclusion_count", 0) or 0
+        total_count = budget_summary.get("total_recall_count", 1) or 1
+        stale_pct = min(1.0, stale_count / total_count)
+
+    source_types = [item.source_type for item in included_items]
+    if commit_history_text:
+        source_types.append("commit")
+
+    quality_pack = ContextPackSnapshot(
+        files=[e.path for e in file_entries],
+        rules=included_rules_final,
+        source_types=source_types,
+        stale_exclusion_pct=stale_pct,
+        dedup_savings_pct=dedup_savings_pct,
+        graph_expansion_files=graph_expansion_files,
+        primary_symbol=_extract_primary_symbol(request.task_description),
+    )
+    quality = score_context_pack(quality_pack, task_description=request.task_description)
+    quality_response = ContextQualityScoreResponse(**quality.as_dict())
+
     return ContextBuildResponse(
-        **response_payload,
+        files=file_entries,
+        rules=included_rules_final,
+        skills=included_skills,
+        total_tokens=total_tokens,
+        estimated_cost_usd=round(estimated_cost, 6),
         context_pack_hash=context_pack_hash,
+        budget_summary=budget_summary,
+        stale_exclusions=stale_exclusions,
+        included_items=serialized_included_items,
+        excluded_items=serialized_excluded_items,
+        quality_score=quality_response,
+        callers_not_in_context=callers_not_in_context or None,
+        repo_map=repo_map_text,
+        commit_history=commit_history_text,
     )
 
 
