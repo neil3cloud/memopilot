@@ -83,6 +83,15 @@ class TestClassifyDiagnostic:
         )
         assert result.safety == AutofixSafety.REQUIRES_MANUAL
 
+    def test_undefined_variable_is_manual(self):
+        """F821 / undefined name requires manual review — may indicate real bugs."""
+        result = classify_diagnostic(
+            code="F821", message="undefined name 'foo'",
+            file_path="main.py", line=10
+        )
+        assert result.safety == AutofixSafety.REQUIRES_MANUAL
+        assert result.category == "undefined_variable"
+
 
 class TestClassifyDiagnostics:
     """Test batch classification."""

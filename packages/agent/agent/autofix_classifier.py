@@ -36,7 +36,6 @@ AUTOFIX_SAFE_PATTERNS: list[tuple[str, re.Pattern[str]]] = [
     ("missing_type_annotation", re.compile(r"(?i)type\s+annotation\s+missing|ANN")),
     ("unreachable_code", re.compile(r"(?i)unreachable\s+(code|statement)")),
     ("deprecated_call", re.compile(r"(?i)deprecated\s+(function|method|call)|W0deprecated")),
-    ("undefined_variable_simple", re.compile(r"(?i)undefined\s+(name|variable)|F821")),
     ("missing_return_type", re.compile(r"(?i)missing\s+return\s+type")),
     ("redundant_pass", re.compile(r"(?i)redundant\s+pass|PIE790")),
     ("unnecessary_semicolon", re.compile(r"(?i)unnecessary\s+semicolon|E703")),
@@ -57,6 +56,7 @@ AUTOFIX_UNSAFE_PATTERNS: list[tuple[str, re.Pattern[str]]] = [
     ("type_incompatible", re.compile(
         r"(?i)incompatible\s+type|argument.*has\s+incompatible|mypy.*error"
     )),
+    ("undefined_variable", re.compile(r"(?i)undefined\s+(name|variable)|F821")),
 ]
 
 

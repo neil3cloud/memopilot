@@ -701,7 +701,12 @@ class SuggestMemoryRequest(BaseModel):
 
 class SmartSuggestMemoryRequest(SuggestMemoryRequest):
     memory_class: str = "fact"
-    derivation_source: str | None = None
+    derivation_source: str | None = Field(
+        default=None,
+        pattern=r"^(git_diff|call_graph|code_analysis)$",
+        description="Must be 'git_diff', 'call_graph', or 'code_analysis'. "
+        "Auto-confirmation only applies when task_run_id is also provided.",
+    )
 
 
 class SuggestMemoryResponse(BaseModel):

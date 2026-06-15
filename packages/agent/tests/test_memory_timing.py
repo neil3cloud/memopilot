@@ -94,6 +94,7 @@ async def test_factual_git_diff_proposals_auto_confirm(config: Config, db: Datab
         workspace_root=str(config.workspace_path),
         memory_class="fact",
         derivation_source="git_diff",
+        task_run_id="task-auto-1",
     )
 
     assert outcome.memory_item_id is not None
@@ -120,6 +121,7 @@ async def test_factual_call_graph_proposals_auto_confirm(config: Config, db: Dat
         workspace_root=str(config.workspace_path),
         memory_class="fact",
         derivation_source="call_graph",
+        task_run_id="task-auto-2",
     )
 
     assert outcome.memory_item_id is not None
@@ -258,6 +260,7 @@ async def test_smart_suggest_endpoint_auto_confirms_fact_from_git_diff(
             "source_path": "src/app/module.py",
             "memory_class": "fact",
             "derivation_source": "git_diff",
+            "task_run_id": "task-endpoint-1",
         },
     )
 

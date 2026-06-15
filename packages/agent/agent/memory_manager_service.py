@@ -263,7 +263,11 @@ class MemoryManagerService:
                 blocked_reason=blocked_reason,
             )
 
-        auto_confirm = memory_class == "fact" and derivation_source in {"git_diff", "call_graph"}
+        auto_confirm = (
+            memory_class == "fact"
+            and derivation_source in {"git_diff", "call_graph"}
+            and task_run_id is not None
+        )
         item_id = uuid.uuid4().hex
         merged_tags: dict[str, Any] = dict(tags or {})
         merged_tags["pending_approval"] = not auto_confirm
