@@ -176,7 +176,8 @@ export class TaskEntryPanel extends MemoPilotPanelBase {
     private getStyles(): string {
         return `
             /* Layout */
-            .task-panel { max-width: 640px; margin: 0 auto; padding: 24px 20px; }
+            body { overflow-y: auto !important; height: auto !important; }
+            .task-panel { max-width: 640px; margin: 0 auto; padding: 24px 20px 48px; }
 
             /* Header */
             .task-header { margin-bottom: 24px; }
