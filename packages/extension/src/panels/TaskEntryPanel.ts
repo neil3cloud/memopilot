@@ -768,15 +768,15 @@ export class TaskEntryPanel extends MemoPilotPanelBase {
                     <button id="context-btn" class="mp-btn">Generate Context Pack</button>
                     <button id="edit-btn" class="mp-btn-secondary">← Edit Task</button>
                 </div>
-                <div class="actions-bar" id="step-context-bar" style="display:none;">
+                <div class="actions-bar hidden" id="step-context-bar">
                     <button id="patch-btn" class="mp-btn">Generate Patch</button>
                     <button id="edit-btn-2" class="mp-btn-secondary">← Edit Task</button>
                 </div>
-                <div class="actions-bar" id="approval-bar" style="display:none;">
+                <div class="actions-bar hidden" id="approval-bar">
                     <button id="approve-btn" class="mp-btn mp-btn-approve">✓ Approve &amp; Apply Patch</button>
                     <button id="reject-btn" class="mp-btn-secondary mp-btn-reject">✗ Reject Patch</button>
                 </div>
-                <div class="actions-bar" id="step-done-bar" style="display:none;">
+                <div class="actions-bar hidden" id="step-done-bar">
                     <span class="done-msg">✓ Patch applied successfully.</span>
                     <button id="new-task-btn" class="mp-btn-secondary">+ New Task</button>
                 </div>
@@ -850,7 +850,12 @@ export class TaskEntryPanel extends MemoPilotPanelBase {
             var bars = ['step-analyze-bar', 'step-context-bar', 'approval-bar', 'step-done-bar'];
             bars.forEach(function(id) {
                 var el = document.getElementById(id);
-                if (el) el.style.display = (id === stepId) ? 'flex' : 'none';
+                if (!el) return;
+                if (id === stepId) {
+                    el.classList.remove('hidden');
+                } else {
+                    el.classList.add('hidden');
+                }
             });
         }
 
