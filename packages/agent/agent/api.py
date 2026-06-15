@@ -21,6 +21,7 @@ import os
 import re
 import sys
 import uuid
+from datetime import UTC, datetime
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, Request
@@ -42,9 +43,9 @@ from .code_review_memory import (
 )
 from .config import Config
 from .context_budget import (
+    TIER_ORDER_BY_TASK_TYPE,
     ContextBudget,
     ContextItem,
-    TIER_ORDER_BY_TASK_TYPE,
     build_budget_aware_context_pack,
 )
 from .context_builder import ContextBuilderService
@@ -59,7 +60,7 @@ from .mcp_orchestrator import MCPOrchestrator, ToolCall
 from .memory_manager_service import MemoryManagerService
 from .memory_recall import MemoryRecallService, RecallRequest, RecallResponse
 from .migration_runner import run_migrations
-from .model_router import ModelTier, TIER_ORDER, get_outcome_routing_hint
+from .model_router import TIER_ORDER, ModelTier, get_outcome_routing_hint
 from .patch_assessor import PatchAssessorService
 from .policy_packs import PolicyPacksService
 from .privacy_dashboard_service import PrivacyDashboardService
@@ -70,11 +71,21 @@ from .retention import enforce_retention
 from .review_memory_mode import CodeReviewMemoryModeService
 from .security_policy import CredentialRedactor, DatabaseWriteBlocker
 from .skill_loader import SkillLoaderService
+from .tool_mode_router import create_tool_mode_routes
 from .validation_runner import ValidationCommand, ValidationRunner
 from .workspace_indexer import WorkspaceIndexer
 from .workspace_init import ensure_global_config
 from .workspace_profile_service import WorkspaceProfileService
 from .workspace_roots import WorkspaceRootsService
+from .context_quality_scorer import (
+    ContextPackSnapshot,
+    score_context_pack,
+    build_quality_warning,
+)
+from .context_deduplicator import deduplicate_text_list
+from .repo_map_generator import RepoMapGenerator
+from .git_history_indexer import GitHistoryIndexer
+from .graph_retriever import GraphRetriever
 
 logger = logging.getLogger(__name__)
 
@@ -211,6 +222,9 @@ class ContextBuildRequest(BaseModel):
     workspace_root: str | None = None
     task_type: str | None = None
     model_max_tokens: int | None = Field(default=None, ge=1)
+    caller: str = "memopilot_ui"
+    output_format: str = "full"
+    max_output_tokens: int = 8000
 
 
 class ContextFileEntry(BaseModel):
@@ -225,6 +239,20 @@ class StaleExclusionsResponse(BaseModel):
     rebuild_command: str | None = None
 
 
+class ContextQualityScoreResponse(BaseModel):
+    total: float
+    has_primary_symbol: bool
+    has_callers: bool
+    has_related_tests: bool
+    has_active_rules: bool
+    has_recent_history: bool
+    stale_exclusion_pct: float
+    dedup_savings_pct: float
+    graph_expansion_files: int
+    verdict: str            # 'good' | 'acceptable' | 'poor' | 'rebuild'
+    missing_signals: list[str] = Field(default_factory=list)
+
+
 class ContextBuildResponse(BaseModel):
     files: list[ContextFileEntry]
     rules: list[str]
@@ -236,6 +264,10 @@ class ContextBuildResponse(BaseModel):
     stale_exclusions: StaleExclusionsResponse | None = None
     included_items: list[dict[str, object]] | None = None
     excluded_items: list[dict[str, object]] | None = None
+    quality_score: ContextQualityScoreResponse | None = None
+    callers_not_in_context: list[str] | None = None     # file paths of callers not included
+    repo_map: str | None = None                          # compact structural overview
+    commit_history: str | None = None                    # structured decision history
 
 
 class ModelRouteRequest(BaseModel):
@@ -337,6 +369,79 @@ class PatchRankFilesResponse(BaseModel):
     approval_tier: str
 
 
+class ReviewAppliedPatchRequest(BaseModel):
+    git_diff: str
+    workspace_root: str | None = None
+    caller: str = "memopilot_ui"
+
+
+class PatchReviewRankedFile(BaseModel):
+    path: str
+    risk_level: str
+    risk_category: str
+
+
+class PatchReviewComplianceWarning(BaseModel):
+    rule_id: str | None = None
+    message: str
+    severity: str = "warning"
+
+
+class ReviewAppliedPatchResponse(BaseModel):
+    task_run_id: str
+    risk_level: str
+    risk_category: str
+    compliance_score: float
+    compliance_passed: list[str] = Field(default_factory=list)
+    compliance_warnings: list[PatchReviewComplianceWarning] = Field(default_factory=list)
+    ranked_files: list[PatchReviewRankedFile] = Field(default_factory=list)
+    secret_detected: bool = False
+    rendered_report: str
+    patch_governance_available: bool = False
+
+
+class WritebackRequest(BaseModel):
+    outcome_summary: str
+    outcome_status: str
+    context_pack_hash: str | None = None
+    git_diff: str | None = None
+    workspace_root: str
+    caller: str = "memopilot_ui"
+
+
+class WritebackProposalResponse(BaseModel):
+    id: str
+    title: str
+    memory_class: str
+    memory_status: str
+    trust_level: int
+    reusable: bool
+
+
+class WritebackResponse(BaseModel):
+    writeback_id: str
+    task_run_id: str
+    proposals_count: int
+    blocked_content_count: int
+    already_processed: bool = False
+    rendered_summary: str
+    proposals: list[WritebackProposalResponse] = Field(default_factory=list)
+
+
+class DismissWritebackRequest(BaseModel):
+    task_run_id: str
+
+
+class DismissWritebackResponse(BaseModel):
+    status: str
+    task_run_id: str
+
+
+class PendingWritebacksResponse(BaseModel):
+    count: int
+    runs: list[dict[str, object]] = Field(default_factory=list)
+
+
 class ValidationCommandRequest(BaseModel):
     name: str
     command: list[str] = Field(min_length=1)
@@ -397,6 +502,8 @@ class CostDashboardResponse(BaseModel):
     by_day: list[CostDashboardEntry]
     by_model: list[CostDashboardEntry]
     savings_report: SavingsReportResponse | None = None
+    avg_context_quality: float | None = None     # 0.0–1.0 average quality score
+    context_quality_verdicts: dict[str, int] | None = None  # verdict → count
 
 
 class RecordAICallRequest(BaseModel):
@@ -907,6 +1014,134 @@ def _serialize_compliance_warnings(
         )
         for warning in warnings
     ]
+
+
+HIGH_RISK_PATTERNS = re.compile(
+    r"(billing|payment|invoice|auth|security|credential|secret|crypto|token)",
+    re.IGNORECASE,
+)
+CRITICAL_RISK_PATTERNS = re.compile(
+    r"(migration|schema|database|deploy|infrastructure|ci[/-]cd)",
+    re.IGNORECASE,
+)
+TEST_PATTERNS = re.compile(r"(test_|_test\.|\.test\.|spec\.)", re.IGNORECASE)
+SECRET_PATTERNS = re.compile(
+    r"(?:"
+    r"(?:api[_-]?key|secret[_-]?key|password|token|auth[_-]?token)"
+    r"\s*[=:]\s*['\"][^'\"]{8,}"
+    r"|(?:-----BEGIN (?:RSA |EC )?PRIVATE KEY-----)"
+    r"|(?:sk-[a-zA-Z0-9]{20,})"
+    r"|(?:ghp_[a-zA-Z0-9]{36})"
+    r"|(?:AKIA[A-Z0-9]{16})"
+    r")",
+    re.IGNORECASE,
+)
+
+
+def _parse_diff_files(diff_text: str) -> list[str]:
+    """Extract file paths from a unified diff."""
+    files: list[str] = []
+    seen: set[str] = set()
+    for line in diff_text.splitlines():
+        if line.startswith("+++ b/"):
+            candidate = line[6:]
+        elif line.startswith("+++ ") and not line.startswith("+++ /dev/null"):
+            candidate = line[4:]
+        else:
+            continue
+        if candidate and candidate not in seen:
+            seen.add(candidate)
+            files.append(candidate)
+    return files
+
+
+def _classify_file_risk(file_path: str) -> tuple[str, str]:
+    """Classify a file's risk level and category."""
+    if TEST_PATTERNS.search(file_path):
+        return ("low", "test coverage")
+    if CRITICAL_RISK_PATTERNS.search(file_path):
+        return ("critical", "infrastructure")
+    if HIGH_RISK_PATTERNS.search(file_path):
+        return ("high", "sensitive logic")
+    return ("medium", "general logic")
+
+
+def _check_diff_for_secrets(diff_text: str) -> bool:
+    """Check if the diff contains potential secrets."""
+    return bool(SECRET_PATTERNS.search(diff_text))
+
+
+def _render_patch_review_report(
+    *,
+    task_run_id: str,
+    overall_risk: str,
+    overall_category: str,
+    compliance_score: float,
+    compliance_passed: list[str],
+    compliance_warnings: list[PatchReviewComplianceWarning],
+    ranked_files: list[PatchReviewRankedFile],
+    secret_detected: bool,
+    caller: str,
+) -> str:
+    """Render the patch review as a Markdown report."""
+    risk_emoji = {"critical": "🔴", "high": "🟠", "medium": "🟡", "low": "🟢"}.get(
+        overall_risk,
+        "⚪",
+    )
+
+    lines = [
+        "## MemoPilot Patch Review Report\n",
+        f"**Task Run ID:** `{task_run_id}`",
+        f"**Risk Level:** {risk_emoji} {overall_risk.upper()} — {overall_category}",
+        f"**Rule Compliance Score:** {compliance_score:.0f}%",
+    ]
+
+    if caller in ("copilot_lm_tool", "cursor_mcp_tool"):
+        lines.append(
+            "**Governance Note:** This patch was applied outside MemoPilot's native flow. "
+            "Post-hoc review only — no approval gate, validation, or memory writeback occurred.\n"
+        )
+
+    lines.append("\n### Changed Files (by risk)\n")
+    for file_item in ranked_files:
+        emoji = {"critical": "🔴", "high": "🟠", "medium": "🟡", "low": "🟢"}.get(
+            file_item.risk_level,
+            "⚪",
+        )
+        lines.append(
+            f"{emoji} {file_item.risk_level.upper():8s} "
+            f"{file_item.path}   [{file_item.risk_category}]"
+        )
+
+    lines.append("\n### Rule Compliance\n")
+    for passed in compliance_passed:
+        lines.append(f"✓ {passed}")
+    for warning in compliance_warnings:
+        lines.append(f"⚠ {warning.message}")
+
+    lines.append("\n### Secret Scan\n")
+    if secret_detected:
+        lines.append(
+            "⚠ **Potential secret detected in diff.** "
+            "Review and remove before committing."
+        )
+    else:
+        lines.append("✓ No secrets detected in diff.")
+
+    recommendations: list[str] = []
+    if secret_detected:
+        recommendations.append("Remove detected secrets from the diff immediately.")
+    if not any("test" in file_item.path.lower() for file_item in ranked_files):
+        recommendations.append("Add tests for the changed code before merging.")
+    recommendations.append(
+        "Run `MemoPilot: Run Validation` to execute tests and linters on the applied changes."
+    )
+
+    lines.append("\n### Recommended Actions\n")
+    for index, recommendation in enumerate(recommendations, start=1):
+        lines.append(f"{index}. {recommendation}")
+
+    return "\n".join(lines)
 
 
 class ProviderCapabilityItemResponse(BaseModel):
@@ -1679,6 +1914,20 @@ def _estimate_context_tokens(text: str) -> int:
     return max(1, (len(text) + 3) // 4)
 
 
+def _extract_primary_symbol(task_description: str) -> str | None:
+    """Heuristically extract the primary symbol name from a task description."""
+    import re
+    # Look for CamelCase class names or snake_case function names in backticks or quotes
+    for pattern in (r"`([A-Za-z_][A-Za-z0-9_.]+)`", r"'([A-Za-z_][A-Za-z0-9_.]+)'",
+                    r'"([A-Za-z_][A-Za-z0-9_.]+)"'):
+        m = re.search(pattern, task_description)
+        if m:
+            return m.group(1)
+    # Fall back: first CamelCase word
+    m = re.search(r'\b([A-Z][a-z]+(?:[A-Z][a-z]+)+)\b', task_description)
+    return m.group(1) if m else None
+
+
 def _serialize_context_item(item: ContextItem) -> dict[str, object]:
     return {
         "content": item.content,
@@ -1750,7 +1999,11 @@ def _build_stack_trace_items(request: ContextBuildRequest) -> list[ContextItem]:
 
 
 def _read_context_file_item(workspace_root: str, file_path: str) -> ContextItem:
-    full_path = os.path.join(workspace_root, file_path) if not os.path.isabs(file_path) else file_path
+    full_path = (
+        os.path.join(workspace_root, file_path)
+        if not os.path.isabs(file_path)
+        else file_path
+    )
     content = ""
     try:
         if os.path.exists(full_path) and os.path.isfile(full_path):
@@ -1780,7 +2033,10 @@ async def _generate_context_pack_response(request: ContextBuildRequest) -> Conte
     workspace_service = WorkspaceRootsService(config=config, db=db)
     workspace_root = str(await workspace_service.resolve_workspace_root(request.workspace_root))
 
-    file_items = [_read_context_file_item(workspace_root, file_path) for file_path in files_to_include[:20]]
+    file_items = [
+        _read_context_file_item(workspace_root, file_path)
+        for file_path in files_to_include[:20]
+    ]
 
     rules: list[str] = []
     try:
@@ -1943,13 +2199,113 @@ async def _generate_context_pack_response(request: ContextBuildRequest) -> Conte
     await recall_service.record_recall_trace(
         context_pack_hash=context_pack_hash,
         request_json=request.model_dump_json(),
-        included_memory_ids=[item.source for item in included_items if item.source_type == "memory"],
-        excluded_memory_ids=[item.source for item in excluded_items if item.source_type == "memory"],
+        included_memory_ids=[
+            item.source for item in included_items if item.source_type == "memory"
+        ],
+        excluded_memory_ids=[
+            item.source for item in excluded_items if item.source_type == "memory"
+        ],
     )
 
+    # ── Layer 3: structural graph (callers not in context) ────────────────────
+    callers_not_in_context: list[str] = []
+    graph_expansion_files = 0
+    try:
+        graph = GraphRetriever(db=db)
+        included_file_paths = {e.path for e in file_entries}
+        conn = await db.connect()
+        cursor = await conn.execute(
+            """
+            SELECT id FROM symbols
+            WHERE file_path IN ({})
+              AND kind IN ('function', 'class', 'method')
+            LIMIT 1
+            """.format(",".join("?" * len(list(included_file_paths)))),
+            list(included_file_paths) or ["__none__"],
+        )
+        primary_row = await cursor.fetchone()
+        if primary_row:
+            callers_missing = await graph.find_callers_not_in_context(
+                primary_row["id"], included_file_paths
+            )
+            callers_not_in_context = list({c.file_path for c in callers_missing})
+            graph_expansion_files = len({c.file_path for c in callers_missing})
+    except Exception:
+        pass
+
+    # ── Layer 4: git history ──────────────────────────────────────────────────
+    commit_history_text: str | None = None
+    try:
+        git_indexer = GitHistoryIndexer(db=db)
+        commits = await git_indexer.get_relevant_commits(
+            file_paths=list(included_file_paths),
+            task_description=request.task_description,
+            workspace_root=workspace_root or "",
+        )
+        if commits:
+            commit_history_text = git_indexer.format_commit_history_for_context(
+                commits, list(included_file_paths)
+            )
+    except Exception:
+        pass
+
+    # ── Repo map ──────────────────────────────────────────────────────────────
+    repo_map_text: str | None = None
+    try:
+        repo_gen = RepoMapGenerator(db=db)
+        repo_map_text = await repo_gen.generate(
+            workspace_root=workspace_root or "", max_tokens=500
+        )
+    except Exception:
+        pass
+
+    # ── Deduplication ─────────────────────────────────────────────────────────
+    all_rule_texts = included_rules[:]
+    if all_rule_texts:
+        deduped_rules, dedup_savings_pct = deduplicate_text_list(all_rule_texts)
+        included_rules_final = deduped_rules
+    else:
+        dedup_savings_pct = 0.0
+        included_rules_final = included_rules
+
+    # ── Quality scoring ───────────────────────────────────────────────────────
+    stale_pct = 0.0
+    if budget_summary and isinstance(budget_summary, dict):
+        stale_count = budget_summary.get("stale_exclusion_count", 0) or 0
+        total_count = budget_summary.get("total_recall_count", 1) or 1
+        stale_pct = min(1.0, stale_count / total_count)
+
+    source_types = [item.source_type for item in included_items]
+    if commit_history_text:
+        source_types.append("commit")
+
+    quality_pack = ContextPackSnapshot(
+        files=[e.path for e in file_entries],
+        rules=included_rules_final,
+        source_types=source_types,
+        stale_exclusion_pct=stale_pct,
+        dedup_savings_pct=dedup_savings_pct,
+        graph_expansion_files=graph_expansion_files,
+        primary_symbol=_extract_primary_symbol(request.task_description),
+    )
+    quality = score_context_pack(quality_pack, task_description=request.task_description)
+    quality_response = ContextQualityScoreResponse(**quality.as_dict())
+
     return ContextBuildResponse(
-        **response_payload,
+        files=file_entries,
+        rules=included_rules_final,
+        skills=included_skills,
+        total_tokens=total_tokens,
+        estimated_cost_usd=round(estimated_cost, 6),
         context_pack_hash=context_pack_hash,
+        budget_summary=budget_summary,
+        stale_exclusions=stale_exclusions,
+        included_items=serialized_included_items,
+        excluded_items=serialized_excluded_items,
+        quality_score=quality_response,
+        callers_not_in_context=callers_not_in_context or None,
+        repo_map=repo_map_text,
+        commit_history=commit_history_text,
     )
 
 
@@ -1961,6 +2317,101 @@ async def generate_context_pack(request: ContextBuildRequest) -> ContextBuildRes
 @app.post("/v1/context/build", response_model=ContextBuildResponse, deprecated=True)
 async def build_context_pack(request: ContextBuildRequest) -> ContextBuildResponse:
     return await _generate_context_pack_response(request)
+
+
+# ── Git blame endpoint (Layer 4 supplemental) ─────────────────────────────────
+
+class BlameRequest(BaseModel):
+    file_path: str
+    line_start: int = Field(ge=1)
+    line_end: int = Field(ge=1)
+    workspace_root: str = ""
+
+
+class BlameEntryResponse(BaseModel):
+    sha: str
+    author: str
+    committed_at: str
+    line_number: int
+    line_content: str
+    commit_message: str | None = None
+
+
+class BlameResponse(BaseModel):
+    entries: list[BlameEntryResponse]
+    file_path: str
+
+
+@app.post("/v1/context/blame", response_model=BlameResponse)
+async def get_blame_context(request: BlameRequest) -> BlameResponse:
+    """Return git blame context for a line range within a file."""
+    db = _get_db()
+    indexer = GitHistoryIndexer(db=db)
+    workspace_root = request.workspace_root or str(_get_config().workspace_path.resolve())
+    entries = await indexer.get_blame_context(
+        file_path=request.file_path,
+        line_start=request.line_start,
+        line_end=request.line_end,
+        workspace_root=workspace_root,
+    )
+    return BlameResponse(
+        file_path=request.file_path,
+        entries=[
+            BlameEntryResponse(
+                sha=e.sha,
+                author=e.author,
+                committed_at=e.committed_at,
+                line_number=e.line_number,
+                line_content=e.line_content,
+                commit_message=e.commit_message,
+            )
+            for e in entries
+        ],
+    )
+
+
+# ── Rejection learning endpoint (T3-C) ────────────────────────────────────────
+
+class PatchRejectionRequest(BaseModel):
+    patch_attempt_id: str
+    rejection_reason: str
+    rejection_category: str | None = None
+
+
+class PatchRejectionResponse(BaseModel):
+    recorded: bool
+    patch_attempt_id: str
+
+
+@app.post("/v1/patch/reject", response_model=PatchRejectionResponse)
+async def record_patch_rejection(request: PatchRejectionRequest) -> PatchRejectionResponse:
+    """Record why a patch was rejected for context quality learning."""
+    valid_categories = {
+        "wrong_approach", "missed_business_rule", "wrong_file",
+        "broke_existing_behavior", "incomplete", "other",
+    }
+    category = request.rejection_category
+    if category and category not in valid_categories:
+        category = "other"
+
+    db = _get_db()
+    conn = await db.connect()
+    await conn.execute(
+        """UPDATE patch_attempts
+           SET rejection_reason = ?, rejection_category = ?
+           WHERE id = ?""",
+        (request.rejection_reason[:1000], category, request.patch_attempt_id),
+    )
+    await conn.commit()
+
+    cursor = await conn.execute(
+        "SELECT id FROM patch_attempts WHERE id = ?", (request.patch_attempt_id,)
+    )
+    row = await cursor.fetchone()
+    return PatchRejectionResponse(
+        recorded=row is not None,
+        patch_attempt_id=request.patch_attempt_id,
+    )
 
 
 @app.post("/v1/model/route", response_model=ModelRouteResponse)
@@ -2583,6 +3034,29 @@ async def cost_dashboard(days: int = 30) -> CostDashboardResponse:
     dashboard_start = now - datetime.timedelta(days=max(days, 1))
     savings = await service.get_savings_report(start_date=dashboard_start, end_date=now)
 
+    # ── Context quality metrics ───────────────────────────────────────────────
+    avg_quality: float | None = None
+    verdicts: dict[str, int] | None = None
+    try:
+        conn = await _get_db().connect()
+        cutoff = (now - datetime.timedelta(days=days)).isoformat()
+        cursor = await conn.execute(
+            """SELECT quality_score, quality_verdict
+               FROM task_runs
+               WHERE created_at >= ? AND quality_score IS NOT NULL""",
+            (cutoff,),
+        )
+        rows = await cursor.fetchall()
+        if rows:
+            scores = [r["quality_score"] for r in rows]
+            avg_quality = round(sum(scores) / len(scores), 3)
+            verdicts = {}
+            for r in rows:
+                v = r["quality_verdict"] or "unknown"
+                verdicts[v] = verdicts.get(v, 0) + 1
+    except Exception:
+        pass
+
     return CostDashboardResponse(
         period_days=days,
         total_cost_usd=round(budget.spent_usd, 4),
@@ -2592,6 +3066,8 @@ async def cost_dashboard(days: int = 30) -> CostDashboardResponse:
         by_day=by_day,
         by_model=by_model,
         savings_report=_to_savings_report_response(savings),
+        avg_context_quality=avg_quality,
+        context_quality_verdicts=verdicts,
     )
 
 
@@ -3589,6 +4065,167 @@ async def rank_patch_files_endpoint(
     )
 
 
+@app.post("/v1/task/review-applied-patch", response_model=ReviewAppliedPatchResponse)
+async def review_applied_patch(request: ReviewAppliedPatchRequest) -> ReviewAppliedPatchResponse:
+    conn = await _get_db().connect()
+
+    changed_files = _parse_diff_files(request.git_diff)
+    ranked_files: list[PatchReviewRankedFile] = []
+    overall_risk = "low"
+    overall_category = "general"
+    risk_order = {"critical": 4, "high": 3, "medium": 2, "low": 1}
+
+    for file_path in changed_files:
+        risk_level, risk_category = _classify_file_risk(file_path)
+        ranked_files.append(
+            PatchReviewRankedFile(
+                path=file_path,
+                risk_level=risk_level,
+                risk_category=risk_category,
+            )
+        )
+        if risk_order.get(risk_level, 0) > risk_order.get(overall_risk, 0):
+            overall_risk = risk_level
+            overall_category = risk_category
+
+    ranked_files.sort(key=lambda file_item: risk_order.get(file_item.risk_level, 0), reverse=True)
+    secret_detected = _check_diff_for_secrets(request.git_diff)
+
+    task_run_id = str(uuid.uuid4())
+    now = datetime.now(UTC).isoformat()
+    await conn.execute(
+        """INSERT INTO task_runs (
+               id, user_request, task_type, status, mode, risk_level,
+               workspace_root, source, patch_governance_available, created_at, updated_at
+           ) VALUES (?, ?, 'patch_review', 'success', 'tool_review', ?, ?, ?, 0, ?, ?)""",
+        [
+            task_run_id,
+            f"Post-hoc patch review ({request.caller})",
+            overall_risk,
+            request.workspace_root,
+            request.caller,
+            now,
+            now,
+        ],
+    )
+    await conn.commit()
+
+    compliance_passed: list[str] = []
+    compliance_warnings: list[PatchReviewComplianceWarning] = []
+    compliance_score = 100.0
+
+    if secret_detected:
+        compliance_warnings.append(
+            PatchReviewComplianceWarning(
+                message="Potential secret detected in diff",
+                severity="critical",
+            )
+        )
+        compliance_score -= 30.0
+    else:
+        compliance_passed.append("No secrets detected in diff")
+
+    has_tests = any("test" in file_path.lower() for file_path in changed_files)
+    if has_tests:
+        compliance_passed.append("Includes test changes")
+    elif overall_risk in {"high", "critical"}:
+        compliance_warnings.append(
+            PatchReviewComplianceWarning(
+                message="High-risk change with no test coverage",
+                severity="warning",
+            )
+        )
+        compliance_score -= 10.0
+
+    compliance_score = max(0.0, compliance_score)
+    rendered_report = _render_patch_review_report(
+        task_run_id=task_run_id,
+        overall_risk=overall_risk,
+        overall_category=overall_category,
+        compliance_score=compliance_score,
+        compliance_passed=compliance_passed,
+        compliance_warnings=compliance_warnings,
+        ranked_files=ranked_files,
+        secret_detected=secret_detected,
+        caller=request.caller,
+    )
+
+    return ReviewAppliedPatchResponse(
+        task_run_id=task_run_id,
+        risk_level=overall_risk,
+        risk_category=overall_category,
+        compliance_score=compliance_score,
+        compliance_passed=compliance_passed,
+        compliance_warnings=compliance_warnings,
+        ranked_files=ranked_files,
+        secret_detected=secret_detected,
+        rendered_report=rendered_report,
+        patch_governance_available=False,
+    )
+
+
+@app.post("/v1/tool-mode/writeback", response_model=WritebackResponse)
+async def tool_mode_writeback(request: WritebackRequest) -> WritebackResponse:
+    from .tool_mode_writeback import execute_writeback
+
+    conn = await _get_db().connect()
+    git_diff = request.git_diff or ""
+    if not git_diff.strip():
+        raise HTTPException(status_code=400, detail="git_diff is required (no diff provided)")
+
+    result = await execute_writeback(
+        conn,
+        outcome_summary=request.outcome_summary,
+        outcome_status=request.outcome_status,
+        git_diff=git_diff,
+        workspace_root=request.workspace_root,
+        caller=request.caller,
+        context_pack_hash=request.context_pack_hash,
+    )
+
+    proposals_resp = [
+        WritebackProposalResponse(
+            id=proposal.id,
+            title=proposal.title,
+            memory_class=proposal.memory_class,
+            memory_status=proposal.memory_status,
+            trust_level=proposal.trust_level,
+            reusable=proposal.reusable,
+        )
+        for proposal in result.proposals
+    ]
+
+    return WritebackResponse(
+        writeback_id=result.writeback_id,
+        task_run_id=result.task_run_id,
+        proposals_count=result.proposals_count,
+        blocked_content_count=result.blocked_content_count,
+        already_processed=result.already_processed,
+        rendered_summary=result.rendered_summary,
+        proposals=proposals_resp,
+    )
+
+
+@app.post("/v1/tool-mode/dismiss-writeback", response_model=DismissWritebackResponse)
+async def tool_mode_dismiss_writeback(
+    request: DismissWritebackRequest,
+) -> DismissWritebackResponse:
+    from .tool_mode_writeback import dismiss_writeback
+
+    conn = await _get_db().connect()
+    await dismiss_writeback(conn, request.task_run_id)
+    return DismissWritebackResponse(status="dismissed", task_run_id=request.task_run_id)
+
+
+@app.get("/v1/tool-mode/pending-writebacks", response_model=PendingWritebacksResponse)
+async def tool_mode_pending_writebacks(workspace_root: str = "") -> PendingWritebacksResponse:
+    from .tool_mode_writeback import get_pending_writebacks
+
+    conn = await _get_db().connect()
+    runs = await get_pending_writebacks(conn, workspace_root)
+    return PendingWritebacksResponse(count=len(runs), runs=runs)
+
+
 @app.get("/v1/providers/capabilities", response_model=ProviderCapabilitiesResponse)
 async def list_provider_capabilities(limit: int = 100) -> ProviderCapabilitiesResponse:
     service = ProviderRegistryService(config=_get_config(), db=_get_db())
@@ -4262,3 +4899,10 @@ def _get_db() -> DatabaseManager:
     if _db is None:
         raise HTTPException(status_code=500, detail="Database not initialized")
     return _db
+
+
+async def _get_tool_mode_db_connection():
+    return await _get_db().connect()
+
+
+app.include_router(create_tool_mode_routes(_get_tool_mode_db_connection))

@@ -342,7 +342,7 @@ export class MemoPilotPanel extends MemoPilotPanelBase {
                 html += '<div style="font-size:11px;color:var(--mp-muted);">' + status.filesScanned + ' / ' + status.totalFiles + ' files • ' + status.symbolsExtracted + ' symbols</div>';
             }
             if (!status.connected) {
-                html += '<div style="margin-top:12px;"><button class="mp-restart-btn" style="background:var(--mp-button-bg);color:var(--mp-button-fg);border:none;padding:6px 12px;border-radius:4px;cursor:pointer;">Restart Backend</button></div>';
+                html += '<div style="margin-top:12px;"><button class="mp-restart-btn mp-btn">Restart Backend</button></div>';
             }
             el.innerHTML = html;
         }

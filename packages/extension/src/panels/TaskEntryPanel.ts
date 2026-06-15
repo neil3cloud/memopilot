@@ -78,12 +78,21 @@ export class TaskEntryPanel extends MemoPilotPanelBase {
         }
 
         if (!this.client) {
-            this.postMessage({ type: 'error', payload: { message: 'Backend not connected.' } });
+            this.postMessage({ type: 'error', payload: { message: 'Backend not connected. Please restart the backend.' } });
             return;
         }
 
-        // Send loading state
-        this.postMessage({ type: 'view-content', payload: { viewId: 'task-entry', html: '<p style="color:var(--mp-muted);">$(sync~spin) Analyzing task...</p>' } });
+        // Show loading spinner in result area
+        this.postMessage({
+            type: 'view-content',
+            payload: {
+                viewId: 'task-loading',
+                html: `<div style="display:flex;align-items:center;gap:8px;padding:12px 0;color:var(--mp-muted);">
+                    <span class="codicon codicon-loading" style="animation:spin 1s linear infinite;"></span>
+                    <span>Analyzing task...</span>
+                </div>`,
+            },
+        });
 
         try {
             const result = await this.client.analyzeTask({
@@ -97,7 +106,6 @@ export class TaskEntryPanel extends MemoPilotPanelBase {
         } catch (err: unknown) {
             const msg = err instanceof Error ? err.message : String(err);
             this.postMessage({ type: 'error', payload: { message: `Analysis failed: ${msg}` } });
-            this.render();
         }
     }
 
@@ -127,7 +135,7 @@ export class TaskEntryPanel extends MemoPilotPanelBase {
                 <ul style="margin:0;padding-left:16px;font-size:12px;">${filesHtml}</ul>
 
                 <div style="margin-top:16px;display:flex;gap:8px;">
-                    <button id="edit-task-btn" style="background:transparent;color:var(--mp-fg);border:1px solid var(--mp-border);padding:6px 12px;border-radius:4px;cursor:pointer;">← Edit Task</button>
+                    <button id="edit-task-btn" class="mp-btn-secondary">← Edit Task</button>
                 </div>
             </div>`;
 
@@ -176,21 +184,12 @@ export class TaskEntryPanel extends MemoPilotPanelBase {
             .constraints-group .checkbox-item input[type="checkbox"] {
                 accent-color: var(--vscode-button-background);
             }
-            .btn-primary {
-                background: var(--vscode-button-background);
-                color: var(--vscode-button-foreground);
-                border: none;
-                padding: 8px 20px;
-                border-radius: 4px;
-                cursor: pointer;
-                font-size: 13px;
-                font-weight: 500;
-                transition: background 0.15s;
-            }
-            .btn-primary:hover { background: var(--vscode-button-hoverBackground); }
-            .btn-primary:disabled { opacity: 0.6; cursor: not-allowed; }
+            #submit-btn { font-size: 13px; }
+            #submit-btn:disabled { opacity: 0.6; cursor: not-allowed; }
             #error-area { margin-top: 8px; color: var(--mp-error); font-size: 12px; }
             #result-area { margin-top: 16px; }
+            @keyframes spin { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }
+            .codicon-loading { display: inline-block; width: 16px; height: 16px; border: 2px solid var(--mp-muted); border-top-color: var(--vscode-button-background); border-radius: 50%; }
         `;
     }
 
@@ -231,7 +230,7 @@ export class TaskEntryPanel extends MemoPilotPanelBase {
                 </label>
             </div>
 
-            <button id="submit-btn" class="btn-primary">Analyze Task</button>
+            <button id="submit-btn" class="mp-btn">Analyze Task</button>
 
             <div id="result-area"></div>
             <div id="error-area"></div>
@@ -240,12 +239,19 @@ export class TaskEntryPanel extends MemoPilotPanelBase {
 
     private buildScript(): string {
         return `<script nonce="REPLACED_BY_BASE">
-        document.getElementById('submit-btn').addEventListener('click', submitTask);
+        document.addEventListener('DOMContentLoaded', function() {
+            var submitBtn = document.getElementById('submit-btn');
+            if (submitBtn) {
+                submitBtn.addEventListener('click', submitTask);
+            }
 
-        // Delegated handler for dynamically-inserted buttons
-        document.addEventListener('click', function(e) {
-            var editBtn = e.target.closest('#edit-task-btn');
-            if (editBtn) { postMsg('cancel-task'); }
+            // Delegated handler for dynamically-inserted buttons
+            document.addEventListener('click', function(e) {
+                var target = e.target;
+                if (!(target instanceof Element)) { return; }
+                var editBtn = target.closest('#edit-task-btn');
+                if (editBtn) { postMsg('cancel-task'); }
+            });
         });
 
         function submitTask() {
@@ -267,11 +273,14 @@ export class TaskEntryPanel extends MemoPilotPanelBase {
             switch (msg.type) {
                 case 'view-content':
                     document.getElementById('result-area').innerHTML = msg.payload.html;
-                    document.getElementById('submit-btn').textContent = 'Analyze Task';
-                    document.getElementById('submit-btn').disabled = false;
+                    if (msg.payload.viewId !== 'task-loading') {
+                        document.getElementById('submit-btn').textContent = 'Analyze Task';
+                        document.getElementById('submit-btn').disabled = false;
+                    }
                     break;
                 case 'error':
                     document.getElementById('error-area').textContent = msg.payload.message;
+                    document.getElementById('result-area').innerHTML = '';
                     document.getElementById('submit-btn').textContent = 'Analyze Task';
                     document.getElementById('submit-btn').disabled = false;
                     break;

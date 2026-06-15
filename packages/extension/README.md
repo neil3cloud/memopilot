@@ -101,6 +101,17 @@ AI coding assistants are powerful — but uncontrolled. They send too much conte
 - **Decay detection** — pending review items older than 14 days with changed source flagged as DECAYED
 - Keyboard shortcuts: `A` approve, `R` reject, `E` edit, `D` delete, `Space` preview
 
+### 🔌 Tool Mode (Copilot Chat & Cursor Chat Integration)
+- **6 callable tools** exposed to Copilot Chat via VS Code Language Model Tools API
+- Tools: `memopilot-context`, `memopilot-recall`, `memopilot-rules`, `memopilot-workspace-profile`, `memopilot-memory-search`, `memopilot-review-applied-patch`
+- **MCP Server** for Cursor Chat — same tools via Model Context Protocol (stdio transport)
+- Bounded context rendering (8000 tokens for context packs, 2000 for other tools)
+- **Memory writeback** — applied diffs generate memory proposals (outcome, symbols, rules, tests)
+- All proposals enter `pending_review` — nothing auto-confirmed
+- Tool call audit logging with per-caller session tracking
+- First-use approval gate per caller
+- Automatic Cursor token injection (`.memopilot/.cursor-mcp-env`, never committed)
+
 ### 📄 Document & Artifact Ingestion
 
 | Format | Trust Level | Notes |
@@ -241,6 +252,11 @@ validation:
       timeout_seconds: 60
     ruff:
       timeout_seconds: 30
+
+tool_mode:
+  max_output_tokens: 8000     # Context tool output cap
+  other_tool_tokens: 2000     # Other tools output cap
+  writeback_max_proposals: 10 # Max proposals per diff
 ```
 
 ### Budget Profiles
@@ -290,6 +306,8 @@ validation:
 | **Manage Policy Packs** | Load/view organization policy packs |
 | **Run Local Agent Flow** | Execute a multi-step YAML workflow |
 | **Manage Workspaces** | Switch workspace in multi-root setups |
+| **Review Applied Patch** | Submit a diff for memory writeback proposals |
+| **Refresh Memory Review Queue** | Refresh pending memory proposals from tool mode |
 | **Restart Backend** | Stop and restart the Python backend |
 
 ---

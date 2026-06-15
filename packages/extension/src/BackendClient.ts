@@ -11,6 +11,17 @@ export interface InitWorkspaceResponse {
     memopilot_dir: string;
 }
 
+export interface IndexWorkspaceResponse {
+    python_project: boolean;
+    total_files_scanned: number;
+    indexed_files: number;
+    unchanged_files: number;
+    stale_files: number;
+    skipped_files: number;
+    symbols_extracted: number;
+    duration_ms: number;
+}
+
 export interface RebuildMemoryResponse {
     rebuilt: boolean;
     total_files_scanned: number;
@@ -111,6 +122,21 @@ export interface ContextBuildResponse {
     skills: string[];
     total_tokens: number;
     estimated_cost_usd: number;
+    quality_score?: {
+        total: number;
+        verdict: 'good' | 'acceptable' | 'poor' | 'rebuild';
+        missing_signals: string[];
+        has_primary_symbol: boolean;
+        has_callers: boolean;
+        has_related_tests: boolean;
+        has_active_rules: boolean;
+        has_recent_history: boolean;
+        dedup_savings_pct: number;
+        graph_expansion_files: number;
+    };
+    callers_not_in_context?: string[];
+    repo_map?: string;
+    commit_history?: string;
 }
 
 export interface ModelRouteRequest {
@@ -480,6 +506,16 @@ export class BackendClient {
         this.manager = manager;
     }
 
+    async get<T = unknown>(urlPath: string): Promise<T> {
+        const result = await this.manager.request('GET', urlPath);
+        return result as T;
+    }
+
+    async post<T = unknown>(urlPath: string, body?: unknown): Promise<T> {
+        const result = await this.manager.request('POST', urlPath, body);
+        return result as T;
+    }
+
     async health(): Promise<HealthResponse> {
         const result = await this.manager.request('GET', '/v1/health');
         return result as HealthResponse;
@@ -488,6 +524,11 @@ export class BackendClient {
     async initWorkspace(): Promise<InitWorkspaceResponse> {
         const result = await this.manager.request('POST', '/v1/workspace/init');
         return result as InitWorkspaceResponse;
+    }
+
+    async indexWorkspace(): Promise<IndexWorkspaceResponse> {
+        const result = await this.manager.request('POST', '/v1/workspace/index');
+        return result as IndexWorkspaceResponse;
     }
 
     async rebuildMemory(): Promise<RebuildMemoryResponse> {

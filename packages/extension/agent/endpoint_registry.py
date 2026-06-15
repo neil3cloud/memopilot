@@ -13,6 +13,7 @@ ENDPOINT_STATUS: dict[str, str] = {
     "POST /v1/task/generate-patch": "real",
     "POST /v1/task/apply-patch": "real",
     "POST /v1/task/validate": "real",
+    "POST /v1/task/review-applied-patch": "real",
     "GET /v1/task/history": "real",
     "GET /v1/rules/active": "real",
     "POST /v1/policies/load": "real",
@@ -55,4 +56,8 @@ ENDPOINT_STATUS: dict[str, str] = {
     "POST /v1/cost/budget-check": "real",
     # Context packs
     "GET /v1/context-pack/diff": "real",
+    # Tool mode
+    "POST /v1/tool-mode/approve-caller": "real",
+    "POST /v1/tool-mode/block-caller": "real",
+    "GET /v1/tool-mode/session-summary": "real",
 }
