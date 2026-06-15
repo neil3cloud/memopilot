@@ -78,6 +78,8 @@ class ValidationResult:
     fixed_by_patch: list[tuple[str, str]] = field(default_factory=list)
     baseline_run: list[tuple[str, str]] = field(default_factory=list)
     post_patch_run: list[tuple[str, str]] = field(default_factory=list)
+    autofix_available: bool = False
+    autofix_candidates: list[dict[str, object]] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -137,6 +139,23 @@ def classify_validation_diff(
     new_failures = post_patch_ids - baseline_ids
     fixed_by_patch = baseline_ids - post_patch_ids
 
+    # Check if new failures are autofix-safe
+    autofix_available = False
+    autofix_candidates: list[dict[str, object]] = []
+    if new_failures:
+        from .autofix_classifier import classify_diagnostic, AutofixSafety
+        for test_id, output in _select_failures(post_patch_run, new_failures):
+            candidate = classify_diagnostic(code=test_id, message=output)
+            if candidate.safety == AutofixSafety.SAFE:
+                autofix_available = True
+                autofix_candidates.append({
+                    "file_path": candidate.file_path,
+                    "line": candidate.line,
+                    "code": test_id,
+                    "message": output[:200],
+                    "category": candidate.category,
+                })
+
     return ValidationResult(
         overall_status="passed" if not new_failures else "failed",
         pre_existing_failures=_select_failures(baseline_run, pre_existing),
@@ -144,6 +163,8 @@ def classify_validation_diff(
         fixed_by_patch=_select_failures(baseline_run, fixed_by_patch),
         baseline_run=baseline_run,
         post_patch_run=post_patch_run,
+        autofix_available=autofix_available,
+        autofix_candidates=autofix_candidates,
     )
 
 
