@@ -673,8 +673,8 @@ export class TaskEntryPanel extends MemoPilotPanelBase {
             if (btn) {
                 btn.disabled = true;
                 btn.dataset.originalText = btn.textContent;
-                btn.innerHTML = '<span class="spinner" style="width:12px;height:12px;display:inline-block;vertical-align:middle;margin-right:6px;border-width:1.5px;"></span>' + text;
-                btn.style.opacity = '0.7';
+                btn.innerHTML = '<span style="width:12px;height:12px;display:inline-block;vertical-align:middle;margin-right:6px;border:2px solid rgba(255,255,255,0.3);border-top-color:var(--vscode-button-foreground);border-radius:50%;animation:spin 0.8s linear infinite;"></span>' + text;
+                btn.style.opacity = '0.8';
             }
         }
 
