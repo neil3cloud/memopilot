@@ -51,11 +51,15 @@ AI coding assistants are powerful — but uncontrolled. They send too much conte
 ### 📦 Governed Context Packs
 - Assembles only relevant files, symbols, rules, and memory into a minimal context
 - **Budget-aware allocation** — per-tier token caps prevent any single source from crowding out others
+- **Structural call graph** — callers and callees from AST relationships included alongside primary files
+- **Git commit history** — recent commits for context files included so AI knows what changed and why
+- **Content deduplication** — 5-gram shingling removes redundant chunks before sending to AI
 - Shows token cost estimates before any AI call
 - Explains why each item is included or excluded — reasons generated at selection time, not post-hoc
 - Stale memory items surfaced with rebuild prompt
 - Task-type-aware tier ordering (bug fixes prioritise stack traces; investigations prioritise history)
 - Context pack diffing shows what changed between versions
+- **Context quality score** — 6-factor weighted score with verdict (good/acceptable/poor/rebuild) visible in sidebar before patching
 
 ### 🤖 Cost-Aware Model Routing
 - Routes tasks: local model → cheap cloud → frontier (only when needed)
@@ -74,6 +78,7 @@ AI coding assistants are powerful — but uncontrolled. They send too much conte
 - Compliance warnings with inline actions (generate missing test, add docstring)
 - `git apply --check` pre-validation before any patch
 - File snapshots for instant rollback on failure
+- **Autofix pipeline** — safe validation failures (unused imports, whitespace) auto-fixed after patch without AI call
 - **Developer must approve** before any code is applied
 - **Pre-patch baseline** — validation runs before AND after patch to isolate new failures from pre-existing ones
 - Auto-retry with configurable policy (up to 2 retries + optional frontier escalation)
@@ -100,6 +105,14 @@ AI coding assistants are powerful — but uncontrolled. They send too much conte
 - "Approve High Priority Only" and "Dismiss All Low Priority" batch buttons
 - **Decay detection** — pending review items older than 14 days with changed source flagged as DECAYED
 - Keyboard shortcuts: `A` approve, `R` reject, `E` edit, `D` delete, `Space` preview
+
+### 🧩 Workflow Intelligence
+- **Plan Mode** — store multi-step plans, recall them in context, and check compliance at patch time
+- **Autofix** — validation failures classified safe/unsafe; safe issues (unused imports, whitespace) auto-fixed without AI
+- **Structured Rejection** — rejected patches create per-category lessons (style, logic, security) injected into future context
+- **Investigation → Plan** — investigation findings automatically generate executable action plans
+- **Task Patterns** — recurring tasks detected; similar past tasks recalled to inform current context
+- **Smart Memory Timing** — memory update suggestions triggered by context signals; auto-confirm only for trusted derivations (git diff, call graph)
 
 ### 🔌 Tool Mode (Copilot Chat & Cursor Chat Integration)
 - **6 callable tools** exposed to Copilot Chat via VS Code Language Model Tools API
@@ -149,12 +162,13 @@ AI coding assistants are powerful — but uncontrolled. They send too much conte
 ### The Task Flow
 
 1. **You describe a task** → MemoPilot classifies type and risk (no AI call needed)
-2. **Context pack is built** → Relevant files, rules, memory, symbols assembled
-3. **You inspect the context** → See exactly what AI will receive, token cost, model selected
-4. **AI generates a patch** → Diff preview shown in VS Code editor
-5. **You approve or reject** → Nothing happens without your consent
-6. **Validation runs** → pytest, mypy, ruff verify the patch
-7. **Memory updates** → Learnings stored locally for next time
+2. **Context pack is built** → Relevant files, rules, memory, symbols, callers, and git history assembled and deduplicated
+3. **Context quality is scored** → Verdict shown (✅ Good / ⚠️ Acceptable / 🔴 Poor / 🔴 Rebuild needed) with missing signals and callers not in context
+4. **You inspect the context** → See exactly what AI will receive, token cost, model selected
+5. **AI generates a patch** → Diff preview shown in VS Code editor
+6. **You approve or reject** → Nothing happens without your consent
+7. **Validation runs** → pytest, mypy, ruff verify the patch
+8. **Memory updates** → Learnings stored locally for next time
 
 ---
 
@@ -320,12 +334,26 @@ tool_mode:
 | **Workspace Profile** | Detected stack, languages, frameworks |
 | **Memory Manager** | Browse, filter, approve/reject memory items |
 | **Rules & Skills** | Active rules by source, skills with match criteria |
-| **Context Pack** | Files, tokens, rules, cost for current context |
+| **Context Pack** | Files, tokens, rules, cost, **quality score** (verdict + missing signals + callers not in context) |
 | **Cost Guard** | Budget bar with graduated states (green/orange/red), savings vs frontier baseline, per-task cost feedback |
 | **Privacy Dashboard** | Local-only vs. sent-to-provider data |
 | **Evidence Board** | Attached evidence with classification + trust |
 | **Task History** | Past tasks with status, model, cost, duration |
 | **MCP Tools** | Connected tool servers and available tools |
+
+### New Task Screen (Redesigned)
+
+The **New Task** screen is a card-based workflow screen guiding you through:
+
+1. **Describe** your task (description, notes, mode selection)
+2. **Guardrails** shown as chips (rules, approval, redaction, validation)
+3. **Local analysis** runs without any AI call
+4. **Structured result** — intent, mode, complexity, risk badges
+5. **Suggested files** with operation indicators (+create, ~modify, −delete)
+6. **AI boundary** — clearly shows "No AI call yet" until model is invoked
+7. **Next actions** — Generate Context Pack, Generate Patch, or Edit Task
+
+Docs-only tasks (`.md`, `.txt`, `.rst`) skip test validation messaging.
 
 ---
 

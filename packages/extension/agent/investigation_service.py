@@ -7,6 +7,7 @@ import importlib.util
 import json
 import re
 import uuid
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -22,6 +23,7 @@ from pydantic import BaseModel, Field
 from .config import Config
 from .db import DatabaseManager
 from .evidence_classifier import EvidenceSourceClassifier
+from .plan_service import PlanModeService, PlanResult, PlanStep
 from .security_policy import CredentialRedactor
 from .workspace_roots import WorkspaceRootsService
 
@@ -91,6 +93,16 @@ class InvestigationSession(BaseModel):
 class RemovedEvidence(BaseModel):
     evidence_id: str
     removed: bool = True
+
+
+@dataclass(frozen=True)
+class InvestigationFindingsSummary:
+    findings: list[str]
+    root_cause: list[str]
+    impacted_files: list[str]
+    impacted_callers: list[str]
+    acceptance_criteria: list[str]
+    task_run_id: str | None = None
 
 
 class InvestigationService:
@@ -429,6 +441,113 @@ class InvestigationService:
             missing_test_coverage=missing_coverage,
             evidence_count=len(evidence_entries),
         )
+
+    async def generate_plan_from_findings(
+        self,
+        *,
+        investigation_session_id: str,
+        workspace_root: str | None = None,
+    ) -> PlanResult:
+        conn = await self._db.connect()
+        session_row = await self._require_session(conn, session_id=investigation_session_id)
+        normalized_root = self._normalize_workspace_root(
+            workspace_root or session_row["workspace_root"]
+        )
+        summary = await self._summarize_findings(
+            conn=conn,
+            investigation_session_id=investigation_session_id,
+            workspace_root=normalized_root,
+        )
+        steps = self._build_plan_steps(summary)
+        if not steps:
+            raise ValueError("No actionable investigation findings available to build a plan")
+
+        plan_service = PlanModeService(config=self._config, db=self._db)
+        plan = await plan_service.store_plan(
+            title=f"Plan from investigation: {session_row['title']}",
+            steps=steps,
+            task_description=self._build_plan_task_description(session_row, summary),
+            workspace_root=normalized_root,
+            task_run_id=summary.task_run_id,
+        )
+        await self.store_investigation_memory(
+            investigation_session_id=investigation_session_id,
+            workspace_root=normalized_root,
+            summary=summary,
+        )
+        return plan
+
+    async def store_investigation_memory(
+        self,
+        *,
+        investigation_session_id: str,
+        workspace_root: str | None = None,
+        summary: InvestigationFindingsSummary | None = None,
+    ) -> list[str]:
+        conn = await self._db.connect()
+        session_row = await self._require_session(conn, session_id=investigation_session_id)
+        normalized_root = self._normalize_workspace_root(
+            workspace_root or session_row["workspace_root"]
+        )
+        findings_summary = summary or await self._summarize_findings(
+            conn=conn,
+            investigation_session_id=investigation_session_id,
+            workspace_root=normalized_root,
+        )
+
+        memory_ids: list[str] = []
+        root_cause_lines = findings_summary.root_cause or findings_summary.findings[:1]
+        if root_cause_lines:
+            memory_ids.append(
+                await self._store_confirmed_memory_item(
+                    conn=conn,
+                    investigation_session_id=investigation_session_id,
+                    workspace_root=normalized_root,
+                    finding_kind="root_cause",
+                    title=f"Root cause for investigation: {session_row['title']}",
+                    body=self._bullet_list(root_cause_lines),
+                    memory_class="fact",
+                    trust_level=4,
+                )
+            )
+
+        impacted_lines: list[str] = []
+        if findings_summary.impacted_files:
+            impacted_lines.append("Impacted files:")
+            impacted_lines.extend(f"- {path}" for path in findings_summary.impacted_files)
+        if findings_summary.impacted_callers:
+            impacted_lines.append("Impacted callers:")
+            impacted_lines.extend(f"- {caller}" for caller in findings_summary.impacted_callers)
+        if impacted_lines:
+            memory_ids.append(
+                await self._store_confirmed_memory_item(
+                    conn=conn,
+                    investigation_session_id=investigation_session_id,
+                    workspace_root=normalized_root,
+                    finding_kind="impacted_scope",
+                    title=f"Impacted scope for investigation: {session_row['title']}",
+                    body="\n".join(impacted_lines),
+                    memory_class="fact",
+                    trust_level=4,
+                )
+            )
+
+        if findings_summary.acceptance_criteria:
+            memory_ids.append(
+                await self._store_confirmed_memory_item(
+                    conn=conn,
+                    investigation_session_id=investigation_session_id,
+                    workspace_root=normalized_root,
+                    finding_kind="acceptance_criteria",
+                    title=f"Acceptance criteria for investigation: {session_row['title']}",
+                    body=self._bullet_list(findings_summary.acceptance_criteria),
+                    memory_class="instruction",
+                    trust_level=3,
+                )
+            )
+
+        await conn.commit()
+        return memory_ids
 
     async def _fetch_session_row(
         self,
@@ -1013,6 +1132,377 @@ class InvestigationService:
         path = context_pack_dir / file_name
         path.write_text(context_pack, encoding="utf-8")
         return str(path)
+
+    async def _summarize_findings(
+        self,
+        *,
+        conn: aiosqlite.Connection,
+        investigation_session_id: str,
+        workspace_root: str,
+    ) -> InvestigationFindingsSummary:
+        await self._require_session(conn, session_id=investigation_session_id)
+        evidence_entries = await self.list_evidence_board(
+            task_run_id=None,
+            investigation_session_id=investigation_session_id,
+            workspace_root=workspace_root,
+            conn=conn,
+        )
+        findings = self._dedupe_preserve_order(
+            finding.strip()
+            for entry in evidence_entries
+            for finding in entry.findings
+            if finding and finding.strip()
+        )
+        if not findings:
+            raise ValueError("No evidence findings available for investigation session")
+
+        extracted_files: list[str] = []
+        for finding in findings:
+            extracted_files.extend(self._extract_code_paths(finding))
+        impacted_files = self._dedupe_preserve_order(
+            extracted_files + await self._discover_impacted_files(findings)
+        )[:10]
+        impacted_callers = self._extract_impacted_callers(findings)
+        root_cause = self._extract_root_cause_findings(findings)
+        acceptance_criteria = self._extract_acceptance_criteria(
+            findings,
+            impacted_files=impacted_files,
+            impacted_callers=impacted_callers,
+            root_cause=root_cause,
+        )
+        task_run_id = await self._resolve_investigation_task_run_id(
+            conn=conn,
+            investigation_session_id=investigation_session_id,
+        )
+        return InvestigationFindingsSummary(
+            findings=findings,
+            root_cause=root_cause,
+            impacted_files=impacted_files,
+            impacted_callers=impacted_callers,
+            acceptance_criteria=acceptance_criteria,
+            task_run_id=task_run_id,
+        )
+
+    async def _resolve_investigation_task_run_id(
+        self,
+        *,
+        conn: aiosqlite.Connection,
+        investigation_session_id: str,
+    ) -> str | None:
+        cursor = await conn.execute(
+            """
+            SELECT task_run_id
+            FROM evidence_sources
+            WHERE investigation_session_id = ? AND task_run_id IS NOT NULL
+            GROUP BY task_run_id
+            ORDER BY MAX(created_at) DESC
+            LIMIT 2
+            """,
+            (investigation_session_id,),
+        )
+        rows = await cursor.fetchall()
+        task_run_ids = [str(row["task_run_id"]) for row in rows if row["task_run_id"]]
+        if len(task_run_ids) == 1:
+            return task_run_ids[0]
+
+        cursor = await conn.execute(
+            """
+            SELECT id
+            FROM task_runs
+            WHERE investigation_session_id = ?
+            ORDER BY created_at DESC
+            LIMIT 2
+            """,
+            (investigation_session_id,),
+        )
+        rows = await cursor.fetchall()
+        session_task_runs = [str(row["id"]) for row in rows if row["id"]]
+        if len(session_task_runs) == 1:
+            return session_task_runs[0]
+        return None
+
+    def _build_plan_steps(self, summary: InvestigationFindingsSummary) -> list[PlanStep]:
+        steps: list[PlanStep] = []
+        seen: set[tuple[str, str | None, str | None]] = set()
+
+        def append_step(
+            description: str,
+            *,
+            target_file: str | None = None,
+            target_symbol: str | None = None,
+        ) -> None:
+            clean_description = description.strip()
+            if not clean_description:
+                return
+            key = (clean_description.lower(), target_file, target_symbol)
+            if key in seen:
+                return
+            seen.add(key)
+            steps.append(
+                PlanStep(
+                    step_number=len(steps) + 1,
+                    description=clean_description,
+                    target_file=target_file,
+                    target_symbol=target_symbol,
+                )
+            )
+
+        primary_file = summary.impacted_files[0] if summary.impacted_files else None
+        if summary.root_cause:
+            append_step(
+                f"Fix the root cause: {self._truncate_text(summary.root_cause[0])}",
+                target_file=primary_file,
+            )
+
+        for path in summary.impacted_files[:3]:
+            append_step(
+                f"Update {path} to reflect the investigation findings",
+                target_file=path,
+            )
+
+        if summary.impacted_callers:
+            append_step(
+                "Verify impacted callers remain correct: "
+                f"{self._truncate_text(summary.impacted_callers[0])}",
+                target_file=self._extract_first_code_path(summary.impacted_callers)
+                or primary_file,
+            )
+
+        for criterion in summary.acceptance_criteria[:2]:
+            append_step(f"Add or update validation for: {self._truncate_text(criterion)}")
+
+        if not steps:
+            append_step("Review the investigation findings and implement the smallest safe fix")
+        return steps
+
+    def _build_plan_task_description(
+        self,
+        session_row: aiosqlite.Row,
+        summary: InvestigationFindingsSummary,
+    ) -> str:
+        parts = [f"Investigation: {session_row['title']}"]
+        description = str(session_row["description"] or "").strip()
+        if description:
+            parts.append(f"Description: {description}")
+        if summary.root_cause:
+            parts.append("Root cause findings: " + "; ".join(summary.root_cause[:2]))
+        if summary.acceptance_criteria:
+            parts.append("Acceptance criteria: " + "; ".join(summary.acceptance_criteria[:3]))
+        return "\n".join(parts)
+
+    async def _store_confirmed_memory_item(
+        self,
+        *,
+        conn: aiosqlite.Connection,
+        investigation_session_id: str,
+        workspace_root: str,
+        finding_kind: str,
+        title: str,
+        body: str,
+        memory_class: str,
+        trust_level: int,
+    ) -> str:
+        cursor = await conn.execute(
+            """
+            SELECT id
+            FROM memory_items
+            WHERE source = 'investigation'
+              AND json_extract(tags_json, '$.investigation_session_id') = ?
+              AND json_extract(tags_json, '$.finding_kind') = ?
+            LIMIT 1
+            """,
+            (investigation_session_id, finding_kind),
+        )
+        existing = await cursor.fetchone()
+        now = datetime.now(UTC).isoformat()
+        tags_json = json.dumps(
+            {
+                "approved": True,
+                "pending_approval": False,
+                "finding_kind": finding_kind,
+                "investigation_session_id": investigation_session_id,
+            }
+        )
+
+        if existing is not None:
+            await conn.execute(
+                """
+                UPDATE memory_items
+                SET title = ?,
+                    body = ?,
+                    trust_level = ?,
+                    tags_json = ?,
+                    stale = 0,
+                    memory_class = ?,
+                    memory_status = 'confirmed',
+                    visibility_scope = 'workspace',
+                    reusable = 1,
+                    review_required = 0,
+                    workspace_root = ?,
+                    updated_at = ?
+                WHERE id = ?
+                """,
+                (
+                    title,
+                    body,
+                    trust_level,
+                    tags_json,
+                    memory_class,
+                    workspace_root,
+                    now,
+                    existing["id"],
+                ),
+            )
+            return str(existing["id"])
+
+        memory_item_id = uuid.uuid4().hex
+        await conn.execute(
+            """
+            INSERT INTO memory_items
+            (
+                id, type, title, body, source, source_path, source_hash,
+                trust_level, tags_json, stale, memory_class, memory_status,
+                visibility_scope, reusable, review_required, workspace_root,
+                created_at, updated_at
+            )
+            VALUES (
+                ?, 'ai_summary', ?, ?, 'investigation', NULL, NULL,
+                ?, ?, 0, ?, 'confirmed',
+                'workspace', 1, 0, ?,
+                ?, ?
+            )
+            """,
+            (
+                memory_item_id,
+                title,
+                body,
+                trust_level,
+                tags_json,
+                memory_class,
+                workspace_root,
+                now,
+                now,
+            ),
+        )
+        return memory_item_id
+
+    def _normalize_workspace_root(self, workspace_root: str | None) -> str:
+        return str(Path(workspace_root or self._config.workspace_path).resolve())
+
+    def _extract_root_cause_findings(self, findings: list[str]) -> list[str]:
+        keywords = (
+            "root cause",
+            "caused by",
+            "because",
+            "due to",
+            "failure",
+            "fails",
+            "failing",
+            "error",
+            "exception",
+            "timeout",
+            "regression",
+            "invalid",
+            "missing",
+            "broken",
+        )
+        matches = [
+            finding
+            for finding in findings
+            if any(keyword in finding.lower() for keyword in keywords)
+        ]
+        return self._dedupe_preserve_order(matches or findings[:2])[:4]
+
+    def _extract_impacted_callers(self, findings: list[str]) -> list[str]:
+        matches = [
+            finding
+            for finding in findings
+            if any(token in finding.lower() for token in ("caller", "called by", "invoked by"))
+        ]
+        return self._dedupe_preserve_order(matches)[:5]
+
+    def _extract_acceptance_criteria(
+        self,
+        findings: list[str],
+        *,
+        impacted_files: list[str],
+        impacted_callers: list[str],
+        root_cause: list[str],
+    ) -> list[str]:
+        matches = [
+            finding
+            for finding in findings
+            if any(
+                token in finding.lower()
+                for token in (
+                    "acceptance",
+                    "should",
+                    "must",
+                    "expected",
+                    "ensure",
+                    "verify",
+                    "covered",
+                    "test case:",
+                )
+            )
+        ]
+        criteria = self._dedupe_preserve_order(matches)[:5]
+        if criteria:
+            return criteria
+
+        synthesized: list[str] = []
+        if root_cause:
+            synthesized.append(
+                "Eliminate the investigated failure condition: "
+                f"{self._truncate_text(root_cause[0], limit=140)}"
+            )
+        if impacted_files:
+            synthesized.append(
+                f"Constrain the patch to the impacted code paths: {', '.join(impacted_files[:3])}"
+            )
+        if impacted_callers:
+            synthesized.append("Keep impacted callers compatible with the fix.")
+        if not synthesized:
+            synthesized.append(
+                "Address the investigation findings without regressing nearby behavior."
+            )
+        return synthesized
+
+    def _extract_code_paths(self, text: str) -> list[str]:
+        pattern = re.compile(
+            r"[A-Za-z0-9_./\\-]+\.(?:py|js|jsx|ts|tsx|java|go|rb|php|cs|cpp|c|h|hpp|sql)"
+        )
+        return self._dedupe_preserve_order(
+            match.group(0).strip(".,:;()[]{}<>")
+            for match in pattern.finditer(text)
+        )
+
+    def _extract_first_code_path(self, lines: list[str]) -> str | None:
+        for line in lines:
+            paths = self._extract_code_paths(line)
+            if paths:
+                return paths[0]
+        return None
+
+    def _dedupe_preserve_order(self, values: list[str] | tuple[str, ...] | Any) -> list[str]:
+        seen: set[str] = set()
+        deduped: list[str] = []
+        for value in values:
+            text = str(value).strip()
+            if not text or text in seen:
+                continue
+            seen.add(text)
+            deduped.append(text)
+        return deduped
+
+    def _truncate_text(self, text: str, *, limit: int = 160) -> str:
+        stripped = text.strip()
+        if len(stripped) <= limit:
+            return stripped
+        return stripped[: limit - 3].rstrip() + "..."
+
+    def _bullet_list(self, values: list[str]) -> str:
+        return "\n".join(f"- {value}" for value in values)
 
     def _parse_findings(self, raw: str | None) -> list[str]:
         if not raw:

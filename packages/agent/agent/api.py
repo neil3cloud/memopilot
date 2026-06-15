@@ -49,11 +49,18 @@ from .context_budget import (
     build_budget_aware_context_pack,
 )
 from .context_builder import ContextBuilderService
+from .context_deduplicator import deduplicate_text_list
+from .context_quality_scorer import (
+    ContextPackSnapshot,
+    score_context_pack,
+)
 from .cost_guard import CostGuardService, check_budget_gate, infer_selected_tier
 from .db import DatabaseManager
 from .document_ingestion import extract_csv, extract_docx, extract_excel, extract_pdf, extract_pptx
 from .endpoint_registry import ENDPOINT_STATUS
 from .flow_builder import FlowBuilderService
+from .git_history_indexer import GitHistoryIndexer
+from .graph_retriever import GraphRetriever
 from .image_analysis import ImageAnalysisResult, analyze_image
 from .investigation_service import InvestigationService
 from .mcp_orchestrator import MCPOrchestrator, ToolCall
@@ -66,6 +73,7 @@ from .policy_packs import PolicyPacksService
 from .privacy_dashboard_service import PrivacyDashboardService
 from .provider_registry import ProviderCapabilityRecord, ProviderRegistryService
 from .provider_resilience import ProviderCallError, ProviderResilienceService
+from .repo_map_generator import RepoMapGenerator
 from .response_cache import ResponseCacheService
 from .retention import enforce_retention
 from .review_memory_mode import CodeReviewMemoryModeService
@@ -77,15 +85,6 @@ from .workspace_indexer import WorkspaceIndexer
 from .workspace_init import ensure_global_config
 from .workspace_profile_service import WorkspaceProfileService
 from .workspace_roots import WorkspaceRootsService
-from .context_quality_scorer import (
-    ContextPackSnapshot,
-    score_context_pack,
-    build_quality_warning,
-)
-from .context_deduplicator import deduplicate_text_list
-from .repo_map_generator import RepoMapGenerator
-from .git_history_indexer import GitHistoryIndexer
-from .graph_retriever import GraphRetriever
 
 logger = logging.getLogger(__name__)
 
@@ -700,11 +699,27 @@ class SuggestMemoryRequest(BaseModel):
     workspace_root: str | None = None
 
 
+class SmartSuggestMemoryRequest(SuggestMemoryRequest):
+    memory_class: str = "fact"
+    derivation_source: str | None = Field(
+        default=None,
+        pattern=r"^(git_diff|call_graph|code_analysis)$",
+        description="Must be 'git_diff', 'call_graph', or 'code_analysis'. "
+        "Auto-confirmation only applies when task_run_id is also provided.",
+    )
+
+
 class SuggestMemoryResponse(BaseModel):
     memory_item_id: str | None
     pending_approval: bool
     artifact_id: str | None = None
     blocked_reason: str | None = None
+
+
+class ModuleMemoryProposalsRequest(BaseModel):
+    module_path: str = Field(min_length=1)
+    workspace_root: str | None = None
+    limit: int = Field(default=10, ge=1, le=100)
 
 
 class MemoryEditRequest(BaseModel):
@@ -889,6 +904,11 @@ class RunInvestigationResponse(BaseModel):
     related_tests: list[str]
     missing_test_coverage: list[str]
     evidence_count: int
+
+
+class InvestigationPlanFromFindingsRequest(BaseModel):
+    investigation_session_id: str
+    workspace_root: str | None = None
 
 
 class ContextTemplateItemResponse(BaseModel):
@@ -2128,11 +2148,67 @@ async def _generate_context_pack_response(request: ContextBuildRequest) -> Conte
     except Exception:
         recall_items = []
 
+    # Plan recall: inject confirmed decision plans as high-priority context
+    plan_items: list[ContextItem] = []
+    try:
+        from .plan_service import PlanModeService
+        plan_service = PlanModeService(config=config, db=db)
+        plans = await plan_service.recall_plans_for_context(
+            workspace_root=request.workspace_root,
+            limit=2,
+        )
+        for plan in plans:
+            plan_content = (
+                f"[PLAN — Follow this plan. Do not deviate from the steps listed.]\n"
+                f"{plan.title}\n\n{plan.body}"
+            )
+            plan_items.append(
+                ContextItem(
+                    content=plan_content,
+                    source=f"plan:{plan.memory_item_id}",
+                    source_type="plan",
+                    tokens=_estimate_context_tokens(plan_content),
+                    relevance_score=1.0,
+                    inclusion_reason="Active plan for this task",
+                    retrieval_method="plan_recall",
+                    trust_level=5,
+                    tier="rules",
+                )
+            )
+    except Exception:
+        plan_items = []
+
+    # Rejection constraint recall: inject prior rejection learnings as constraints
+    rejection_items: list[ContextItem] = []
+    try:
+        from .rejection_handler import RejectionHandlerService
+        rejection_service = RejectionHandlerService(config=config, db=db)
+        constraints = await rejection_service.get_rejection_constraints(
+            workspace_root=request.workspace_root,
+            limit=3,
+        )
+        for idx, constraint_text in enumerate(constraints):
+            rejection_items.append(
+                ContextItem(
+                    content=constraint_text,
+                    source=f"rejection:{idx}",
+                    source_type="rule",
+                    tokens=_estimate_context_tokens(constraint_text),
+                    relevance_score=0.95,
+                    inclusion_reason="Prior rejection constraint",
+                    retrieval_method="rejection_learning",
+                    trust_level=4,
+                    tier="rules",
+                )
+            )
+    except Exception:
+        rejection_items = []
+
     retrieval_results: dict[str, list[ContextItem | dict[str, object]]] = {
         "current_file": file_items,
         "stack_trace": _build_stack_trace_items(request),
         "fts": recall_items,
-        "rules": [
+        "rules": plan_items + rejection_items + [
             ContextItem(
                 content=rule,
                 source=f"rule:{index}",
@@ -2376,16 +2452,28 @@ class PatchRejectionRequest(BaseModel):
     patch_attempt_id: str
     rejection_reason: str
     rejection_category: str | None = None
+    workspace_root: str | None = None
 
 
 class PatchRejectionResponse(BaseModel):
     recorded: bool
     patch_attempt_id: str
+    action_taken: str | None = None
+    memory_item_id: str | None = None
+    suggestion: str | None = None
 
 
 @app.post("/v1/patch/reject", response_model=PatchRejectionResponse)
 async def record_patch_rejection(request: PatchRejectionRequest) -> PatchRejectionResponse:
-    """Record why a patch was rejected for context quality learning."""
+    """Record why a patch was rejected with structured category handling.
+
+    Each rejection category triggers specific learning actions:
+    - wrong_approach: stores rejected approach, next attempt tries differently
+    - missed_business_rule: creates pending instruction for developer to confirm
+    - wrong_file: stores scope restriction for future patches
+    - broke_existing_behavior: stores regression evidence, suggests adding tests
+    - incomplete: feeds back into Plan mode for completeness
+    """
     valid_categories = {
         "wrong_approach", "missed_business_rule", "wrong_file",
         "broke_existing_behavior", "incomplete", "other",
@@ -2408,10 +2496,465 @@ async def record_patch_rejection(request: PatchRejectionRequest) -> PatchRejecti
         "SELECT id FROM patch_attempts WHERE id = ?", (request.patch_attempt_id,)
     )
     row = await cursor.fetchone()
+    if row is None:
+        return PatchRejectionResponse(
+            recorded=False,
+            patch_attempt_id=request.patch_attempt_id,
+        )
+
+    # Structured rejection handling — creates targeted learning artifacts
+    action_taken = None
+    memory_item_id = None
+    suggestion = None
+    if category and category != "other":
+        try:
+            from .rejection_handler import RejectionHandlerService
+            handler = RejectionHandlerService(config=_get_config(), db=db)
+            result = await handler.handle_rejection(
+                patch_attempt_id=request.patch_attempt_id,
+                category=category,
+                reason=request.rejection_reason[:1000],
+                workspace_root=request.workspace_root,
+            )
+            action_taken = result.action_taken
+            memory_item_id = result.memory_item_id
+            suggestion = result.suggestion
+        except Exception:
+            pass
+
     return PatchRejectionResponse(
-        recorded=row is not None,
+        recorded=True,
         patch_attempt_id=request.patch_attempt_id,
+        action_taken=action_taken,
+        memory_item_id=memory_item_id,
+        suggestion=suggestion,
     )
+
+
+# ── Plan mode endpoints (Priority 1) ──────────────────────────────────────────
+
+class PlanStepRequest(BaseModel):
+    step_number: int = Field(ge=1)
+    description: str
+    target_file: str | None = None
+    target_symbol: str | None = None
+
+
+class StorePlanRequest(BaseModel):
+    title: str
+    steps: list[PlanStepRequest]
+    task_description: str
+    task_run_id: str | None = None
+    workspace_root: str | None = None
+
+
+class PlanStepResponse(BaseModel):
+    step_number: int
+    description: str
+    target_file: str | None = None
+    target_symbol: str | None = None
+
+
+class StorePlanResponse(BaseModel):
+    plan_id: str
+    memory_item_id: str
+    title: str
+    steps: list[PlanStepResponse]
+    raw_text: str
+    created_at: str
+
+
+class RecallPlansRequest(BaseModel):
+    workspace_root: str | None = None
+    module_path: str | None = None
+    limit: int = Field(default=3, ge=1, le=10)
+
+
+class PlanRecallItemResponse(BaseModel):
+    memory_item_id: str
+    title: str
+    body: str
+    trust_level: int
+    created_at: str
+
+
+class RecallPlansResponse(BaseModel):
+    plans: list[PlanRecallItemResponse]
+
+
+class PlanComplianceRequest(BaseModel):
+    plan_memory_id: str
+    files_changed: list[str]
+
+
+class PlanComplianceResponse(BaseModel):
+    compliant: bool
+    warnings: list[str]
+
+
+@app.post("/v1/plan/store", response_model=StorePlanResponse)
+async def store_plan(request: StorePlanRequest) -> StorePlanResponse:
+    """Store a plan as a confirmed decision memory item.
+
+    Plans are stored immediately as confirmed because the developer
+    deliberately triggered plan generation.
+    """
+    from .plan_service import PlanModeService, PlanStep
+
+    service = PlanModeService(config=_get_config(), db=_get_db())
+    result = await service.store_plan(
+        title=request.title,
+        steps=[
+            PlanStep(
+                step_number=s.step_number,
+                description=s.description,
+                target_file=s.target_file,
+                target_symbol=s.target_symbol,
+            )
+            for s in request.steps
+        ],
+        task_description=request.task_description,
+        task_run_id=request.task_run_id,
+        workspace_root=request.workspace_root,
+    )
+    return StorePlanResponse(
+        plan_id=result.plan_id,
+        memory_item_id=result.memory_item_id,
+        title=result.title,
+        steps=[
+            PlanStepResponse(
+                step_number=s.step_number,
+                description=s.description,
+                target_file=s.target_file,
+                target_symbol=s.target_symbol,
+            )
+            for s in result.steps
+        ],
+        raw_text=result.raw_text,
+        created_at=result.created_at,
+    )
+
+
+@app.post("/v1/plan/recall", response_model=RecallPlansResponse)
+async def recall_plans(request: RecallPlansRequest) -> RecallPlansResponse:
+    """Recall confirmed decision plans for context injection.
+
+    Returns plans relevant to the workspace/module for inclusion in
+    the patch context pack with elevated priority.
+    """
+    from .plan_service import PlanModeService
+
+    service = PlanModeService(config=_get_config(), db=_get_db())
+    plans = await service.recall_plans_for_context(
+        workspace_root=request.workspace_root,
+        module_path=request.module_path,
+        limit=request.limit,
+    )
+    return RecallPlansResponse(
+        plans=[
+            PlanRecallItemResponse(
+                memory_item_id=p.memory_item_id,
+                title=p.title,
+                body=p.body,
+                trust_level=p.trust_level,
+                created_at=p.created_at,
+            )
+            for p in plans
+        ]
+    )
+
+
+@app.post("/v1/plan/check-compliance", response_model=PlanComplianceResponse)
+async def check_plan_compliance(request: PlanComplianceRequest) -> PlanComplianceResponse:
+    """Check if a patch is consistent with its source plan.
+
+    Returns compliance warnings if the patch contradicts the plan
+    (e.g., modifies files not mentioned in plan steps).
+    """
+    from .plan_service import PlanModeService
+
+    service = PlanModeService(config=_get_config(), db=_get_db())
+    warnings = await service.check_plan_compliance(
+        plan_memory_id=request.plan_memory_id,
+        files_changed=request.files_changed,
+    )
+    return PlanComplianceResponse(
+        compliant=len(warnings) == 0,
+        warnings=warnings,
+    )
+
+
+# ── Autofix mode endpoints (Priority 2) ───────────────────────────────────────
+
+class DiagnosticItem(BaseModel):
+    file_path: str
+    line: int = Field(ge=0)
+    code: str
+    message: str
+
+
+class AutofixClassifyRequest(BaseModel):
+    diagnostics: list[DiagnosticItem]
+
+
+class AutofixCandidateResponse(BaseModel):
+    file_path: str
+    line: int
+    code: str
+    message: str
+    safety: str
+    category: str
+
+
+class AutofixClassifyResponse(BaseModel):
+    safe_candidates: list[AutofixCandidateResponse]
+    manual_candidates: list[AutofixCandidateResponse]
+    autofix_available: bool
+    task_description: str
+
+
+class AutofixRunRequest(BaseModel):
+    diagnostics: list[DiagnosticItem]
+    workspace_root: str | None = None
+    task_run_id: str | None = None
+
+
+class AutofixRunResponse(BaseModel):
+    task_description: str
+    safe_count: int
+    manual_count: int
+    mode: str
+    model: str
+    approval_tier: str
+    files_to_fix: list[str]
+    autofix_available: bool
+
+
+@app.post("/v1/autofix/classify", response_model=AutofixClassifyResponse)
+async def classify_for_autofix(request: AutofixClassifyRequest) -> AutofixClassifyResponse:
+    """Classify diagnostics into safe (autofix) and manual categories.
+
+    Safe diagnostics can be fixed automatically with cheap_cloud at LOW tier.
+    Manual diagnostics require normal Patch mode with human review.
+    """
+    from .autofix_classifier import classify_diagnostics
+
+    diagnostics = [
+        {"file_path": d.file_path, "line": d.line, "code": d.code, "message": d.message}
+        for d in request.diagnostics
+    ]
+    safe, manual = classify_diagnostics(diagnostics)
+
+    safe_descriptions = [f"{c.code}: {c.message} in {c.file_path}:{c.line}" for c in safe]
+    task_desc = f"Fix lint errors: {'; '.join(safe_descriptions[:5])}" if safe else ""
+
+    return AutofixClassifyResponse(
+        safe_candidates=[
+            AutofixCandidateResponse(
+                file_path=c.file_path, line=c.line, code=c.code,
+                message=c.message, safety=c.safety.value, category=c.category,
+            )
+            for c in safe
+        ],
+        manual_candidates=[
+            AutofixCandidateResponse(
+                file_path=c.file_path, line=c.line, code=c.code,
+                message=c.message, safety=c.safety.value, category=c.category,
+            )
+            for c in manual
+        ],
+        autofix_available=len(safe) > 0,
+        task_description=task_desc,
+    )
+
+
+@app.post("/v1/autofix/run", response_model=AutofixRunResponse)
+async def run_autofix(request: AutofixRunRequest) -> AutofixRunResponse:
+    """Run autofix for safe diagnostics.
+
+    Filters to safe-only patterns, generates a task description scoped to
+    the safe issues, and returns metadata for the extension to trigger
+    patch generation with cheap_cloud at LOW approval tier.
+    """
+    from .autofix_classifier import classify_diagnostics
+
+    diagnostics = [
+        {"file_path": d.file_path, "line": d.line, "code": d.code, "message": d.message}
+        for d in request.diagnostics
+    ]
+    safe, manual = classify_diagnostics(diagnostics)
+
+    files_to_fix = sorted({c.file_path for c in safe})
+    safe_descriptions = [f"{c.code}: {c.message} ({c.file_path}:{c.line})" for c in safe]
+    task_desc = f"Autofix lint errors: {'; '.join(safe_descriptions[:10])}" if safe else ""
+
+    # Record autofix task run if we have safe candidates
+    if safe and request.task_run_id is None:
+        db = _get_db()
+        conn = await db.connect()
+        task_run_id = uuid.uuid4().hex
+        now = datetime.now(UTC).isoformat()
+        await conn.execute(
+            """INSERT INTO task_runs
+               (id, user_request, task_type, status, mode, risk_level,
+                workspace_root, created_at, updated_at)
+               VALUES (?, ?, 'autofix', 'pending', 'autofix', 'low', ?, ?, ?)""",
+            (task_run_id, task_desc, request.workspace_root or "", now, now),
+        )
+        await conn.commit()
+
+    return AutofixRunResponse(
+        task_description=task_desc,
+        safe_count=len(safe),
+        manual_count=len(manual),
+        mode="autofix",
+        model="cheap_cloud",
+        approval_tier="LOW",
+        files_to_fix=files_to_fix,
+        autofix_available=len(safe) > 0,
+    )
+
+
+class TaskPatternsRequest(BaseModel):
+    workspace_root: str
+
+
+class TaskPatternResponse(BaseModel):
+    pattern_type: str
+    context_path: str
+    details: dict[str, object] = Field(default_factory=dict)
+    suggestion: str
+
+
+class TaskPatternsResponse(BaseModel):
+    patterns: list[TaskPatternResponse]
+
+
+class SimilarTaskResponse(BaseModel):
+    task_id: str
+    user_request: str
+    status: str
+    model_used: str | None = None
+    cost_usd: float
+    created_at: str
+    rejection_reason: str | None = None
+
+
+class SimilarTasksResponse(BaseModel):
+    tasks: list[SimilarTaskResponse]
+
+
+@app.post("/v1/task/patterns", response_model=TaskPatternsResponse)
+async def detect_task_patterns(request: TaskPatternsRequest) -> TaskPatternsResponse:
+    from .task_pattern_detector import TaskPatternDetector
+
+    detector = TaskPatternDetector(config=_get_config(), db=_get_db())
+    patterns = await detector.detect_patterns(request.workspace_root)
+    return TaskPatternsResponse(
+        patterns=[
+            TaskPatternResponse(
+                pattern_type=pattern.pattern_type,
+                context_path=pattern.context_path,
+                details=pattern.details,
+                suggestion=pattern.suggestion,
+            )
+            for pattern in patterns
+        ]
+    )
+
+
+@app.get("/v1/task/similar", response_model=SimilarTasksResponse)
+async def find_similar_tasks(
+    context_path: str,
+    workspace_root: str,
+    limit: int = 3,
+) -> SimilarTasksResponse:
+    from .task_pattern_detector import TaskPatternDetector
+
+    detector = TaskPatternDetector(config=_get_config(), db=_get_db())
+    similar_tasks = await detector.find_similar_tasks(
+        context_path=context_path,
+        workspace_root=workspace_root,
+        limit=max(1, min(limit, 10)),
+    )
+    return SimilarTasksResponse(
+        tasks=[
+            SimilarTaskResponse(
+                task_id=task.task_id,
+                user_request=task.user_request,
+                status=task.status,
+                model_used=task.model_used,
+                cost_usd=task.cost_usd,
+                created_at=task.created_at,
+                rejection_reason=task.rejection_reason,
+            )
+            for task in similar_tasks
+        ]
+    )
+
+
+async def _resolve_memory_workspace_root(workspace_root: str | None) -> str | None:
+    if not workspace_root:
+        return None
+    workspace_service = WorkspaceRootsService(config=_get_config(), db=_get_db())
+    return str(await workspace_service.resolve_workspace_root(workspace_root))
+
+
+async def _suggest_memory_from_request(
+    request: SuggestMemoryRequest | SmartSuggestMemoryRequest,
+    *,
+    smart: bool,
+) -> SuggestMemoryResponse:
+    service = MemoryManagerService(config=_get_config(), db=_get_db())
+    workspace_root = await _resolve_memory_workspace_root(request.workspace_root)
+    if smart:
+        assert isinstance(request, SmartSuggestMemoryRequest)
+        result = await service.suggest_memory_update_smart(
+            title=request.title,
+            body=request.body,
+            source=request.source,
+            source_path=request.source_path,
+            tags=request.tags,
+            task_run_id=request.task_run_id,
+            workspace_root=workspace_root,
+            memory_class=request.memory_class,
+            derivation_source=request.derivation_source,
+        )
+    else:
+        result = await service.suggest_memory_update(
+            title=request.title,
+            body=request.body,
+            source=request.source,
+            source_path=request.source_path,
+            tags=request.tags,
+            task_run_id=request.task_run_id,
+            workspace_root=workspace_root,
+        )
+    return SuggestMemoryResponse(
+        memory_item_id=result.memory_item_id,
+        pending_approval=result.pending_approval,
+        artifact_id=result.artifact_id,
+        blocked_reason=result.blocked_reason,
+    )
+
+
+@app.post("/v1/memory/smart-suggest", response_model=SuggestMemoryResponse)
+async def smart_suggest_memory(request: SmartSuggestMemoryRequest) -> SuggestMemoryResponse:
+    return await _suggest_memory_from_request(request, smart=True)
+
+
+@app.post("/v1/memory/proposals-for-module", response_model=MemoryItemsResponse)
+async def memory_proposals_for_module(
+    request: ModuleMemoryProposalsRequest,
+) -> MemoryItemsResponse:
+    service = MemoryManagerService(config=_get_config(), db=_get_db())
+    workspace_root = await _resolve_memory_workspace_root(request.workspace_root)
+    items = await service.get_pending_proposals_for_module(
+        module_path=request.module_path,
+        workspace_root=workspace_root,
+        limit=request.limit,
+    )
+    return MemoryItemsResponse(items=[_memory_item_response(item) for item in items])
 
 
 @app.post("/v1/model/route", response_model=ModelRouteResponse)
@@ -3359,26 +3902,7 @@ async def recall_memory(request: RecallRequest) -> RecallResponse:
 
 
 async def _write_back_memory(request: SuggestMemoryRequest) -> SuggestMemoryResponse:
-    service = MemoryManagerService(config=_get_config(), db=_get_db())
-    workspace_root = None
-    if request.workspace_root:
-        workspace_service = WorkspaceRootsService(config=_get_config(), db=_get_db())
-        workspace_root = str(await workspace_service.resolve_workspace_root(request.workspace_root))
-    result = await service.suggest_memory_update(
-        title=request.title,
-        body=request.body,
-        source=request.source,
-        source_path=request.source_path,
-        tags=request.tags,
-        task_run_id=request.task_run_id,
-        workspace_root=workspace_root,
-    )
-    return SuggestMemoryResponse(
-        memory_item_id=result.memory_item_id,
-        pending_approval=result.pending_approval,
-        artifact_id=result.artifact_id,
-        blocked_reason=result.blocked_reason,
-    )
+    return await _suggest_memory_from_request(request, smart=False)
 
 
 @app.post("/v1/memory/writeback", response_model=SuggestMemoryResponse)
@@ -3865,6 +4389,37 @@ async def run_investigation(request: RunInvestigationRequest) -> RunInvestigatio
         related_tests=result.related_tests,
         missing_test_coverage=result.missing_test_coverage,
         evidence_count=result.evidence_count,
+    )
+
+
+@app.post("/v1/investigation/plan-from-findings", response_model=StorePlanResponse)
+async def plan_from_investigation_findings(
+    request: InvestigationPlanFromFindingsRequest,
+) -> StorePlanResponse:
+    service = InvestigationService(config=_get_config(), db=_get_db())
+    try:
+        result = await service.generate_plan_from_findings(
+            investigation_session_id=request.investigation_session_id,
+            workspace_root=request.workspace_root,
+        )
+    except ValueError as exc:
+        status_code = 404 if "Investigation session not found" in str(exc) else 400
+        raise HTTPException(status_code=status_code, detail=str(exc)) from exc
+    return StorePlanResponse(
+        plan_id=result.plan_id,
+        memory_item_id=result.memory_item_id,
+        title=result.title,
+        steps=[
+            PlanStepResponse(
+                step_number=step.step_number,
+                description=step.description,
+                target_file=step.target_file,
+                target_symbol=step.target_symbol,
+            )
+            for step in result.steps
+        ],
+        raw_text=result.raw_text,
+        created_at=result.created_at,
     )
 
 

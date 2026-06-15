@@ -56,6 +56,23 @@ export class TaskFlowController {
         return this.state;
     }
 
+    /** Seed the controller with an analysis already obtained externally */
+    setAnalysis(description: string, constraints: string[], mode: string, analysis: TaskAnalyzeResponse): void {
+        this.state = {
+            ...this.state,
+            stage: 'context_building',
+            taskDescription: description,
+            constraints,
+            mode: analysis.suggested_mode || mode,
+            analysis,
+            contextPack: undefined,
+            modelDecision: undefined,
+            patch: undefined,
+            validation: undefined,
+            error: undefined,
+        };
+    }
+
     onStageChange(listener: StageChangeListener): vscode.Disposable {
         this.listeners.push(listener);
         return new vscode.Disposable(() => {
@@ -176,18 +193,58 @@ export class TaskFlowController {
         this.transition('validating');
 
         try {
+            // For docs-only changes, skip heavy validation (syntax, test_impact)
+            const docExtensions = ['.md', '.txt', '.rst', '.adoc', '.mdx'];
+            const isDocsOnly = this.state.patch.patches.every(p =>
+                docExtensions.some(ext => p.path.toLowerCase().endsWith(ext))
+            );
+            const checks = isDocsOnly ? ['security'] : ['syntax', 'lint', 'test_impact', 'security'];
+
             const validation = await this.client.validatePatches({
                 patches: this.state.patch.patches.map(p => ({
                     path: p.path,
                     action: p.action,
                     diff: p.diff,
                 })),
-                checks: ['syntax', 'lint', 'test_impact', 'security'],
+                checks,
             });
             this.transition(validation.can_apply ? 'applying' : 'awaiting_approval', { validation });
+
+            // If validation passed, actually write files to disk
+            if (validation.can_apply && this.state.patch) {
+                await this.applyPatchesToDisk();
+            }
         } catch (err: unknown) {
             this.transition('error', { error: this.errorMsg(err) });
         }
+    }
+
+    /** Write patch file changes to the workspace */
+    private async applyPatchesToDisk(): Promise<void> {
+        if (!this.state.patch) { return; }
+
+        const workspaceFolders = vscode.workspace.workspaceFolders;
+        if (!workspaceFolders || workspaceFolders.length === 0) {
+            this.transition('error', { error: 'No workspace folder open' });
+            return;
+        }
+        const rootUri = workspaceFolders[0].uri;
+
+        for (const filePatch of this.state.patch.patches) {
+            const fileUri = vscode.Uri.joinPath(rootUri, filePatch.path);
+
+            if (filePatch.action === 'create' && filePatch.new_content !== null) {
+                await vscode.workspace.fs.writeFile(fileUri, Buffer.from(filePatch.new_content, 'utf-8'));
+            } else if (filePatch.action === 'modify' && filePatch.new_content !== null) {
+                await vscode.workspace.fs.writeFile(fileUri, Buffer.from(filePatch.new_content, 'utf-8'));
+            } else if (filePatch.action === 'delete') {
+                try {
+                    await vscode.workspace.fs.delete(fileUri);
+                } catch { /* file may not exist */ }
+            }
+        }
+
+        this.transition('done');
     }
 
     /** Developer rejects the patch — reset to idle */

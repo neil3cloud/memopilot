@@ -1,6 +1,6 @@
 # MemoPilot: Master Product and Implementation Reference
 
-**Document Version:** 2.4 (Tool Mode Integration) **Target Product:** MemoPilot — Rule-Aware, Local-Memory, Cost-Governed AI Development Agent Extension for VS Code/Cursor **Status:** Production Reference
+**Document Version:** 2.6 (Workflow Intelligence + UI Redesign) **Target Product:** MemoPilot — Rule-Aware, Local-Memory, Cost-Governed AI Development Agent Extension for VS Code/Cursor **Status:** Production Reference
 
 ---
 
@@ -36,6 +36,8 @@
 28. [Remediation and Feature Hardening (v2.2)](#28-remediation-and-feature-hardening-v22--june-2026)
 29. [Feature Refinement Phase (v2.3)](#29-feature-refinement-phase-v23--june-2026)
 30. [Tool Mode Integration (v2.4)](#30-tool-mode-integration-v24--june-2026)
+31. [Context Accuracy Refinement (v2.5)](#31-context-accuracy-refinement-v25--june-2026)
+32. [Workflow Intelligence + UI Redesign (v2.6)](#32-workflow-intelligence--ui-redesign-v26--june-2026)
 
 ---
 
@@ -3721,4 +3723,348 @@ Phase 30:  Tool Mode — LM Tools + MCP + Writeback
   T3: Tool call audit logging + per-caller session tracking
   T4: First-use approval gate + privacy session summary
   T5: Post-hoc patch review + memory writeback proposals
+```
+
+---
+
+## 31\. Context Accuracy Refinement (v2.5 — June 2026)
+
+### Overview
+
+A focused accuracy sprint adding four layers to the context-pack pipeline: structural call graph (Layer 3), git commit history (Layer 4), content deduplication, and context quality scoring. The goal is to close the most common class of bad AI patches: patches that fail because the AI lacked callers, lacked historical intent, or received redundant chunks that crowded out signal.
+
+Result: 6 new modules, 1 new migration, 5 new test files (32 tests), 249 total tests passing, 0 regressions. All 6 code-review issues fixed.
+
+### Layer Summary
+
+| Layer | Name | What It Adds |
+|-------|------|-------------|
+| 1 | Content Deduplication | Remove near-duplicate context chunks (5-gram shingling, 70% overlap threshold) before pack assembly |
+| 2 | Context Quality Scoring | 6-factor weighted score per context pack; verdicts (good / acceptable / poor / rebuild); missing-signal diagnosis |
+| 3 | Structural Call Graph | Recursive callers/callees from AST-extracted relationships; finds callers NOT already in context |
+| 4 | Git Commit History | Index recent commits per file; retrieve recency-weighted history; show what changed and why |
+
+### New Backend Modules
+
+| Module | Class / Function | Purpose |
+|--------|-----------------|---------|
+| `graph_retriever.py` | `GraphRetriever` | Recursive CTE callers/callees; `find_callers_not_in_context()`; `store_relationships()` |
+| `repo_map_generator.py` | `RepoMapGenerator` | Compact ~500-token structural overview of workspace symbols |
+| `context_quality_scorer.py` | `score_context_pack()` | 6-factor weighted scoring → `ContextQualityScore`; `build_quality_warning()` |
+| `context_deduplicator.py` | `deduplicate_context_items()` | 5-gram shingling dedup; higher trust_level wins; returns `DeduplicationResult` with savings_pct |
+| `git_history_indexer.py` | `GitHistoryIndexer` | `index_git_history()`, `get_commits_for_files()`, `get_blame_context()`, `format_commit_history_for_context()` |
+| `symbol_extractor.py` (extended) | `extract_relationships()` | Emits `SymbolRelationshipRecord` (caller→callee) from AST call analysis |
+
+### New Migration
+
+| Migration | Version | Contents |
+|-----------|---------|----------|
+| `018_context_accuracy.sql` | 18 | `symbol_relationships` (caller/callee edges), `commit_history`, `commit_file_changes`, `commit_fts` (FTS5 virtual table + triggers), quality/rejection columns on `task_runs` and `patch_attempts` |
+
+### Memory Recall Enhancement
+
+`memory_recall.py` extended with `_recency_boost()`:
+
+- BM25 scores (negative floats from SQLite FTS5) are now correctly negated before use
+- Items recalled within 7 days receive an additive recency boost proportional to days elapsed
+- Prevents recently-relevant memory items from being displaced by older but keyword-dense items
+
+### Extended API Responses
+
+| Endpoint | New Fields |
+|----------|-----------|
+| `POST /v1/context-pack/generate` | `quality_score` (verdict, score, missing_signals, dedup_savings_pct, graph_expansion_files), `callers_not_in_context` (file paths), `repo_map` (compact symbol overview), `commit_history` (recent commits for context files) |
+| `GET /v1/cost/dashboard` | `quality_metrics` (avg_score, good_pct, acceptable_pct, poor_pct, rebuild_pct, avg_dedup_savings_pct) |
+
+### New API Endpoints
+
+| Endpoint | Method | Purpose |
+|----------|--------|---------|
+| `POST /v1/context/blame` | POST | Git blame for a line range; enriches result with stored commit messages |
+| `POST /v1/patch/reject` | POST | Record a patch rejection; stores context snapshot for rejection-learning queries |
+
+### Extension Changes
+
+#### `ContextPackTreeProvider.ts`
+
+The Context Pack sidebar tree now shows:
+
+- **Quality indicator node** — verdict icon (✅ / ⚠️ / 🔴), score, and dedup savings
+- **Missing signals** — expandable list of what the context pack lacks (e.g., "no git history", "no callers found")
+- **Callers not in context** — files calling the primary symbol that were not included in the pack
+
+#### `BackendClient.ts`
+
+`ContextBuildResponse` extended with optional `quality_score`, `callers_not_in_context`, `repo_map`, and `commit_history` fields.
+
+#### `LspContextProvider.ts` (new)
+
+Real-time LSP enrichment provider using `vscode.executeReferenceProvider` and `vscode.executeDefinitionProvider`. Entry points: `getContextForPosition()` and `getContextForSymbol()`. Allows the extension to augment context packs with editor-side call references without a backend round-trip.
+
+### End-User Workflow (Updated)
+
+The context accuracy refinement adds a **quality gate** between Analyze and Patch:
+
+```
+1. Analyze Task
+   → Call graph indexed (callers/callees extracted from workspace)
+   → Git history indexed (recent commits per relevant file)
+   → Context assembled and deduplicated
+
+2. Review Context Quality (NEW)
+   → Context Pack tree shows quality verdict:
+       ✅ Good         — proceed to patch
+       ⚠️ Acceptable   — minor gaps, patch may still work
+       🔴 Poor         — key callers/files missing
+       🔴 Rebuild      — context too thin, re-index or add files
+   → Missing signals listed (e.g., "no callers found", "no git history")
+   → Callers not in context surfaced for manual inclusion
+
+3. Patch (unchanged)
+   → AI receives: deduplicated context + call graph + commit history + repo map
+   → Fewer hallucinated architectures; AI knows what changed and why
+
+4. Reject Feedback (NEW)
+   → POST /v1/patch/reject stores rejection with context snapshot
+   → Future context builds for same files avoid repeating the same bad context
+```
+
+### Key Architectural Decisions
+
+1. **Call graph via recursive CTE**: Callers/callees are retrieved from `symbol_relationships` using a recursive CTE with depth cap (default 3). No runtime AST parsing needed after index.
+2. **Async subprocess**: `git log` and `git blame` use `asyncio.get_event_loop().run_in_executor()` to avoid blocking the FastAPI event loop.
+3. **5-gram shingling**: Deduplication samples up to 50 shingles per item to cap O(n²) cost. 70% overlap triggers replacement by the higher-trust item.
+4. **6 quality factors**: symbol coverage (primary symbol in pack), caller coverage (known callers present), file diversity (multiple files), rule presence, git history presence, deduplication efficiency. Weighted average → verdict.
+5. **BM25 polarity**: SQLite FTS5 `bm25()` returns negative floats. Memory recall now negates before use — previously all relevance scores were silently clipped to 0.
+6. **Rejection learning**: Stored rejections enable future context builds to penalise configurations that previously produced rejected patches for the same files.
+7. **Repo map is ~500 tokens**: Structural overview fits comfortably in budget tier without crowding file content.
+
+### Code Review Fixes (6 issues resolved)
+
+| # | Severity | File | Issue | Fix |
+|---|----------|------|-------|-----|
+| 1 | High | `workspace_indexer.py` | DELETE of `symbol_relationships` used subquery on `symbols` that was already deleted | Swapped DELETE order: relationships first, then symbols |
+| 2 | High | `symbol_extractor.py` | ~57 lines of unreachable dead code after `return None` in `_name_of()` | Removed dead block entirely |
+| 3 | High | `api.py` | `graph_expansion_files` always 0 (inverted filter: `if c.file_path in included_file_paths`) | Removed contradictory condition |
+| 4 | High | `memory_recall.py` | BM25 scores negated by `max(rank, 0.0)` — all relevance_scores became 1.0 | Negated rank; changed to additive boost |
+| 5 | Medium | `git_history_indexer.py` | Blocking `subprocess.run()` in async handlers froze event loop | Replaced with `run_in_executor()` |
+| 6 | Low | `git_history_indexer.py` | `_human_age()` naive `.split("-0")` corrupted Jan–Sep dates | Replaced with regex timezone strip |
+
+### Test Coverage (post-context-accuracy)
+
+| Test File | Tests | Scope |
+|-----------|-------|-------|
+| `test_graph_retriever.py` | 5 | Store relationships, callers/callees, callers-not-in-context, empty graph |
+| `test_repo_map.py` | 4 | Empty workspace, single file, multi-file, truncation at symbol limit |
+| `test_context_quality_scorer.py` | 8 | All 6 factors, verdict thresholds, warning builder, missing signals |
+| `test_git_history_indexer.py` | 7 | Commit parsing, file filtering, recency weighting, blame context, `_human_age()` |
+| `test_context_deduplicator.py` | 8 | Exact dup, near-dup, trust-level winner, distinct items, savings_pct |
+| **Context accuracy total** | **32** | All new modules covered |
+| **Full suite total** | **249** | Including all pre-existing tests |
+
+### Phase Structure
+
+```
+Phase 31:  Context Accuracy Refinement
+  CA1: Call graph extraction (symbol_relationships, graph_retriever)
+  CA2: Git commit history indexing (git_history_indexer, migration 018)
+  CA3: Content deduplication (context_deduplicator, 5-gram shingling)
+  CA4: Context quality scoring (context_quality_scorer, 6 factors, verdicts)
+  CA5: API wiring (quality_score + callers_not_in_context + repo_map + commit_history in /v1/context-pack/generate)
+  CA6: New endpoints (blame, reject, quality dashboard metrics)
+  CA7: Extension UI (ContextPackTreeProvider quality indicator, LspContextProvider)
+  CA8: Memory recall enhancement (recency boost, BM25 polarity fix)
+  CA9: Tests (32 new tests across 5 test files)
+```
+
+## 32. Workflow Intelligence + UI Redesign (v2.6 — June 2026)
+
+### Overview
+
+v2.6 makes MemoPilot workflow-aware, not just context-aware. The backend can now store executable plans as trusted memory, turn investigations into action plans, learn from structured patch rejections, auto-remediate deterministic validation failures, detect recurring task patterns, and time memory write-back based on trusted derivations. The frontend was redesigned around a clearer task workflow so developers can see guardrails, suggested files, AI boundaries, and next actions before any model call happens.
+
+Schema version advances to **21** in this phase, with three new migrations (`019`, `020`, `021`) and 37 new tests covering the workflow intelligence surface.
+
+### New / Extended API Surface
+
+| Capability | Endpoint | Purpose |
+|------------|----------|---------|
+| Plan Mode | `POST /v1/plan/store` | Persist a reusable multi-step plan as high-trust memory |
+| Plan recall | `POST /v1/plan/recall` | Retrieve relevant stored plans for current task context |
+| Plan compliance | `POST /v1/plan/check-compliance` | Compare changed files to planned scope and surface violations |
+| Autofix classification | `POST /v1/autofix/classify` | Split validation failures into safe vs. manual-review buckets |
+| Autofix execution | `POST /v1/autofix/run` | Apply deterministic low-risk fixes without an additional AI call |
+| Structured rejection learning | `POST /v1/patch/reject` | Route patch rejections through category handlers and store reusable lessons |
+| Investigation → Plan | `POST /v1/investigation/plan-from-findings` | Generate an executable plan directly from stored investigation findings |
+| Task pattern detection | `POST /v1/task/patterns` | Detect recurring task patterns across past runs |
+| Similar task recall | `GET /v1/task/similar` | Recall related historical tasks for the current scope |
+| Smart memory timing | `POST /v1/memory/smart-suggest` | Suggest or auto-confirm memory updates from trusted derivations |
+| Pending proposals by module | `POST /v1/memory/proposals-for-module` | Batch pending memory proposals relevant to a module |
+
+### Plan Mode (P1)
+
+Plan Mode introduces a **plan-first execution path**. Instead of treating a task as a one-shot prompt, MemoPilot can now store a concrete, ordered plan, recall that plan later, and verify whether a generated patch stayed inside the intended scope.
+
+Key design points:
+
+- Plans are stored as **decision-class memory items** with high trust and reusable status.
+- `task_runs.plan_memory_id` and `patch_attempts.plan_memory_id` link plans directly to execution history.
+- Recall can be filtered by module or task context so only relevant plans are surfaced.
+- Compliance checking compares plan target files against files actually changed and raises warnings when a patch drifts from the planned scope.
+- The plan object is intentionally multi-step and file-aware, making it useful for both implementation work and follow-up review.
+
+This closes the loop between "what we intended to do" and "what the patch actually changed," which is especially important for larger, multi-file edits.
+
+### Autofix Classification (P2)
+
+The autofix pipeline separates **deterministic cleanup** from **judgment-heavy fixes**.
+
+Safe patterns now include issues such as:
+
+- unused imports
+- missing or trailing whitespace
+- import sort issues
+- line-length / formatting cleanup
+
+Unsafe or manual-review patterns include:
+
+- undefined names (`F821`)
+- syntax errors
+- security diagnostics
+- failing tests / assertions
+- type incompatibilities
+
+The intended workflow is:
+
+1. Validation produces diagnostics.
+2. `/v1/autofix/classify` sorts them into safe vs. unsafe buckets.
+3. `/v1/autofix/run` applies only the safe fixes.
+4. Anything semantic or risky remains visible for the developer or model to address deliberately.
+
+This reduces unnecessary AI calls for trivial cleanup while preventing MemoPilot from "auto-fixing" signals that may indicate real bugs.
+
+### Structured Rejection Learning (P3)
+
+v2.6 replaces generic rejection capture with **per-category rejection handling**. Rejections are no longer stored as a flat note; they are interpreted according to the kind of failure that occurred and written back as the right sort of memory.
+
+Behavior added in this phase:
+
+- category-specific rejection handlers for style, logic, architecture, performance, security, testing, and related patch-scope failures
+- memory write-back that chooses the right `memory_class` (`lesson`, `instruction`, `fact`, etc.) for the rejection type
+- reusable rejection constraints injected into future context packs so the same bad approach is not repeated
+- stronger support for incomplete patches, wrong-file edits, and behavioral regressions
+
+This makes rejection feedback actionable: MemoPilot can now learn *how* the patch failed and turn that into future guardrails.
+
+### Investigation → Plan Loop (P4)
+
+Investigations now feed directly into execution. Findings gathered during investigation sessions can be stored as memory and converted into an executable plan without the developer manually re-summarising them.
+
+Phase 32 adds:
+
+- extraction of investigation findings into reusable memory items
+- structured plan generation from those findings
+- linkage from investigation sessions to the resulting plan/task records
+- acceptance-target persistence to carry expected outcomes into follow-up patching
+
+This is the missing bridge between evidence collection and patch generation: MemoPilot can investigate first, then transition into a plan-backed implementation flow.
+
+### Task History / Pattern Detection (P5)
+
+Task history is now mined for **recurring patterns** rather than being treated as passive logs.
+
+The detector looks for patterns such as:
+
+- repeated failures on the same module
+- recurring touches to the same files or folders
+- similar task descriptions across recent runs
+- repeated model escalation for the same work area
+
+Similar-task recall provides historical context including prior status, model used, cost, and rejection reason. This lets MemoPilot bring forward "what usually goes wrong here" before the next patch attempt starts.
+
+### Smart Memory Timing (P6)
+
+Memory timing is now more selective and trustworthy. Instead of treating every write-back proposal the same way, MemoPilot uses local context signals to decide when an update is strong enough to auto-confirm and when it should stay pending review.
+
+Rules added in this phase:
+
+- auto-confirm is only allowed when **both** `task_run_id` and `derivation_source` are present
+- `derivation_source` must be in a trusted set (`git_diff`, `call_graph`)
+- `derivation_source` is validated with a regex-backed schema check before use
+- factual observations derived from trusted sources can auto-confirm
+- lessons and instructions still stay pending for human review
+- pending proposals can be grouped by module so the review queue is easier to process in batches
+
+This hardens the governance model while still reducing manual friction for highly trustworthy, mechanically-derived memory items.
+
+### TaskEntryPanel UI Redesign
+
+The **TaskEntryPanel** was completely redesigned into a card-based workflow screen that mirrors the new workflow intelligence on the backend.
+
+New UI elements include:
+
+- a **7-step workflow stepper**: Task → Analyze → Context → Route → Patch → Approval → Validate
+- a **Guardrails** card with chips for rules, approval, redaction, and validation
+- a **Mode** dropdown with contextual explanations per mode
+- a structured local analysis result with **risk / complexity / mode** badges
+- **Suggested files** with operation indicators (`+create`, `~modify`, `−delete`)
+- regex-based file inference from the task description before any model call
+- an explicit **AI / Cost boundary** card showing **"No AI call yet"** until a model is used
+- docs-only detection so `.md` / `.txt` / `.rst` tasks do not show unnecessary test-validation prompts
+- a **Next actions** bar for Generate Context Pack, Generate Patch, and Edit Task
+- theme-safe color treatment built entirely on `color-mix()` with VS Code theme variables
+
+The redesign makes MemoPilot's local-first behavior visible. Developers can see what the extension inferred, what is still deterministic, and where an AI call would begin.
+
+### Code Review Fixes
+
+| # | Area | Issue | Fix |
+|---|------|-------|-----|
+| 1 | Autofix safety | `F821` / undefined-variable errors were treated as safe autofix candidates | Reclassified as unsafe/manual-review only |
+| 2 | Memory auto-confirm | Trusted derivation alone was not sufficient for provenance | Auto-confirm now also requires `task_run_id` |
+| 3 | Memory input validation | `derivation_source` accepted weak/unchecked values | Added regex validation before proposal acceptance |
+
+### New Backend Modules
+
+| Module | Purpose |
+|--------|---------|
+| `plan_service.py` | Store, recall, link, and check compliance of multi-step plans |
+| `autofix_classifier.py` | Classify validation failures as safe vs. unsafe for deterministic autofix |
+| `rejection_handler.py` | Handle patch rejections by category and emit reusable lessons / constraints |
+| `task_pattern_detector.py` | Detect recurring task patterns and surface similar historical tasks |
+
+**Extended but not newly introduced in this phase:** `investigation_service.py`, `memory_manager_service.py`, `api.py`, and `TaskEntryPanel` wiring in the extension UI.
+
+### New Migrations
+
+| Migration | Version | Contents |
+|-----------|---------|----------|
+| `019_plan_mode.sql` | 19 | Adds `plan_memory_id` links on `task_runs` and `patch_attempts`; indexes plan-backed execution history |
+| `020_investigation_plan.sql` | 20 | Adds `acceptance_targets_json` to `patch_attempts`; refreshes investigation-session indexing for the plan bridge |
+| `021_task_patterns.sql` | 21 | Adds `task_patterns` table plus workspace/type indexes; advances schema version to 21 |
+
+### Test Coverage (post-workflow-intelligence)
+
+| Area | Coverage | Notes |
+|------|----------|-------|
+| Plan Mode | Dedicated service coverage | Store, recall, module filtering, task/patch linking, compliance warnings |
+| Autofix classifier | Safe vs. unsafe classification coverage | Formatting issues, security/test/type failures, `F821` unsafe handling |
+| Structured rejection learning | Category-handler coverage | Wrong approach, wrong scope, regressions, incomplete work, constraint recall |
+| Investigation → Plan | Service + API coverage | Finding persistence, plan generation from evidence, endpoint contract |
+| Task patterns | Detector coverage | Frequent failures, escalation patterns, similar-task recall |
+| Smart memory timing | Service + API coverage | Trusted auto-confirm, `task_run_id` gate, pending-by-module batching |
+| **v2.6 total** | **37 new tests across 6 test files** | **Full suite now at 286+ tests passing** |
+
+### Phase Structure
+
+```
+Phase 32:  Workflow Intelligence + UI Redesign
+  P1: Plan Mode (store / recall / compliance; plan_service; migration 019)
+  P2: Autofix wiring (safe vs. unsafe validation failures; classify + run)
+  P3: Structured rejection learning (category handlers, memory-class write-back, context constraints)
+  P4: Investigation → Plan loop (findings persistence, plan generation, migration 020)
+  P5: Task history / pattern detection (recurring tasks, similar-task recall, migration 021)
+  P6: Smart memory timing (trusted auto-confirm gate, task_run_id requirement, derivation_source validation)
+  P7: TaskEntryPanel redesign (stepper, guardrails, badges, suggested files, AI boundary, docs-only flow)
+  P8: Code review fixes + tests (F821 unsafe, stricter provenance gate, 37 new tests, schema v21)
 ```

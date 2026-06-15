@@ -13,6 +13,7 @@ from .config import Config
 from .db import DatabaseManager
 from .project_scanner import WorkspaceScanner
 from .symbol_extractor import SymbolExtractor
+from .graph_retriever import GraphRetriever
 
 
 @dataclass(frozen=True)
@@ -80,6 +81,12 @@ class WorkspaceIndexer:
             )
             symbols_extracted += len(symbols)
 
+            # Delete stale relationships BEFORE deleting symbols (subquery needs them)
+            await conn.execute(
+                "DELETE FROM symbol_relationships WHERE from_symbol_id IN "
+                "(SELECT id FROM symbols WHERE file_path = ?)",
+                (file_path,),
+            )
             await conn.execute("DELETE FROM symbols WHERE file_path = ?", (file_path,))
             for symbol in symbols:
                 await conn.execute(
@@ -102,6 +109,16 @@ class WorkspaceIndexer:
                         symbol.content_hash,
                     ),
                 )
+
+            # Extract and store structural relationships
+            relationships = self._symbol_extractor.extract_relationships(
+                file_path=file_path,
+                source=content,
+                symbols=list(symbols),
+                workspace_root=str(self._config.workspace_path),
+            )
+            graph = GraphRetriever(db=self._db)
+            await graph.store_relationships(conn, relationships)
 
             await self._upsert_file_index(
                 conn=conn,
