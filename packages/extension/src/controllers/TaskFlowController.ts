@@ -209,9 +209,42 @@ export class TaskFlowController {
                 checks,
             });
             this.transition(validation.can_apply ? 'applying' : 'awaiting_approval', { validation });
+
+            // If validation passed, actually write files to disk
+            if (validation.can_apply && this.state.patch) {
+                await this.applyPatchesToDisk();
+            }
         } catch (err: unknown) {
             this.transition('error', { error: this.errorMsg(err) });
         }
+    }
+
+    /** Write patch file changes to the workspace */
+    private async applyPatchesToDisk(): Promise<void> {
+        if (!this.state.patch) { return; }
+
+        const workspaceFolders = vscode.workspace.workspaceFolders;
+        if (!workspaceFolders || workspaceFolders.length === 0) {
+            this.transition('error', { error: 'No workspace folder open' });
+            return;
+        }
+        const rootUri = workspaceFolders[0].uri;
+
+        for (const filePatch of this.state.patch.patches) {
+            const fileUri = vscode.Uri.joinPath(rootUri, filePatch.path);
+
+            if (filePatch.action === 'create' && filePatch.new_content !== null) {
+                await vscode.workspace.fs.writeFile(fileUri, Buffer.from(filePatch.new_content, 'utf-8'));
+            } else if (filePatch.action === 'modify' && filePatch.new_content !== null) {
+                await vscode.workspace.fs.writeFile(fileUri, Buffer.from(filePatch.new_content, 'utf-8'));
+            } else if (filePatch.action === 'delete') {
+                try {
+                    await vscode.workspace.fs.delete(fileUri);
+                } catch { /* file may not exist */ }
+            }
+        }
+
+        this.transition('done');
     }
 
     /** Developer rejects the patch — reset to idle */
