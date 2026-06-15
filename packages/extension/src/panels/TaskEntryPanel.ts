@@ -9,7 +9,9 @@ type TaskEntryMessage = WebviewOutboundMessage
     | { type: 'submit-task'; payload: { description: string; constraints: string[]; mode: string; notes: string } }
     | { type: 'cancel-task' }
     | { type: 'generate-context' }
-    | { type: 'generate-patch' };
+    | { type: 'generate-patch' }
+    | { type: 'approve-patch' }
+    | { type: 'reject-patch' };
 
 /**
  * Task Entry panel — modern card-based workflow screen.
@@ -93,6 +95,12 @@ export class TaskEntryPanel extends MemoPilotPanelBase {
                     this.postMessage({ type: 'view-content', payload: { viewId: 'btn-loading', html: 'patch' } });
                     this.runPatchGeneration();
                 }
+                break;
+            case 'approve-patch':
+                this.runApproval();
+                break;
+            case 'reject-patch':
+                this.runRejection();
                 break;
             default:
                 break;
@@ -306,6 +314,59 @@ export class TaskEntryPanel extends MemoPilotPanelBase {
             // Always reset button state
             this.postMessage({ type: 'view-content', payload: { viewId: 'btn-reset', html: 'patch' } });
         }
+    }
+
+    private async runApproval(): Promise<void> {
+        if (!this.flowController) {
+            this.log('runApproval: no flow controller');
+            return;
+        }
+
+        this.log('runApproval: starting...');
+        TaskEntryPanel.outputChannel?.show(true);
+
+        try {
+            await this.flowController.approve();
+            const state = this.flowController.getState();
+            this.log(`runApproval: flow state = ${state.stage}`);
+            if (state.error) {
+                this.log(`runApproval: ERROR — ${state.error}`);
+                this.postMessage({ type: 'error', payload: { message: state.error } });
+            } else if (state.validation) {
+                if (state.validation.can_apply) {
+                    this.log('runApproval: validation passed — applying patch');
+                    this.postMessage({ type: 'view-content', payload: { viewId: 'approval-done', html: JSON.stringify({ status: 'applied', issues: [] }) } });
+                    vscode.window.showInformationMessage('MemoPilot: Patch approved and applied successfully!');
+                } else {
+                    const issues = state.validation.checks
+                        .filter((c: { status: string }) => c.status === 'fail' || c.status === 'warn')
+                        .map((c: { message: string }) => c.message);
+                    if (issues.length === 0) { issues.push('Validation failed'); }
+                    this.log(`runApproval: validation failed — ${issues.join(', ')}`);
+                    this.postMessage({ type: 'view-content', payload: { viewId: 'approval-blocked', html: JSON.stringify({ issues }) } });
+                    vscode.window.showWarningMessage(`MemoPilot: Patch has validation issues: ${issues[0]}`);
+                }
+            } else {
+                this.postMessage({ type: 'view-content', payload: { viewId: 'approval-done', html: JSON.stringify({ status: 'applied', issues: [] }) } });
+                vscode.window.showInformationMessage('MemoPilot: Patch applied!');
+            }
+        } catch (err: unknown) {
+            const msg = err instanceof Error ? err.message : String(err);
+            this.log(`runApproval: EXCEPTION — ${msg}`);
+            this.postMessage({ type: 'error', payload: { message: `Approval failed: ${msg}` } });
+        } finally {
+            this.postMessage({ type: 'view-content', payload: { viewId: 'btn-reset', html: 'approve' } });
+        }
+    }
+
+    private runRejection(): void {
+        if (!this.flowController) { return; }
+        this.log('runRejection: rejecting patch, resetting flow');
+        this.flowController.reject();
+        this.lastAnalysis = undefined;
+        this.postMessage({ type: 'view-content', payload: { viewId: 'patch-rejected', html: '' } });
+        vscode.window.showInformationMessage('MemoPilot: Patch rejected. You can edit the task and try again.');
+        this.render();
     }
 
     private render(): void {
@@ -530,6 +591,18 @@ export class TaskEntryPanel extends MemoPilotPanelBase {
                 border-top: 1px solid var(--mp-border);
             }
             .actions-bar .mp-btn { flex: 0 0 auto; }
+            .mp-btn-approve {
+                background: var(--vscode-testing-iconPassed, #28a745) !important;
+                color: #fff !important;
+            }
+            .mp-btn-approve:hover { opacity: 0.9; }
+            .mp-btn-reject {
+                border-color: var(--vscode-testing-iconFailed, #d73a49) !important;
+                color: var(--vscode-testing-iconFailed, #d73a49) !important;
+            }
+            .ai-dot.warning {
+                background: var(--vscode-editorWarning-foreground, #cca700);
+            }
 
             /* Validation note */
             .validation-note {
@@ -691,6 +764,11 @@ export class TaskEntryPanel extends MemoPilotPanelBase {
                     <button id="patch-btn" class="mp-btn">Generate Patch</button>
                     <button id="edit-btn" class="mp-btn-secondary">← Edit Task</button>
                 </div>
+                <!-- Approval Actions (hidden until patch is ready) -->
+                <div class="actions-bar" id="approval-bar" style="display:none; margin-top: 12px;">
+                    <button id="approve-btn" class="mp-btn mp-btn-approve">✓ Approve &amp; Apply Patch</button>
+                    <button id="reject-btn" class="mp-btn-secondary mp-btn-reject">✗ Reject Patch</button>
+                </div>
             </div>
 
             <div id="error-area"></div>
@@ -719,6 +797,13 @@ export class TaskEntryPanel extends MemoPilotPanelBase {
                 if (target.closest('#patch-btn')) {
                     showBtnLoading('patch-btn', 'Generating Patch...');
                     postMsg('generate-patch');
+                }
+                if (target.closest('#approve-btn')) {
+                    showBtnLoading('approve-btn', 'Applying Patch...');
+                    postMsg('approve-patch');
+                }
+                if (target.closest('#reject-btn')) {
+                    postMsg('reject-patch');
                 }
             });
 
@@ -890,6 +975,7 @@ export class TaskEntryPanel extends MemoPilotPanelBase {
                         var resetWhich = msg.payload.html;
                         if (resetWhich === 'context') { restoreBtn('context-btn'); }
                         else if (resetWhich === 'patch') { restoreBtn('patch-btn'); }
+                        else if (resetWhich === 'approve') { restoreBtn('approve-btn'); }
                     } else if (msg.payload.viewId === 'context-done') {
                         updateStepper('context');
                         restoreBtn('context-btn');
@@ -903,11 +989,34 @@ export class TaskEntryPanel extends MemoPilotPanelBase {
                     } else if (msg.payload.viewId === 'patch-done') {
                         updateStepper('approval');
                         restoreBtn('patch-btn');
+                        // Show approval bar
+                        var approvalBar = document.getElementById('approval-bar');
+                        if (approvalBar) { approvalBar.style.display = 'flex'; }
                         try {
                             var pdata = JSON.parse(msg.payload.html);
                             var aiEl2 = document.getElementById('a-cost-status');
                             if (aiEl2) {
                                 aiEl2.innerHTML = '<div class="ai-dot active"></div><span>Patch generated — ' + pdata.fileCount + ' file(s). Review required.</span>';
+                            }
+                        } catch(e) {}
+                    } else if (msg.payload.viewId === 'approval-done') {
+                        updateStepper('validate');
+                        var approvalBar2 = document.getElementById('approval-bar');
+                        if (approvalBar2) { approvalBar2.style.display = 'none'; }
+                        restoreBtn('approve-btn');
+                        try {
+                            var aiEl3 = document.getElementById('a-cost-status');
+                            if (aiEl3) {
+                                aiEl3.innerHTML = '<div class="ai-dot active"></div><span>✓ Patch applied successfully!</span>';
+                            }
+                        } catch(e) {}
+                    } else if (msg.payload.viewId === 'approval-blocked') {
+                        restoreBtn('approve-btn');
+                        try {
+                            var bdata = JSON.parse(msg.payload.html);
+                            var aiEl4 = document.getElementById('a-cost-status');
+                            if (aiEl4) {
+                                aiEl4.innerHTML = '<div class="ai-dot warning"></div><span>⚠ Validation issues: ' + bdata.issues.join(', ') + '</span>';
                             }
                         } catch(e) {}
                     }
