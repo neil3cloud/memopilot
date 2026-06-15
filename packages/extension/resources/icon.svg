@@ -1,17 +1,22 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round">
   <!-- antenna -->
-  <line x1="12" y1="2" x2="12" y2="5"/>
-  <circle cx="12" cy="2" r="1" fill="currentColor" stroke="none"/>
-  <!-- head -->
-  <rect x="4" y="5" width="16" height="12" rx="4" ry="4"/>
-  <!-- eyes -->
-  <circle cx="9" cy="11" r="1.5" fill="currentColor" stroke="none"/>
-  <circle cx="15" cy="11" r="1.5" fill="currentColor" stroke="none"/>
-  <!-- mouth -->
-  <path d="M9 14.5h6" stroke-width="1.2"/>
-  <!-- ears -->
-  <rect x="1" y="9" width="2" height="4" rx="1" fill="currentColor" stroke="none"/>
-  <rect x="21" y="9" width="2" height="4" rx="1" fill="currentColor" stroke="none"/>
-  <!-- neck/body hint -->
-  <path d="M9 17v2h6v-2"/>
+  <line x1="12" y1="1.5" x2="12" y2="4"/>
+  <circle cx="12" cy="1.5" r="1" fill="currentColor" stroke="none"/>
+  <!-- rounded helmet head -->
+  <rect x="3.5" y="4" width="17" height="14" rx="7" ry="7"/>
+  <!-- visor band -->
+  <rect x="5.5" y="8.5" width="13" height="5" rx="2.5" ry="2.5"/>
+  <!-- eyes inside visor -->
+  <circle cx="9" cy="11" r="1.8" fill="currentColor" stroke="none"/>
+  <circle cx="15" cy="11" r="1.8" fill="currentColor" stroke="none"/>
+  <!-- eye highlights -->
+  <circle cx="9.6" cy="10.3" r="0.6" fill="none" stroke="none"/>
+  <circle cx="15.6" cy="10.3" r="0.6" fill="none" stroke="none"/>
+  <!-- smile -->
+  <path d="M9.5 15.5c1 1 4 1 5 0" stroke-width="1.2"/>
+  <!-- ear modules -->
+  <rect x="1" y="9.5" width="2.5" height="3.5" rx="1.2" fill="currentColor" stroke="none"/>
+  <rect x="20.5" y="9.5" width="2.5" height="3.5" rx="1.2" fill="currentColor" stroke="none"/>
+  <!-- chin/neck -->
+  <path d="M9.5 18v2.5h5v-2.5"/>
 </svg>
