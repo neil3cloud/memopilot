@@ -122,6 +122,21 @@ export interface ContextBuildResponse {
     skills: string[];
     total_tokens: number;
     estimated_cost_usd: number;
+    quality_score?: {
+        total: number;
+        verdict: 'good' | 'acceptable' | 'poor' | 'rebuild';
+        missing_signals: string[];
+        has_primary_symbol: boolean;
+        has_callers: boolean;
+        has_related_tests: boolean;
+        has_active_rules: boolean;
+        has_recent_history: boolean;
+        dedup_savings_pct: number;
+        graph_expansion_files: number;
+    };
+    callers_not_in_context?: string[];
+    repo_map?: string;
+    commit_history?: string;
 }
 
 export interface ModelRouteRequest {

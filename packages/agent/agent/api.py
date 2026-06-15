@@ -502,6 +502,8 @@ class CostDashboardResponse(BaseModel):
     by_day: list[CostDashboardEntry]
     by_model: list[CostDashboardEntry]
     savings_report: SavingsReportResponse | None = None
+    avg_context_quality: float | None = None     # 0.0–1.0 average quality score
+    context_quality_verdicts: dict[str, int] | None = None  # verdict → count
 
 
 class RecordAICallRequest(BaseModel):
@@ -2319,6 +2321,101 @@ async def build_context_pack(request: ContextBuildRequest) -> ContextBuildRespon
     return await _generate_context_pack_response(request)
 
 
+# ── Git blame endpoint (Layer 4 supplemental) ─────────────────────────────────
+
+class BlameRequest(BaseModel):
+    file_path: str
+    line_start: int = Field(ge=1)
+    line_end: int = Field(ge=1)
+    workspace_root: str = ""
+
+
+class BlameEntryResponse(BaseModel):
+    sha: str
+    author: str
+    committed_at: str
+    line_number: int
+    line_content: str
+    commit_message: str | None = None
+
+
+class BlameResponse(BaseModel):
+    entries: list[BlameEntryResponse]
+    file_path: str
+
+
+@app.post("/v1/context/blame", response_model=BlameResponse)
+async def get_blame_context(request: BlameRequest) -> BlameResponse:
+    """Return git blame context for a line range within a file."""
+    db = _get_db()
+    indexer = GitHistoryIndexer(db=db)
+    workspace_root = request.workspace_root or str(_get_config().workspace_path.resolve())
+    entries = await indexer.get_blame_context(
+        file_path=request.file_path,
+        line_start=request.line_start,
+        line_end=request.line_end,
+        workspace_root=workspace_root,
+    )
+    return BlameResponse(
+        file_path=request.file_path,
+        entries=[
+            BlameEntryResponse(
+                sha=e.sha,
+                author=e.author,
+                committed_at=e.committed_at,
+                line_number=e.line_number,
+                line_content=e.line_content,
+                commit_message=e.commit_message,
+            )
+            for e in entries
+        ],
+    )
+
+
+# ── Rejection learning endpoint (T3-C) ────────────────────────────────────────
+
+class PatchRejectionRequest(BaseModel):
+    patch_attempt_id: str
+    rejection_reason: str
+    rejection_category: str | None = None
+
+
+class PatchRejectionResponse(BaseModel):
+    recorded: bool
+    patch_attempt_id: str
+
+
+@app.post("/v1/patch/reject", response_model=PatchRejectionResponse)
+async def record_patch_rejection(request: PatchRejectionRequest) -> PatchRejectionResponse:
+    """Record why a patch was rejected for context quality learning."""
+    valid_categories = {
+        "wrong_approach", "missed_business_rule", "wrong_file",
+        "broke_existing_behavior", "incomplete", "other",
+    }
+    category = request.rejection_category
+    if category and category not in valid_categories:
+        category = "other"
+
+    db = _get_db()
+    conn = await db.connect()
+    await conn.execute(
+        """UPDATE patch_attempts
+           SET rejection_reason = ?, rejection_category = ?
+           WHERE id = ?""",
+        (request.rejection_reason[:1000], category, request.patch_attempt_id),
+    )
+    await conn.commit()
+
+    cursor = await conn.execute(
+        "SELECT id FROM patch_attempts WHERE id = ?", (request.patch_attempt_id,)
+    )
+    row = await cursor.fetchone()
+    return PatchRejectionResponse(
+        recorded=row is not None,
+        patch_attempt_id=request.patch_attempt_id,
+    )
+
+
 @app.post("/v1/model/route", response_model=ModelRouteResponse)
 async def route_model(request: ModelRouteRequest) -> ModelRouteResponse:
     """Select optimal model based on context size, task type, privacy, and budget."""
@@ -2939,6 +3036,29 @@ async def cost_dashboard(days: int = 30) -> CostDashboardResponse:
     dashboard_start = now - datetime.timedelta(days=max(days, 1))
     savings = await service.get_savings_report(start_date=dashboard_start, end_date=now)
 
+    # ── Context quality metrics ───────────────────────────────────────────────
+    avg_quality: float | None = None
+    verdicts: dict[str, int] | None = None
+    try:
+        conn = await _get_db().connect()
+        cutoff = (now - datetime.timedelta(days=days)).isoformat()
+        cursor = await conn.execute(
+            """SELECT quality_score, quality_verdict
+               FROM task_runs
+               WHERE created_at >= ? AND quality_score IS NOT NULL""",
+            (cutoff,),
+        )
+        rows = await cursor.fetchall()
+        if rows:
+            scores = [r["quality_score"] for r in rows]
+            avg_quality = round(sum(scores) / len(scores), 3)
+            verdicts = {}
+            for r in rows:
+                v = r["quality_verdict"] or "unknown"
+                verdicts[v] = verdicts.get(v, 0) + 1
+    except Exception:
+        pass
+
     return CostDashboardResponse(
         period_days=days,
         total_cost_usd=round(budget.spent_usd, 4),
@@ -2948,6 +3068,8 @@ async def cost_dashboard(days: int = 30) -> CostDashboardResponse:
         by_day=by_day,
         by_model=by_model,
         savings_report=_to_savings_report_response(savings),
+        avg_context_quality=avg_quality,
+        context_quality_verdicts=verdicts,
     )
 
 

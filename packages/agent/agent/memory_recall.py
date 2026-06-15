@@ -357,12 +357,36 @@ class MemoryRecallService:
                 continue
         return entries
 
+    @staticmethod
+    def _recency_boost(updated_at: str | None) -> float:
+        """Compute a small recency multiplier (1.0–1.2) based on updated_at age."""
+        if not updated_at:
+            return 1.0
+        try:
+            from datetime import datetime as _dt
+            dt = _dt.fromisoformat(updated_at.rstrip("Z"))
+            days_old = max(0, (_dt.now() - dt).days)
+            if days_old <= 7:
+                return 1.2
+            if days_old <= 30:
+                return 1.1
+            if days_old <= 90:
+                return 1.05
+        except Exception:
+            pass
+        return 1.0
+
     def _build_item(self, row, use_policy: UsePolicy) -> RecallItem:
         rank = row["fts_rank"]
         relevance_score = 0.0
         if rank is not None:
             normalized_rank = max(float(rank), 0.0)
-            relevance_score = 1.0 / (1.0 + normalized_rank)
+            base_score = 1.0 / (1.0 + normalized_rank)
+            try:
+                updated_at = row["updated_at"] if "updated_at" in row.keys() else None
+            except Exception:
+                updated_at = None
+            relevance_score = min(1.0, base_score * self._recency_boost(updated_at))
 
         return RecallItem(
             memory_id=str(row["id"]),
