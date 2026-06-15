@@ -231,8 +231,8 @@ export class TaskEntryPanel extends MemoPilotPanelBase {
                 border: 1.5px solid currentColor;
                 flex-shrink: 0;
             }
-            .step.active .step-number { border-color: var(--vscode-button-foreground); background: rgba(255,255,255,0.15); }
-            .step.completed .step-number { border-color: var(--mp-success); background: rgba(0,200,0,0.1); }
+            .step.active .step-number { border-color: var(--vscode-button-foreground); background: color-mix(in srgb, var(--vscode-button-foreground) 15%, transparent); }
+            .step.completed .step-number { border-color: var(--mp-success); background: color-mix(in srgb, var(--mp-success) 12%, transparent); }
 
             /* Cards */
             .card {
@@ -295,8 +295,8 @@ export class TaskEntryPanel extends MemoPilotPanelBase {
                 align-items: center;
                 gap: 5px;
                 padding: 4px 10px;
-                background: rgba(0,200,0,0.08);
-                border: 1px solid rgba(0,200,0,0.2);
+                background: color-mix(in srgb, var(--mp-success) 8%, transparent);
+                border: 1px solid color-mix(in srgb, var(--mp-success) 25%, transparent);
                 border-radius: 12px;
                 font-size: 11px;
                 color: var(--mp-success);
@@ -313,10 +313,10 @@ export class TaskEntryPanel extends MemoPilotPanelBase {
                 text-transform: uppercase;
                 letter-spacing: 0.4px;
             }
-            .badge-low { background: rgba(0,180,0,0.12); color: var(--mp-success); border: 1px solid rgba(0,180,0,0.25); }
-            .badge-medium { background: rgba(255,165,0,0.12); color: var(--mp-warning); border: 1px solid rgba(255,165,0,0.25); }
-            .badge-high { background: rgba(255,60,60,0.12); color: var(--mp-error); border: 1px solid rgba(255,60,60,0.25); }
-            .badge-critical { background: rgba(255,0,0,0.15); color: var(--mp-error); border: 1px solid rgba(255,0,0,0.3); }
+            .badge-low { background: color-mix(in srgb, var(--mp-success) 12%, transparent); color: var(--mp-success); border: 1px solid color-mix(in srgb, var(--mp-success) 25%, transparent); }
+            .badge-medium { background: color-mix(in srgb, var(--mp-warning) 12%, transparent); color: var(--mp-warning); border: 1px solid color-mix(in srgb, var(--mp-warning) 25%, transparent); }
+            .badge-high { background: color-mix(in srgb, var(--mp-error) 12%, transparent); color: var(--mp-error); border: 1px solid color-mix(in srgb, var(--mp-error) 25%, transparent); }
+            .badge-critical { background: color-mix(in srgb, var(--mp-error) 18%, transparent); color: var(--mp-error); border: 1px solid color-mix(in srgb, var(--mp-error) 35%, transparent); }
 
             /* Analysis fields */
             .analysis-grid {
@@ -347,7 +347,7 @@ export class TaskEntryPanel extends MemoPilotPanelBase {
                 font-size: 12px;
                 font-family: var(--vscode-editor-font-family, monospace);
             }
-            .file-item:nth-child(odd) { background: rgba(128,128,128,0.05); }
+            .file-item:nth-child(odd) { background: color-mix(in srgb, var(--mp-fg) 5%, transparent); }
             .file-op {
                 font-size: 10px;
                 font-weight: 700;
@@ -355,9 +355,9 @@ export class TaskEntryPanel extends MemoPilotPanelBase {
                 border-radius: 3px;
                 text-transform: uppercase;
             }
-            .file-op-create { background: rgba(0,180,0,0.15); color: var(--mp-success); }
-            .file-op-modify { background: rgba(100,150,255,0.15); color: var(--mp-accent); }
-            .file-op-delete { background: rgba(255,60,60,0.15); color: var(--mp-error); }
+            .file-op-create { background: color-mix(in srgb, var(--mp-success) 15%, transparent); color: var(--mp-success); }
+            .file-op-modify { background: color-mix(in srgb, var(--mp-accent) 15%, transparent); color: var(--mp-accent); }
+            .file-op-delete { background: color-mix(in srgb, var(--mp-error) 15%, transparent); color: var(--mp-error); }
             .file-reason { font-size: 10px; color: var(--mp-muted); margin-left: auto; font-family: var(--vscode-font-family); }
             .empty-state { text-align: center; padding: 16px; color: var(--mp-muted); font-size: 12px; }
 
@@ -368,7 +368,7 @@ export class TaskEntryPanel extends MemoPilotPanelBase {
                 gap: 8px;
                 padding: 10px 12px;
                 border-radius: 4px;
-                background: rgba(128,128,128,0.06);
+                background: color-mix(in srgb, var(--mp-fg) 6%, transparent);
                 font-size: 12px;
             }
             .ai-dot {
@@ -395,7 +395,7 @@ export class TaskEntryPanel extends MemoPilotPanelBase {
             .validation-note {
                 margin-top: 8px;
                 padding: 8px 12px;
-                background: rgba(128,128,128,0.06);
+                background: color-mix(in srgb, var(--mp-fg) 6%, transparent);
                 border-left: 3px solid var(--mp-accent);
                 border-radius: 0 4px 4px 0;
                 font-size: 11px;
