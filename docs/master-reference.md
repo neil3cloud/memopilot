@@ -1,6 +1,6 @@
 # MemoPilot: Master Product and Implementation Reference
 
-**Document Version:** 2.4 (Tool Mode Integration) **Target Product:** MemoPilot — Rule-Aware, Local-Memory, Cost-Governed AI Development Agent Extension for VS Code/Cursor **Status:** Production Reference
+**Document Version:** 2.5 (Context Accuracy Refinement) **Target Product:** MemoPilot — Rule-Aware, Local-Memory, Cost-Governed AI Development Agent Extension for VS Code/Cursor **Status:** Production Reference
 
 ---
 
@@ -36,6 +36,7 @@
 28. [Remediation and Feature Hardening (v2.2)](#28-remediation-and-feature-hardening-v22--june-2026)
 29. [Feature Refinement Phase (v2.3)](#29-feature-refinement-phase-v23--june-2026)
 30. [Tool Mode Integration (v2.4)](#30-tool-mode-integration-v24--june-2026)
+31. [Context Accuracy Refinement (v2.5)](#31-context-accuracy-refinement-v25--june-2026)
 
 ---
 
@@ -3721,4 +3722,156 @@ Phase 30:  Tool Mode — LM Tools + MCP + Writeback
   T3: Tool call audit logging + per-caller session tracking
   T4: First-use approval gate + privacy session summary
   T5: Post-hoc patch review + memory writeback proposals
+```
+
+---
+
+## 31\. Context Accuracy Refinement (v2.5 — June 2026)
+
+### Overview
+
+A focused accuracy sprint adding four layers to the context-pack pipeline: structural call graph (Layer 3), git commit history (Layer 4), content deduplication, and context quality scoring. The goal is to close the most common class of bad AI patches: patches that fail because the AI lacked callers, lacked historical intent, or received redundant chunks that crowded out signal.
+
+Result: 6 new modules, 1 new migration, 5 new test files (32 tests), 249 total tests passing, 0 regressions. All 6 code-review issues fixed.
+
+### Layer Summary
+
+| Layer | Name | What It Adds |
+|-------|------|-------------|
+| 1 | Content Deduplication | Remove near-duplicate context chunks (5-gram shingling, 70% overlap threshold) before pack assembly |
+| 2 | Context Quality Scoring | 6-factor weighted score per context pack; verdicts (good / acceptable / poor / rebuild); missing-signal diagnosis |
+| 3 | Structural Call Graph | Recursive callers/callees from AST-extracted relationships; finds callers NOT already in context |
+| 4 | Git Commit History | Index recent commits per file; retrieve recency-weighted history; show what changed and why |
+
+### New Backend Modules
+
+| Module | Class / Function | Purpose |
+|--------|-----------------|---------|
+| `graph_retriever.py` | `GraphRetriever` | Recursive CTE callers/callees; `find_callers_not_in_context()`; `store_relationships()` |
+| `repo_map_generator.py` | `RepoMapGenerator` | Compact ~500-token structural overview of workspace symbols |
+| `context_quality_scorer.py` | `score_context_pack()` | 6-factor weighted scoring → `ContextQualityScore`; `build_quality_warning()` |
+| `context_deduplicator.py` | `deduplicate_context_items()` | 5-gram shingling dedup; higher trust_level wins; returns `DeduplicationResult` with savings_pct |
+| `git_history_indexer.py` | `GitHistoryIndexer` | `index_git_history()`, `get_commits_for_files()`, `get_blame_context()`, `format_commit_history_for_context()` |
+| `symbol_extractor.py` (extended) | `extract_relationships()` | Emits `SymbolRelationshipRecord` (caller→callee) from AST call analysis |
+
+### New Migration
+
+| Migration | Version | Contents |
+|-----------|---------|----------|
+| `018_context_accuracy.sql` | 18 | `symbol_relationships` (caller/callee edges), `commit_history`, `commit_file_changes`, `commit_fts` (FTS5 virtual table + triggers), quality/rejection columns on `task_runs` and `patch_attempts` |
+
+### Memory Recall Enhancement
+
+`memory_recall.py` extended with `_recency_boost()`:
+
+- BM25 scores (negative floats from SQLite FTS5) are now correctly negated before use
+- Items recalled within 7 days receive an additive recency boost proportional to days elapsed
+- Prevents recently-relevant memory items from being displaced by older but keyword-dense items
+
+### Extended API Responses
+
+| Endpoint | New Fields |
+|----------|-----------|
+| `POST /v1/context-pack/generate` | `quality_score` (verdict, score, missing_signals, dedup_savings_pct, graph_expansion_files), `callers_not_in_context` (file paths), `repo_map` (compact symbol overview), `commit_history` (recent commits for context files) |
+| `GET /v1/cost/dashboard` | `quality_metrics` (avg_score, good_pct, acceptable_pct, poor_pct, rebuild_pct, avg_dedup_savings_pct) |
+
+### New API Endpoints
+
+| Endpoint | Method | Purpose |
+|----------|--------|---------|
+| `POST /v1/context/blame` | POST | Git blame for a line range; enriches result with stored commit messages |
+| `POST /v1/patch/reject` | POST | Record a patch rejection; stores context snapshot for rejection-learning queries |
+
+### Extension Changes
+
+#### `ContextPackTreeProvider.ts`
+
+The Context Pack sidebar tree now shows:
+
+- **Quality indicator node** — verdict icon (✅ / ⚠️ / 🔴), score, and dedup savings
+- **Missing signals** — expandable list of what the context pack lacks (e.g., "no git history", "no callers found")
+- **Callers not in context** — files calling the primary symbol that were not included in the pack
+
+#### `BackendClient.ts`
+
+`ContextBuildResponse` extended with optional `quality_score`, `callers_not_in_context`, `repo_map`, and `commit_history` fields.
+
+#### `LspContextProvider.ts` (new)
+
+Real-time LSP enrichment provider using `vscode.executeReferenceProvider` and `vscode.executeDefinitionProvider`. Entry points: `getContextForPosition()` and `getContextForSymbol()`. Allows the extension to augment context packs with editor-side call references without a backend round-trip.
+
+### End-User Workflow (Updated)
+
+The context accuracy refinement adds a **quality gate** between Analyze and Patch:
+
+```
+1. Analyze Task
+   → Call graph indexed (callers/callees extracted from workspace)
+   → Git history indexed (recent commits per relevant file)
+   → Context assembled and deduplicated
+
+2. Review Context Quality (NEW)
+   → Context Pack tree shows quality verdict:
+       ✅ Good         — proceed to patch
+       ⚠️ Acceptable   — minor gaps, patch may still work
+       🔴 Poor         — key callers/files missing
+       🔴 Rebuild      — context too thin, re-index or add files
+   → Missing signals listed (e.g., "no callers found", "no git history")
+   → Callers not in context surfaced for manual inclusion
+
+3. Patch (unchanged)
+   → AI receives: deduplicated context + call graph + commit history + repo map
+   → Fewer hallucinated architectures; AI knows what changed and why
+
+4. Reject Feedback (NEW)
+   → POST /v1/patch/reject stores rejection with context snapshot
+   → Future context builds for same files avoid repeating the same bad context
+```
+
+### Key Architectural Decisions
+
+1. **Call graph via recursive CTE**: Callers/callees are retrieved from `symbol_relationships` using a recursive CTE with depth cap (default 3). No runtime AST parsing needed after index.
+2. **Async subprocess**: `git log` and `git blame` use `asyncio.get_event_loop().run_in_executor()` to avoid blocking the FastAPI event loop.
+3. **5-gram shingling**: Deduplication samples up to 50 shingles per item to cap O(n²) cost. 70% overlap triggers replacement by the higher-trust item.
+4. **6 quality factors**: symbol coverage (primary symbol in pack), caller coverage (known callers present), file diversity (multiple files), rule presence, git history presence, deduplication efficiency. Weighted average → verdict.
+5. **BM25 polarity**: SQLite FTS5 `bm25()` returns negative floats. Memory recall now negates before use — previously all relevance scores were silently clipped to 0.
+6. **Rejection learning**: Stored rejections enable future context builds to penalise configurations that previously produced rejected patches for the same files.
+7. **Repo map is ~500 tokens**: Structural overview fits comfortably in budget tier without crowding file content.
+
+### Code Review Fixes (6 issues resolved)
+
+| # | Severity | File | Issue | Fix |
+|---|----------|------|-------|-----|
+| 1 | High | `workspace_indexer.py` | DELETE of `symbol_relationships` used subquery on `symbols` that was already deleted | Swapped DELETE order: relationships first, then symbols |
+| 2 | High | `symbol_extractor.py` | ~57 lines of unreachable dead code after `return None` in `_name_of()` | Removed dead block entirely |
+| 3 | High | `api.py` | `graph_expansion_files` always 0 (inverted filter: `if c.file_path in included_file_paths`) | Removed contradictory condition |
+| 4 | High | `memory_recall.py` | BM25 scores negated by `max(rank, 0.0)` — all relevance_scores became 1.0 | Negated rank; changed to additive boost |
+| 5 | Medium | `git_history_indexer.py` | Blocking `subprocess.run()` in async handlers froze event loop | Replaced with `run_in_executor()` |
+| 6 | Low | `git_history_indexer.py` | `_human_age()` naive `.split("-0")` corrupted Jan–Sep dates | Replaced with regex timezone strip |
+
+### Test Coverage (post-context-accuracy)
+
+| Test File | Tests | Scope |
+|-----------|-------|-------|
+| `test_graph_retriever.py` | 5 | Store relationships, callers/callees, callers-not-in-context, empty graph |
+| `test_repo_map.py` | 4 | Empty workspace, single file, multi-file, truncation at symbol limit |
+| `test_context_quality_scorer.py` | 8 | All 6 factors, verdict thresholds, warning builder, missing signals |
+| `test_git_history_indexer.py` | 7 | Commit parsing, file filtering, recency weighting, blame context, `_human_age()` |
+| `test_context_deduplicator.py` | 8 | Exact dup, near-dup, trust-level winner, distinct items, savings_pct |
+| **Context accuracy total** | **32** | All new modules covered |
+| **Full suite total** | **249** | Including all pre-existing tests |
+
+### Phase Structure
+
+```
+Phase 31:  Context Accuracy Refinement
+  CA1: Call graph extraction (symbol_relationships, graph_retriever)
+  CA2: Git commit history indexing (git_history_indexer, migration 018)
+  CA3: Content deduplication (context_deduplicator, 5-gram shingling)
+  CA4: Context quality scoring (context_quality_scorer, 6 factors, verdicts)
+  CA5: API wiring (quality_score + callers_not_in_context + repo_map + commit_history in /v1/context-pack/generate)
+  CA6: New endpoints (blame, reject, quality dashboard metrics)
+  CA7: Extension UI (ContextPackTreeProvider quality indicator, LspContextProvider)
+  CA8: Memory recall enhancement (recency boost, BM25 polarity fix)
+  CA9: Tests (32 new tests across 5 test files)
 ```
