@@ -603,6 +603,11 @@ export class TaskEntryPanel extends MemoPilotPanelBase {
             .ai-dot.warning {
                 background: var(--vscode-editorWarning-foreground, #cca700);
             }
+            .done-msg {
+                color: var(--vscode-testing-iconPassed, #28a745);
+                font-weight: 600;
+                font-size: 13px;
+            }
 
             /* Validation note */
             .validation-note {
@@ -758,16 +763,22 @@ export class TaskEntryPanel extends MemoPilotPanelBase {
                 <!-- Validation Note -->
                 <div class="validation-note" id="a-validation-note"></div>
 
-                <!-- Next Actions Bar -->
-                <div class="actions-bar">
+                <!-- Next Actions Bar — step-aware: only shows buttons for current step -->
+                <div class="actions-bar" id="step-analyze-bar">
                     <button id="context-btn" class="mp-btn">Generate Context Pack</button>
-                    <button id="patch-btn" class="mp-btn">Generate Patch</button>
                     <button id="edit-btn" class="mp-btn-secondary">← Edit Task</button>
                 </div>
-                <!-- Approval Actions (hidden until patch is ready) -->
-                <div class="actions-bar" id="approval-bar" style="display:none; margin-top: 12px;">
+                <div class="actions-bar" id="step-context-bar" style="display:none;">
+                    <button id="patch-btn" class="mp-btn">Generate Patch</button>
+                    <button id="edit-btn-2" class="mp-btn-secondary">← Edit Task</button>
+                </div>
+                <div class="actions-bar" id="approval-bar" style="display:none;">
                     <button id="approve-btn" class="mp-btn mp-btn-approve">✓ Approve &amp; Apply Patch</button>
                     <button id="reject-btn" class="mp-btn-secondary mp-btn-reject">✗ Reject Patch</button>
+                </div>
+                <div class="actions-bar" id="step-done-bar" style="display:none;">
+                    <span class="done-msg">✓ Patch applied successfully.</span>
+                    <button id="new-task-btn" class="mp-btn-secondary">+ New Task</button>
                 </div>
             </div>
 
@@ -789,7 +800,7 @@ export class TaskEntryPanel extends MemoPilotPanelBase {
             document.addEventListener('click', function(e) {
                 var target = e.target;
                 if (!(target instanceof Element)) return;
-                if (target.closest('#edit-btn')) { postMsg('cancel-task'); }
+                if (target.closest('#edit-btn') || target.closest('#edit-btn-2')) { postMsg('cancel-task'); }
                 if (target.closest('#context-btn')) {
                     showBtnLoading('context-btn', 'Generating Context Pack...');
                     postMsg('generate-context');
@@ -804,6 +815,9 @@ export class TaskEntryPanel extends MemoPilotPanelBase {
                 }
                 if (target.closest('#reject-btn')) {
                     postMsg('reject-patch');
+                }
+                if (target.closest('#new-task-btn')) {
+                    postMsg('cancel-task');
                 }
             });
 
@@ -830,6 +844,14 @@ export class TaskEntryPanel extends MemoPilotPanelBase {
                 btn.innerHTML = '<span style="width:12px;height:12px;display:inline-block;vertical-align:middle;margin-right:6px;border:2px solid rgba(255,255,255,0.3);border-top-color:var(--vscode-button-foreground);border-radius:50%;animation:spin 0.8s linear infinite;"></span>' + text;
                 btn.style.opacity = '0.8';
             }
+        }
+
+        function showStepBar(stepId) {
+            var bars = ['step-analyze-bar', 'step-context-bar', 'approval-bar', 'step-done-bar'];
+            bars.forEach(function(id) {
+                var el = document.getElementById(id);
+                if (el) el.style.display = (id === stepId) ? 'flex' : 'none';
+            });
         }
 
         function updateModeHint() {
@@ -979,6 +1001,7 @@ export class TaskEntryPanel extends MemoPilotPanelBase {
                     } else if (msg.payload.viewId === 'context-done') {
                         updateStepper('context');
                         restoreBtn('context-btn');
+                        showStepBar('step-context-bar');
                         try {
                             var cdata = JSON.parse(msg.payload.html);
                             var aiEl = document.getElementById('a-cost-status');
@@ -989,9 +1012,7 @@ export class TaskEntryPanel extends MemoPilotPanelBase {
                     } else if (msg.payload.viewId === 'patch-done') {
                         updateStepper('approval');
                         restoreBtn('patch-btn');
-                        // Show approval bar
-                        var approvalBar = document.getElementById('approval-bar');
-                        if (approvalBar) { approvalBar.style.display = 'flex'; }
+                        showStepBar('approval-bar');
                         try {
                             var pdata = JSON.parse(msg.payload.html);
                             var aiEl2 = document.getElementById('a-cost-status');
@@ -1001,9 +1022,8 @@ export class TaskEntryPanel extends MemoPilotPanelBase {
                         } catch(e) {}
                     } else if (msg.payload.viewId === 'approval-done') {
                         updateStepper('validate');
-                        var approvalBar2 = document.getElementById('approval-bar');
-                        if (approvalBar2) { approvalBar2.style.display = 'none'; }
                         restoreBtn('approve-btn');
+                        showStepBar('step-done-bar');
                         try {
                             var aiEl3 = document.getElementById('a-cost-status');
                             if (aiEl3) {

@@ -193,13 +193,20 @@ export class TaskFlowController {
         this.transition('validating');
 
         try {
+            // For docs-only changes, skip heavy validation (syntax, test_impact)
+            const docExtensions = ['.md', '.txt', '.rst', '.adoc', '.mdx'];
+            const isDocsOnly = this.state.patch.patches.every(p =>
+                docExtensions.some(ext => p.path.toLowerCase().endsWith(ext))
+            );
+            const checks = isDocsOnly ? ['security'] : ['syntax', 'lint', 'test_impact', 'security'];
+
             const validation = await this.client.validatePatches({
                 patches: this.state.patch.patches.map(p => ({
                     path: p.path,
                     action: p.action,
                     diff: p.diff,
                 })),
-                checks: ['syntax', 'lint', 'test_impact', 'security'],
+                checks,
             });
             this.transition(validation.can_apply ? 'applying' : 'awaiting_approval', { validation });
         } catch (err: unknown) {
