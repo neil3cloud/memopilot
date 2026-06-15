@@ -253,6 +253,9 @@ export class TaskEntryPanel extends MemoPilotPanelBase {
             const msg = err instanceof Error ? err.message : String(err);
             this.log(`runContextBuild: EXCEPTION — ${msg}`);
             this.postMessage({ type: 'error', payload: { message: `Context build failed: ${msg}` } });
+        } finally {
+            // Always reset button state
+            this.postMessage({ type: 'view-content', payload: { viewId: 'btn-reset', html: 'context' } });
         }
     }
 
@@ -299,6 +302,9 @@ export class TaskEntryPanel extends MemoPilotPanelBase {
             const msg = err instanceof Error ? err.message : String(err);
             this.log(`runPatchGeneration: EXCEPTION — ${msg}`);
             this.postMessage({ type: 'error', payload: { message: `Patch generation failed: ${msg}` } });
+        } finally {
+            // Always reset button state
+            this.postMessage({ type: 'view-content', payload: { viewId: 'btn-reset', html: 'patch' } });
         }
     }
 
@@ -880,6 +886,10 @@ export class TaskEntryPanel extends MemoPilotPanelBase {
                         var which = msg.payload.html;
                         if (which === 'context') { updateStepper('context'); }
                         else if (which === 'patch') { updateStepper('route'); }
+                    } else if (msg.payload.viewId === 'btn-reset') {
+                        var resetWhich = msg.payload.html;
+                        if (resetWhich === 'context') { restoreBtn('context-btn'); }
+                        else if (resetWhich === 'patch') { restoreBtn('patch-btn'); }
                     } else if (msg.payload.viewId === 'context-done') {
                         updateStepper('context');
                         restoreBtn('context-btn');
