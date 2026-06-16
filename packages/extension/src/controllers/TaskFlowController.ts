@@ -31,6 +31,8 @@ export interface TaskFlowState {
     patch?: GeneratePatchResponse;
     validation?: ValidateResponse;
     error?: string;
+    streamingToken?: string;
+    taskRunId?: string;
 }
 
 type StageChangeListener = (state: TaskFlowState) => void;
@@ -163,12 +165,23 @@ export class TaskFlowController {
         await this.generatePatch();
     }
 
-    /** Generate the patch */
+    /** Generate the patch, streaming tokens to listeners as they arrive */
     async generatePatch(): Promise<void> {
         if (!this.state.modelDecision || !this.state.contextPack) {
             this.transition('error', { error: 'Missing model decision or context' });
             return;
         }
+
+        // Generate a task run ID so we can open the SSE stream before posting
+        const taskRunId = crypto.randomUUID();
+        this.transition('generating_patch', { taskRunId, streamingToken: undefined });
+
+        // Open SSE stream to receive tokens as the LLM generates them
+        let streamingContent = '';
+        const stopStream = this.client.openTokenStream(taskRunId, (token) => {
+            streamingContent += token;
+            this.transition('generating_patch', { streamingToken: streamingContent });
+        });
 
         try {
             const patch = await this.client.generatePatch({
@@ -176,11 +189,14 @@ export class TaskFlowController {
                 context_files: this.state.contextPack.files.map(f => f.path),
                 mode: this.state.mode,
                 model_id: this.state.modelDecision.recommended.model_id,
+                task_run_id: taskRunId,
             });
             // Stop here — developer must approve
-            this.transition('awaiting_approval', { patch });
+            this.transition('awaiting_approval', { patch, streamingToken: undefined });
         } catch (err: unknown) {
-            this.transition('error', { error: this.errorMsg(err) });
+            this.transition('error', { error: this.errorMsg(err), streamingToken: undefined });
+        } finally {
+            stopStream();
         }
     }
 

@@ -13,6 +13,7 @@ export type WebviewOutboundMessage =
     | { type: 'request-cost-status' }
     | { type: 'restart-backend' }
     | { type: 'cancel-indexing' }
+    | { type: 'enter-api-key' }
     | { type: 'ready' };
 
 /** Messages sent FROM extension TO webview */
@@ -38,6 +39,7 @@ export interface WorkspaceStatusDTO {
     filesScanned: number;
     totalFiles: number;
     symbolsExtracted: number;
+    needsSetup?: boolean;
 }
 
 export interface NavigationItemDTO {

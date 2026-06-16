@@ -1,14 +1,20 @@
-"""Outcome-aware model routing helpers."""
+"""Model routing helpers — outcome-aware tier selection and provider resolution."""
 
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass
 from enum import Enum
 
 import aiosqlite
 
 from .db import DatabaseManager
+from .local_model_discovery import LocalModel, discover_all_local
 
+
+# ---------------------------------------------------------------------------
+# Tier enum and ordering (used by /v1/model/route endpoint)
+# ---------------------------------------------------------------------------
 
 class ModelTier(str, Enum):
     LOCAL = "local"
@@ -29,6 +35,7 @@ _FRONTIER_TASK_TYPES = {"architecture", "complex"}
 
 @dataclass(frozen=True)
 class RoutingDecision:
+    """Outcome-aware routing decision used by the /v1/model/route endpoint."""
     tier: ModelTier
     reason: str
     base_tier: ModelTier
@@ -153,4 +160,136 @@ async def route_with_outcome(
             "context budget. Frontier escalation would trigger after 2 failed non-frontier "
             "attempts on the same file within 30 days."
         ),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Phase-33: provider-level routing — resolves a concrete model+provider
+# ---------------------------------------------------------------------------
+
+_local_cache: list[LocalModel] = []
+_local_cache_ts: float = 0.0
+_LOCAL_TTL = 300.0  # 5 minutes
+
+
+@dataclass
+class ProviderDecision:
+    """Concrete model/provider selection for generate_patch and MCP tools."""
+    tier: str
+    model_id: str | None
+    provider: str | None
+    reason: str
+    cost_estimate_usd: float = 0.0
+
+
+async def _get_local_models(config: dict) -> list[LocalModel]:
+    global _local_cache, _local_cache_ts
+    if time.monotonic() - _local_cache_ts > _LOCAL_TTL:
+        _local_cache = await discover_all_local(config)
+        _local_cache_ts = time.monotonic()
+    return _local_cache
+
+
+async def route_model(
+    task_type: str,
+    risk_level: str,
+    ctx_tokens: int,
+    config: dict,
+) -> ProviderDecision:
+    """Resolve a concrete model+provider for a task. Never raises."""
+    tier = _classify_tier(task_type, risk_level)
+    needed = int(ctx_tokens / 0.60)
+    profile = config.get("budget_profile", "cost_saver")
+
+    if tier == "no_ai":
+        return ProviderDecision("no_ai", None, None, "No AI needed for this task type.")
+
+    locals_ = await _get_local_models(config)
+    capable = [m for m in locals_ if m.max_context_tokens >= needed]
+
+    use_local = (tier == "local") or (
+        tier == "standard" and profile in ("cost_saver", "strict_local") and capable
+    )
+
+    if use_local and capable:
+        best = sorted(capable, key=lambda m: m.max_context_tokens)[0]
+        return ProviderDecision(
+            tier="local",
+            model_id=best.model_id,
+            provider=best.source,
+            reason=f"{best.source} model: {best.model_id} ({best.max_context_tokens:,} ctx, $0.00)",
+            cost_estimate_usd=0.0,
+        )
+
+    if profile == "strict_local":
+        return ProviderDecision(
+            "context_pack_only", None, None,
+            "Strict local mode — no cloud calls. "
+            "Install Ollama or pull a model: `ollama pull qwen2.5-coder:7b`",
+        )
+
+    if config.get("host_models_available"):
+        host_list: list[dict] = config.get("host_model_list", [])
+        capable_h = [m for m in host_list if m.get("max_context_tokens", 0) >= needed]
+        if capable_h:
+            best_h = capable_h[0]
+            return ProviderDecision(
+                tier=tier,
+                model_id=best_h["model_id"],
+                provider="host",
+                reason=f"Copilot: {best_h['model_id']} (subscription model)",
+                cost_estimate_usd=0.0,
+            )
+
+    cloud = _pick_cloud(tier, needed, config)
+    if cloud:
+        return cloud
+
+    return ProviderDecision(
+        "context_pack_only", None, None,
+        "No model available. Configure Ollama or add API keys in .memopilot/config.yaml.",
+    )
+
+
+def _classify_tier(task_type: str, risk: str) -> str:
+    if risk in ("critical", "high"):
+        return "advanced"
+    if task_type in ("security_change", "billing_change", "architecture", "complex_refactor"):
+        return "advanced"
+    if task_type in ("code_formatting", "import_sorting", "exact_search"):
+        return "no_ai"
+    if task_type in ("summarization", "classification", "explanation", "memory_generation"):
+        return "local"
+    return "standard"
+
+
+_CLOUD_CATALOG: list[tuple[str, str, int, float, float, str]] = [
+    # (provider, model_id, max_ctx, cost_in, cost_out, min_tier)
+    ("anthropic", "claude-haiku-4-5", 200_000, 0.80, 4.00, "standard"),
+    ("openai", "gpt-4o-mini", 128_000, 0.15, 0.60, "standard"),
+    ("anthropic", "claude-sonnet-4-6", 200_000, 3.00, 15.00, "advanced"),
+    ("openai", "gpt-4o", 128_000, 2.50, 10.00, "advanced"),
+]
+
+_TIER_RANK = {"local": 0, "standard": 1, "advanced": 2}
+
+
+def _pick_cloud(tier: str, needed_ctx: int, config: dict) -> ProviderDecision | None:
+    tier_rank_val = _TIER_RANK.get(tier, 1)
+    candidates = [
+        (p, mid, ctx, ci, co)
+        for p, mid, ctx, ci, co, mt in _CLOUD_CATALOG
+        if _TIER_RANK.get(mt, 0) <= tier_rank_val
+        and ctx >= needed_ctx
+        and config.get(f"{p}_api_key")
+    ]
+    if not candidates:
+        return None
+    p, mid, _ctx, ci, co = sorted(candidates, key=lambda x: x[3])[0]
+    return ProviderDecision(
+        tier=tier,
+        model_id=mid,
+        provider=p,
+        reason=f"{p}: {mid} (${ci}/1M in, ${co}/1M out)",
+        cost_estimate_usd=0.0,
     )

@@ -1,13 +1,27 @@
-"""Tests for outcome-aware model routing."""
+"""Tests for model_router.py — outcome-aware routing and provider resolution."""
 
 from __future__ import annotations
+
+from unittest.mock import AsyncMock, patch
 
 import pytest
 from httpx import AsyncClient
 
+from agent.local_model_discovery import LocalModel
 from agent.migration_runner import run_migrations
-from agent.model_router import ModelTier, get_outcome_routing_hint, route_with_outcome
+from agent.model_router import (
+    ModelTier,
+    ProviderDecision,
+    _classify_tier,
+    get_outcome_routing_hint,
+    route_model,
+    route_with_outcome,
+)
 
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
 
 async def _insert_failed_run(conn, task_run_id: str, model_id: str, file_path: str) -> None:
     await conn.execute(
@@ -60,6 +74,22 @@ async def _insert_failed_run(conn, task_run_id: str, model_id: str, file_path: s
     )
     await conn.commit()
 
+
+def _local(model_id: str, ctx: int = 32_768, source: str = "ollama") -> LocalModel:
+    return LocalModel(
+        model_id=model_id,
+        name=model_id,
+        source=source,
+        max_context_tokens=ctx,
+        supports_tools=True,
+        cost_per_1m_input=0.0,
+        cost_per_1m_output=0.0,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Outcome-aware routing (route_with_outcome / get_outcome_routing_hint)
+# ---------------------------------------------------------------------------
 
 @pytest.mark.asyncio
 async def test_two_failures_triggers_frontier_escalation(test_db):
@@ -153,3 +183,147 @@ async def test_no_escalation_for_local_tier(test_db):
     assert decision.tier == ModelTier.LOCAL
     assert decision.base_tier == ModelTier.LOCAL
     assert decision.escalation_source is None
+
+
+# ---------------------------------------------------------------------------
+# _classify_tier
+# ---------------------------------------------------------------------------
+
+def test_classify_tier_high_risk_returns_advanced():
+    assert _classify_tier("fix", "high") == "advanced"
+    assert _classify_tier("auto", "critical") == "advanced"
+
+
+def test_classify_tier_security_change_returns_advanced():
+    assert _classify_tier("security_change", "low") == "advanced"
+    assert _classify_tier("billing_change", "low") == "advanced"
+
+
+def test_classify_tier_formatting_returns_no_ai():
+    assert _classify_tier("code_formatting", "low") == "no_ai"
+    assert _classify_tier("import_sorting", "low") == "no_ai"
+    assert _classify_tier("exact_search", "low") == "no_ai"
+
+
+def test_classify_tier_summarization_returns_local():
+    assert _classify_tier("summarization", "low") == "local"
+    assert _classify_tier("memory_generation", "low") == "local"
+
+
+def test_classify_tier_default_returns_standard():
+    assert _classify_tier("fix", "low") == "standard"
+    assert _classify_tier("auto", "low") == "standard"
+
+
+# ---------------------------------------------------------------------------
+# route_model — no_ai
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_route_model_no_ai_task():
+    decision = await route_model("code_formatting", "low", 500, {})
+    assert decision.tier == "no_ai"
+    assert decision.model_id is None
+    assert decision.provider is None
+
+
+# ---------------------------------------------------------------------------
+# route_model — local preferred for cost_saver
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_route_model_prefers_local_for_cost_saver():
+    local = _local("qwen2.5-coder:7b", ctx=32_768)
+    with patch("agent.model_router._get_local_models", AsyncMock(return_value=[local])):
+        decision = await route_model(
+            "fix", "low", 5_000, {"budget_profile": "cost_saver"}
+        )
+    assert decision.tier == "local"
+    assert decision.model_id == "qwen2.5-coder:7b"
+    assert decision.provider == "ollama"
+    assert decision.cost_estimate_usd == 0.0
+
+
+# ---------------------------------------------------------------------------
+# route_model — strict_local blocks cloud
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_route_model_strict_local_blocks_cloud_when_no_local():
+    with patch("agent.model_router._get_local_models", AsyncMock(return_value=[])):
+        decision = await route_model(
+            "fix", "low", 5_000,
+            {"budget_profile": "strict_local", "anthropic_api_key": "sk-test"},
+        )
+    assert decision.tier == "context_pack_only"
+    assert decision.model_id is None
+
+
+# ---------------------------------------------------------------------------
+# route_model — context window enforcement
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_route_model_skips_local_with_too_small_context():
+    small_local = _local("phi3:mini", ctx=4_096)
+    with patch("agent.model_router._get_local_models", AsyncMock(return_value=[small_local])):
+        decision = await route_model(
+            "fix", "low", 10_000,
+            {"budget_profile": "cost_saver", "anthropic_api_key": "sk-test"},
+        )
+    assert decision.provider != "ollama"
+
+
+# ---------------------------------------------------------------------------
+# route_model — cloud fallback
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_route_model_falls_back_to_cloud():
+    with patch("agent.model_router._get_local_models", AsyncMock(return_value=[])):
+        decision = await route_model(
+            "fix", "low", 5_000,
+            {"budget_profile": "balanced", "anthropic_api_key": "sk-test"},
+        )
+    assert decision.provider == "anthropic"
+    assert decision.model_id is not None
+
+
+@pytest.mark.asyncio
+async def test_route_model_no_providers_returns_context_pack_only():
+    with patch("agent.model_router._get_local_models", AsyncMock(return_value=[])):
+        decision = await route_model("fix", "low", 5_000, {"budget_profile": "balanced"})
+    assert decision.tier == "context_pack_only"
+    assert decision.model_id is None
+
+
+# ---------------------------------------------------------------------------
+# route_model — host model
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_route_model_uses_host_when_available():
+    host_model = {"model_id": "gpt-4o", "max_context_tokens": 128_000}
+    with patch("agent.model_router._get_local_models", AsyncMock(return_value=[])):
+        decision = await route_model(
+            "fix", "low", 5_000,
+            {"budget_profile": "balanced", "host_models_available": True,
+             "host_model_list": [host_model]},
+        )
+    assert decision.provider == "host"
+    assert decision.model_id == "gpt-4o"
+
+
+# ---------------------------------------------------------------------------
+# route_model — advanced tier goes to cloud even with local available
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_route_model_advanced_tier_skips_local():
+    local = _local("qwen2.5-coder:7b", ctx=32_768)
+    with patch("agent.model_router._get_local_models", AsyncMock(return_value=[local])):
+        decision = await route_model(
+            "security_change", "low", 5_000,
+            {"budget_profile": "cost_saver", "anthropic_api_key": "sk-test"},
+        )
+    assert decision.provider != "ollama"

@@ -25,7 +25,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
 from .approval_gate import (
@@ -64,7 +64,11 @@ from .graph_retriever import GraphRetriever
 from .image_analysis import ImageAnalysisResult, analyze_image
 from .investigation_service import InvestigationService
 from .mcp_orchestrator import MCPOrchestrator, ToolCall
+from .local_model_discovery import discover_all_local
 from .memory_manager_service import MemoryManagerService
+from .config_loader import load_provider_config
+from .llm_client import build_client
+from .memory_seeder import MemorySeederService
 from .memory_recall import MemoryRecallService, RecallRequest, RecallResponse
 from .migration_runner import run_migrations
 from .model_router import TIER_ORDER, ModelTier, get_outcome_routing_hint
@@ -97,6 +101,10 @@ _expected_token: str | None = None
 _retention_task: asyncio.Task[None] | None = None
 _RETENTION_INTERVAL_SECONDS = 6 * 60 * 60
 
+# Host model relay state — extension acts as LLM proxy for VS Code Copilot
+_task_sse_queues: dict[str, asyncio.Queue] = {}
+_host_relay_futures: dict[str, asyncio.Future] = {}
+
 
 class HealthResponse(BaseModel):
     schema_version: int
@@ -120,6 +128,19 @@ class WorkspaceIndexResponse(BaseModel):
     skipped_files: int
     symbols_extracted: int
     duration_ms: int
+    memory_items_seeded: int = 0
+
+
+class WorkspaceIndexRequest(BaseModel):
+    seed_memory: bool = True
+
+
+class WorkspaceIndexStatusResponse(BaseModel):
+    ever_indexed: bool
+    file_count: int
+    stale_file_count: int
+    last_indexed_at: str | None
+    memory_item_count: int
 
 
 class RebuildMemoryResponse(WorkspaceIndexResponse):
@@ -315,6 +336,9 @@ class GeneratePatchRequest(BaseModel):
     mode: str = "auto"
     model_id: str | None = None
     dry_run: bool = False
+    context_pack_hash: str | None = None
+    workspace_root: str | None = None
+    task_run_id: str | None = None
 
 
 class FilePatch(BaseModel):
@@ -1661,16 +1685,63 @@ async def init_workspace() -> InitWorkspaceResponse:
     )
 
 
+@app.get("/v1/workspace/index-status", response_model=WorkspaceIndexStatusResponse)
+async def get_index_status(workspace_root: str | None = None) -> WorkspaceIndexStatusResponse:
+    """Return indexing and memory population status for the current workspace."""
+    db = _get_db()
+    config = _get_config()
+    root = workspace_root or str(config.workspace_path)
+    conn = await db.connect()
+
+    cursor = await conn.execute(
+        """
+        SELECT COUNT(*) AS file_count,
+               SUM(stale) AS stale_count,
+               MAX(last_indexed_at) AS last_indexed_at
+        FROM file_index
+        WHERE workspace_root = ? OR workspace_root IS NULL
+        """,
+        (root,),
+    )
+    row = await cursor.fetchone()
+
+    mem_cursor = await conn.execute(
+        """
+        SELECT COUNT(*) AS cnt FROM memory_items
+        WHERE memory_status = 'confirmed'
+          AND (workspace_root = ? OR workspace_root IS NULL)
+        """,
+        (root,),
+    )
+    mem_row = await mem_cursor.fetchone()
+
+    file_count = row["file_count"] or 0
+    return WorkspaceIndexStatusResponse(
+        ever_indexed=file_count > 0,
+        file_count=file_count,
+        stale_file_count=row["stale_count"] or 0,
+        last_indexed_at=row["last_indexed_at"],
+        memory_item_count=mem_row["cnt"] if mem_row else 0,
+    )
+
+
 @app.post("/v1/workspace/index", response_model=WorkspaceIndexResponse)
-async def index_workspace() -> WorkspaceIndexResponse:
+async def index_workspace(request: WorkspaceIndexRequest | None = None) -> WorkspaceIndexResponse:
     """Index Python files and symbols in the current workspace."""
     config = _get_config()
     db = _get_db()
+    seed_memory = request.seed_memory if request is not None else True
 
     indexer = WorkspaceIndexer(config=config, db=db)
     result = await indexer.index_workspace()
     profile_service = WorkspaceProfileService(config=config, db=db)
     await profile_service.ensure_profile()
+
+    memory_items_seeded = 0
+    if seed_memory and result.indexed_files > 0:
+        seeder = MemorySeederService(config=config, db=db)
+        memory_items_seeded = await seeder.seed(str(config.workspace_path))
+
     return WorkspaceIndexResponse(
         python_project=result.python_project,
         total_files_scanned=result.total_files_scanned,
@@ -1680,6 +1751,7 @@ async def index_workspace() -> WorkspaceIndexResponse:
         skipped_files=result.skipped_files,
         symbols_extracted=result.symbols_extracted,
         duration_ms=result.duration_ms,
+        memory_items_seeded=memory_items_seeded,
     )
 
 
@@ -2963,48 +3035,74 @@ async def route_model(request: ModelRouteRequest) -> ModelRouteResponse:
     config = _get_config()
     db = _get_db()
 
-    context_tokens = request.context_tokens
-    privacy = request.privacy_level
-    task_type = request.task_type
-
     cost_service = CostGuardService(config=config, db=db)
     remaining_usd = 50.0
     try:
         budget_info = await cost_service.get_budget_status()
         remaining_usd = budget_info.remaining_usd
     except Exception:
-        budget_info = None
+        pass
 
-    candidates: list[ModelChoice] = []
+    # Map privacy_level to budget_profile for model_router
+    privacy_to_profile = {
+        "local_only": "strict_local",
+        "local_preferred": "cost_saver",
+        "cloud_ok": "balanced",
+    }
+    router_config = dict(config.__dict__) if hasattr(config, "__dict__") else {}
+    router_config["budget_profile"] = privacy_to_profile.get(request.privacy_level, "cost_saver")
 
-    local_fits = context_tokens <= 32_000
-    local_reasons = []
-    if local_fits:
-        local_reasons.append("Context fits local model window (32K)")
-    if privacy in ("local_only", "local_preferred"):
-        local_reasons.append("Privacy preference: local")
-    if task_type in ("refactor", "fix", "test"):
-        local_reasons.append(f"Task type '{task_type}' suitable for local model")
-    candidates.append(
-        ModelChoice(
-            model_id="codellama-13b-local",
-            provider="ollama",
+    # Check host model availability
+    try:
+        host_caps = await cost_service.check_provider_budget(
+            provider="host", model="copilot", privacy_level="local",
+            estimated_cost_usd=0.0, requires_approval=False, approval_granted=False,
+        )
+        router_config["host_models_available"] = host_caps.allowed
+    except Exception:
+        router_config["host_models_available"] = False
+
+    decision = await _route_model_logic(
+        task_type=request.task_type,
+        risk_level="low",
+        ctx_tokens=request.context_tokens,
+        config=router_config,
+    )
+
+    if decision.model_id:
+        recommended = ModelChoice(
+            model_id=decision.model_id,
+            provider=decision.provider or "unknown",
+            cost_estimate_usd=decision.cost_estimate_usd,
+            reasons=[decision.reason],
+            fits_context=True,
+        )
+    else:
+        # no_ai or context_pack_only — return a sentinel choice
+        recommended = ModelChoice(
+            model_id="none",
+            provider="none",
             cost_estimate_usd=0.0,
-            reasons=local_reasons or ["Local model available"],
-            fits_context=local_fits,
+            reasons=[decision.reason],
+            fits_context=True,
         )
-    )
 
-    gpt4o_cost = (context_tokens / 1_000_000) * 5.0 + 0.015
-    candidates.append(
-        ModelChoice(
-            model_id="gpt-4o",
-            provider="openai",
-            cost_estimate_usd=round(gpt4o_cost, 4),
-            reasons=["Higher quality for complex tasks", "128K context window"],
-            fits_context=context_tokens <= 128_000,
-        )
-    )
+    # Check budget for the recommended model
+    budget_allowed = True
+    if decision.model_id and decision.provider not in ("ollama", "lmstudio", "host", "none"):
+        try:
+            check = await cost_service.check_provider_budget(
+                provider=decision.provider or "",
+                model=decision.model_id,
+                privacy_level="cloud",
+                estimated_cost_usd=decision.cost_estimate_usd,
+                requires_approval=False,
+                approval_granted=False,
+            )
+            budget_allowed = check.allowed
+            remaining_usd = getattr(check, "remaining_usd", remaining_usd)
+        except Exception:
+            pass
 
     claude_cost = (context_tokens / 1_000_000) * 3.0 + 0.015
     candidates.append(
@@ -3123,7 +3221,7 @@ async def route_model(request: ModelRouteRequest) -> ModelRouteResponse:
     ]
     return ModelRouteResponse(
         recommended=recommended,
-        alternatives=alternatives,
+        alternatives=[],
         budget_check=BudgetCheck(allowed=budget_allowed, remaining_usd=round(remaining_usd, 2)),
         options=options,
         escalation_source=escalation_source,
@@ -3132,67 +3230,240 @@ async def route_model(request: ModelRouteRequest) -> ModelRouteResponse:
     )
 
 
+class HostResponseRequest(BaseModel):
+    task_run_id: str
+    token: str = ""
+    is_final: bool = False
+    error: str | None = None
+
+
+@app.get("/v1/task/{task_run_id}/stream")
+async def task_stream(task_run_id: str, request: Request):
+    """SSE endpoint — streams LLM_REQUEST, TOKEN, DONE events to the extension."""
+    queue: asyncio.Queue = _task_sse_queues.setdefault(task_run_id, asyncio.Queue())
+
+    async def event_gen():
+        try:
+            while True:
+                if await request.is_disconnected():
+                    break
+                try:
+                    event = await asyncio.wait_for(queue.get(), timeout=30.0)
+                    yield f"data: {json.dumps(event)}\n\n"
+                    if event.get("type") in ("DONE", "ERROR"):
+                        break
+                except asyncio.TimeoutError:
+                    yield "data: {\"type\": \"HEARTBEAT\"}\n\n"
+        finally:
+            _task_sse_queues.pop(task_run_id, None)
+
+    return StreamingResponse(event_gen(), media_type="text/event-stream")
+
+
+@app.post("/v1/llm/host-response")
+async def host_llm_response(response: HostResponseRequest):
+    """Extension posts host LLM tokens here; backend resolves the relay future."""
+    fut = _host_relay_futures.get(response.task_run_id)
+    if fut is None or fut.done():
+        raise HTTPException(status_code=404, detail="No pending host relay for this task_run_id")
+
+    if response.error:
+        fut.set_exception(RuntimeError(response.error))
+        _host_relay_futures.pop(response.task_run_id, None)
+        return {"ok": True}
+
+    # Accumulate tokens
+    if not hasattr(fut, "_token_buffer"):
+        fut._token_buffer = []  # type: ignore[attr-defined]
+    if response.token:
+        fut._token_buffer.append(response.token)  # type: ignore[attr-defined]
+
+        # Also push token to SSE queue so streaming UI gets it
+        queue = _task_sse_queues.get(response.task_run_id)
+        if queue:
+            await queue.put({"type": "TOKEN", "token": response.token})
+
+    if response.is_final:
+        content = "".join(getattr(fut, "_token_buffer", []))
+        fut.set_result(content)
+        _host_relay_futures.pop(response.task_run_id, None)
+
+    return {"ok": True}
+
+
+async def _relay_to_host(task_run_id: str, system: str, user: str, ctx_tokens: int) -> str | None:
+    """Emit LLM_REQUEST via SSE and wait for the extension to post the response back."""
+    loop = asyncio.get_event_loop()
+    fut: asyncio.Future = loop.create_future()
+    fut._token_buffer = []  # type: ignore[attr-defined]
+    _host_relay_futures[task_run_id] = fut
+
+    queue: asyncio.Queue = _task_sse_queues.setdefault(task_run_id, asyncio.Queue())
+    await queue.put({
+        "type": "LLM_REQUEST",
+        "task_run_id": task_run_id,
+        "system": system,
+        "user": user,
+        "ctx_tokens": ctx_tokens,
+    })
+
+    try:
+        result: str = await asyncio.wait_for(fut, timeout=120.0)
+        return result
+    except (asyncio.TimeoutError, Exception):
+        _host_relay_futures.pop(task_run_id, None)
+        return None
+
+
+PATCH_SYSTEM = (
+    "You are an expert software engineer. Your task is to produce a minimal, correct unified diff "
+    "that implements the requested code change. Output ONLY the unified diff — no explanation, no "
+    "markdown fences. The diff must start with '--- a/' lines. If you cannot produce a valid diff, "
+    "output the single line: PATCH_REFUSED: <reason>"
+)
+
+
+def _build_prompt(task_description: str, context_files: list[str], context_text: str) -> str:
+    files_block = "\n".join(f"  - {f}" for f in context_files) if context_files else "  (none)"
+    return (
+        f"Task: {task_description}\n\n"
+        f"Files in scope:\n{files_block}\n\n"
+        f"Context:\n{context_text or '(no context pack loaded)'}\n\n"
+        "Produce the unified diff now:"
+    )
+
+
+def _extract_diff(text: str) -> str | None:
+    """Return the first valid-looking unified diff block, or None."""
+    lines = text.strip().splitlines()
+    start = None
+    for i, line in enumerate(lines):
+        if line.startswith("--- "):
+            start = i
+            break
+    if start is None:
+        return None
+    return "\n".join(lines[start:])
+
+
 @app.post("/v1/task/generate-patch", response_model=GeneratePatchResponse)
 async def generate_patch(request: GeneratePatchRequest) -> GeneratePatchResponse:
-    """Generate a code patch for a task (mock implementation for UI development)."""
-    import hashlib
-    import textwrap
-
+    """Generate a code patch using the configured LLM provider chain."""
     description = request.task_description.strip()
     if not description:
         raise HTTPException(status_code=400, detail="Task description is required.")
 
-    # In a real implementation this calls the AI model.
-    # For now, generate a deterministic mock patch to enable UI development.
-    patches: list[FilePatch] = []
-    for file_path in request.context_files[:5]:
-        # Create a mock diff based on file path
-        seed = hashlib.md5(f"{description}:{file_path}".encode()).hexdigest()[:8]
-        mock_diff = textwrap.dedent(f"""\
-            --- a/{file_path}
-            +++ b/{file_path}
-            @@ -1,3 +1,5 @@
-             # existing code
-            +# AI-generated change ({seed})
-            +# Task: {description[:50]}
-             # rest of file
-        """)
-        patches.append(
-            FilePatch(
-                path=file_path,
-                action="modify",
-                original_content="# existing code\n# rest of file\n",
-                new_content=(
-                    f"# existing code\n# AI-generated change ({seed})\n"
-                    f"# Task: {description[:50]}\n# rest of file\n"
-                ),
-                diff=mock_diff.strip(),
-            )
-        )
+    config = load_provider_config(request.workspace_root)
+    db = _get_db()
+    cost_service = CostGuardService(config=_get_config(), db=db)
 
-    # If no context files provided, generate a single placeholder patch
-    if not patches:
-        patches.append(
-            FilePatch(
-                path="src/changes.py",
-                action="create",
-                original_content=None,
-                new_content=f"# New file for: {description[:60]}\n",
-                diff=(
-                    f"--- /dev/null\n+++ b/src/changes.py\n"
-                    f"@@ -0,0 +1,1 @@\n+# New file for: {description[:60]}"
-                ),
+    # Load context pack text if hash provided
+    context_text = ""
+    if request.context_pack_hash:
+        try:
+            cb = ContextBuilderService(config=_get_config(), db=db)
+            conn = await db.connect()
+            cursor = await conn.execute(
+                "SELECT pack_content_snapshot FROM context_pack_versions WHERE pack_hash = ? LIMIT 1",
+                (request.context_pack_hash,),
             )
-        )
+            row = await cursor.fetchone()
+            if row and row[0]:
+                context_text = row[0]
+        except Exception:
+            pass
 
-    # Estimate risk based on file count and mode
+    user_prompt = _build_prompt(description, request.context_files, context_text)
+    task_run_id = request.task_run_id or str(uuid.uuid4())
+
+    # Determine provider fallback order
+    providers_with_keys: list[str] = []
+    if config.get("host_models_available"):
+        providers_with_keys.append("host")
+    for p in ("anthropic", "openai", "ollama", "lmstudio"):
+        key_field = f"{p}_api_key" if p in ("anthropic", "openai") else None
+        if key_field is None or config.get(key_field):
+            if p not in ("anthropic", "openai") or config.get(key_field):
+                providers_with_keys.append(p)
+
+    last_error = "No providers configured."
+    result_text: str | None = None
+    model_used = request.model_id or "none"
+    provider_used = "none"
+    input_tokens = 0
+    output_tokens = 0
+    cost_usd = 0.0
+
+    for provider in providers_with_keys:
+        try:
+            if provider == "host":
+                relay_result = await _relay_to_host(task_run_id, PATCH_SYSTEM, user_prompt, 2000)
+                if relay_result is None:
+                    last_error = "Host relay timed out or no host models available."
+                    continue
+                result_text = relay_result
+                model_used = "copilot"
+                provider_used = "host"
+            else:
+                client = build_client(provider, config)
+                response = await client.complete(PATCH_SYSTEM, user_prompt)
+                result_text = response.content
+                model_used = response.model_id
+                provider_used = response.provider
+                input_tokens = response.input_tokens
+                output_tokens = response.output_tokens
+                cost_usd = response.cost_usd
+
+            if result_text and result_text.strip().startswith("PATCH_REFUSED:"):
+                last_error = result_text.strip()
+                result_text = None
+                continue
+
+            diff = _extract_diff(result_text or "")
+            if diff:
+                break
+            last_error = "Model returned no valid diff."
+            result_text = None
+        except Exception as exc:
+            last_error = str(exc)
+            result_text = None
+            continue
+
+    if not result_text:
+        raise HTTPException(status_code=503, detail=f"All providers failed: {last_error}")
+
+    diff = _extract_diff(result_text) or result_text.strip()
+
+    # Record AI call
+    try:
+        await cost_service.record_ai_call(
+            task_run_id=task_run_id,
+            provider=provider_used,
+            model=model_used,
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            estimated_cost=cost_usd,
+            actual_cost=cost_usd,
+            cache_hit=False,
+            context_pack_hash=request.context_pack_hash,
+            purpose="generate_patch",
+        )
+    except Exception:
+        pass
+
+    # Determine file path from diff header
+    patch_path = request.context_files[0] if request.context_files else "src/changes.py"
+    for line in diff.splitlines():
+        if line.startswith("+++ b/"):
+            patch_path = line[6:]
+            break
+
     risk = "low"
-    if len(patches) > 3:
-        risk = "medium"
     if request.mode in ("refactor", "architecture"):
-        risk = "high" if len(patches) > 2 else "medium"
+        risk = "high" if len(request.context_files or []) > 2 else "medium"
 
-    ranked_files = rank_patch_files([patch.path for patch in patches])
+    patches = [FilePatch(path=patch_path, action="modify", diff=diff)]
+    ranked_files = rank_patch_files([p.path for p in patches])
     approval_tier = determine_approval_tier(ranked_files)
     compliance_warnings = build_compliance_warnings(ranked_files)
 
@@ -3206,17 +3477,14 @@ async def generate_patch(request: GeneratePatchRequest) -> GeneratePatchResponse
     if risk_priority[approval_risk] > risk_priority[risk]:
         risk = approval_risk
 
-    tokens_used = len(description) * 3 + sum(len(p.diff) for p in patches)
-    cost = (tokens_used / 1_000_000) * 5.0  # mock at gpt-4o rate
-
     return GeneratePatchResponse(
         patches=patches,
-        total_files_changed=len(patches),
-        summary=f"Generated {len(patches)} file change(s) for: {description[:80]}",
+        total_files_changed=1,
+        summary=f"Patch for: {description[:80]}",
         estimated_risk=risk,
-        model_used=request.model_id or "codellama-13b-local",
-        tokens_used=tokens_used,
-        cost_usd=round(cost, 6),
+        model_used=model_used,
+        tokens_used=input_tokens + output_tokens,
+        cost_usd=round(cost_usd, 6),
         approval_tier=approval_tier.value,
         ranked_files=_serialize_ranked_files(ranked_files),
         compliance_warnings=_serialize_compliance_warnings(compliance_warnings),
@@ -4826,6 +5094,66 @@ async def upsert_provider_capability(
         )
     )
     return MemoryActionResponse(success=True)
+
+
+class LocalModelItem(BaseModel):
+    model_id: str
+    source: str
+    max_context_tokens: int
+    supports_tools: bool
+    cost_per_1m_input: float
+    status: str
+
+
+class LocalDiscoverResponse(BaseModel):
+    models: list[LocalModelItem]
+    ollama_running: bool
+    lmstudio_running: bool
+
+
+@app.get("/v1/providers/local-discover", response_model=LocalDiscoverResponse)
+async def discover_local_providers(workspace_root: str | None = None) -> LocalDiscoverResponse:
+    """Probe Ollama and LM Studio for locally available models and sync to DB."""
+    config = load_provider_config(workspace_root)
+    models = await discover_all_local(config)
+
+    # Sync discovered models to provider_capabilities table
+    try:
+        registry = ProviderRegistryService(config=_get_config(), db=_get_db())
+        for m in models:
+            await registry.upsert_provider_capability(
+                ProviderCapabilityRecord(
+                    model_id=m.model_id,
+                    source=m.source,
+                    max_context_tokens=m.max_context_tokens,
+                    supports_tool_calling=m.supports_tools,
+                    supports_json_mode=False,
+                    estimated_cost_per_1m_input=0.0,
+                    estimated_cost_per_1m_output=0.0,
+                    privacy_level="local",
+                    allowed_task_types=[],
+                    denied_task_types=[],
+                    requires_approval=False,
+                )
+            )
+    except Exception:
+        pass
+
+    return LocalDiscoverResponse(
+        models=[
+            LocalModelItem(
+                model_id=m.model_id,
+                source=m.source,
+                max_context_tokens=m.max_context_tokens,
+                supports_tools=m.supports_tools,
+                cost_per_1m_input=0.0,
+                status="available",
+            )
+            for m in models
+        ],
+        ollama_running=any(m.source == "ollama" for m in models),
+        lmstudio_running=any(m.source == "lmstudio" for m in models),
+    )
 
 
 @app.get("/v1/ai/replay/{ai_call_id}", response_model=ReplayAICallResponse)

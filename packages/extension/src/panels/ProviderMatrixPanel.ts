@@ -1,6 +1,6 @@
 import * as vscode from 'vscode';
 import { MemoPilotPanelBase } from './MemoPilotPanelBase';
-import { BackendClient, ProviderCapabilityItemResponse } from '../BackendClient';
+import { BackendClient, LocalModelItem, ProviderCapabilityItemResponse } from '../BackendClient';
 
 export class ProviderMatrixPanel extends MemoPilotPanelBase {
     public static readonly viewType = 'memopilot.providerMatrix';
@@ -8,6 +8,9 @@ export class ProviderMatrixPanel extends MemoPilotPanelBase {
 
     private client: BackendClient | undefined;
     private providers: ProviderCapabilityItemResponse[] = [];
+    private localModels: LocalModelItem[] = [];
+    private ollamaRunning = false;
+    private lmstudioRunning = false;
     private loading = false;
     private error: string | undefined;
 
@@ -37,6 +40,9 @@ export class ProviderMatrixPanel extends MemoPilotPanelBase {
         this.panel.onDidDispose(() => {
             ProviderMatrixPanel.instance = undefined;
         });
+        this.panel.webview.onDidReceiveMessage((msg: { type: string }) => {
+            this.handleMessage(msg);
+        });
     }
 
     private async loadData(): Promise<void> {
@@ -50,8 +56,16 @@ export class ProviderMatrixPanel extends MemoPilotPanelBase {
         this.update();
 
         try {
-            const result = await this.client.listProviderCapabilities();
-            this.providers = result.items;
+            const [caps, local] = await Promise.all([
+                this.client.listProviderCapabilities(),
+                this.client.discoverLocalProviders(
+                    vscode.workspace.workspaceFolders?.[0]?.uri.fsPath,
+                ).catch(() => ({ models: [], ollama_running: false, lmstudio_running: false })),
+            ]);
+            this.providers = caps.items;
+            this.localModels = local.models;
+            this.ollamaRunning = local.ollama_running;
+            this.lmstudioRunning = local.lmstudio_running;
             this.error = undefined;
         } catch (err: unknown) {
             this.error = err instanceof Error ? err.message : String(err);
@@ -66,75 +80,109 @@ export class ProviderMatrixPanel extends MemoPilotPanelBase {
 
     private getStyles(): string {
         return `
-            .pm-container { max-width: 900px; padding: 16px; }
+            .pm-container { max-width: 960px; padding: 16px; }
             .pm-container h2 { margin-bottom: 4px; }
             .pm-table { width: 100%; border-collapse: collapse; font-size: 13px; margin-top: 12px; }
             .pm-table th, .pm-table td { padding: 10px 12px; text-align: left; border-bottom: 1px solid var(--vscode-panel-border, rgba(255,255,255,0.1)); }
             .pm-table th { font-size: 11px; text-transform: uppercase; opacity: 0.7; white-space: nowrap; }
             .pm-table td { white-space: nowrap; }
             .pm-table tr:hover td { background: var(--vscode-list-hoverBackground); }
-            .pm-summary { margin-bottom: 16px; opacity: 0.7; font-size: 13px; }
+            .pm-summary { margin-bottom: 8px; opacity: 0.7; font-size: 13px; }
             .pm-check { color: #4caf50; }
             .pm-dash { opacity: 0.4; }
             .pm-approval-yes { color: #ff9800; font-weight: 500; }
+            .pm-local-badge { display: inline-block; padding: 1px 6px; border-radius: 3px; font-size: 11px; background: #1b5e20; color: #a5d6a7; }
+            .pm-status-row { display: flex; gap: 12px; margin-bottom: 12px; font-size: 12px; }
+            .pm-status-dot { width: 8px; height: 8px; border-radius: 50%; display: inline-block; margin-right: 4px; vertical-align: middle; }
+            .pm-status-on { background: #4caf50; }
+            .pm-status-off { background: #555; }
+            .pm-section-title { font-size: 12px; text-transform: uppercase; opacity: 0.6; margin: 20px 0 4px; letter-spacing: 0.05em; }
+            .pm-refresh-btn { padding: 4px 12px; font-size: 12px; cursor: pointer; background: var(--vscode-button-background); color: var(--vscode-button-foreground); border: none; border-radius: 3px; margin-bottom: 8px; }
+            .pm-refresh-btn:hover { background: var(--vscode-button-hoverBackground); }
         `;
     }
 
     protected getContent(): string {
-        if (this.loading) return '<p>Loading providers...</p>';
-        if (this.error) return `<p class="error">${this.escapeHtml(this.error)}</p>`;
-        if (this.providers.length === 0) {
-            return '<p>No provider capabilities configured. Add providers via <code>POST /v1/providers/capabilities</code>.</p>';
-        }
+        if (this.loading) { return '<p>Loading providers...</p>'; }
+        if (this.error) { return `<p class="error">${this.escapeHtml(this.error)}</p>`; }
 
-        const rows = this.providers.map(p => {
-            const privacyColor = p.privacy_level === 'local' ? '#4caf50' : p.privacy_level === 'private_cloud' ? '#ff9800' : '#f44336';
-            const tools = p.supports_tool_calling ? '<span class="pm-check">✓</span>' : '<span class="pm-dash">—</span>';
-            const json = p.supports_json_mode ? '<span class="pm-check">✓</span>' : '<span class="pm-dash">—</span>';
-            const approval = p.requires_approval ? '<span class="pm-approval-yes">⚠ Yes</span>' : 'No';
-            const ctx = p.max_context_tokens ? `${(p.max_context_tokens / 1000).toFixed(0)}K` : '<span class="pm-dash">—</span>';
-            const costIn = `$${p.estimated_cost_per_1m_input.toFixed(2)}`;
-            const costOut = `$${p.estimated_cost_per_1m_output.toFixed(2)}`;
+        const ollamaStatus = this.ollamaRunning ? 'on' : 'off';
+        const lmsStatus = this.lmstudioRunning ? 'on' : 'off';
 
-            return `<tr>
-                <td><strong>${this.escapeHtml(p.model_id)}</strong></td>
-                <td>${this.escapeHtml(p.source)}</td>
-                <td><span style="color:${privacyColor}">${this.escapeHtml(p.privacy_level)}</span></td>
-                <td>${ctx}</td>
-                <td>${tools}</td>
-                <td>${json}</td>
-                <td>${costIn}</td>
-                <td>${costOut}</td>
-                <td>${approval}</td>
-            </tr>`;
-        }).join('');
+        const statusRow = `
+            <div class="pm-status-row">
+                <span><span class="pm-status-dot pm-status-${ollamaStatus}"></span> Ollama: ${this.ollamaRunning ? 'running' : 'not detected'}</span>
+                <span><span class="pm-status-dot pm-status-${lmsStatus}"></span> LM Studio: ${this.lmstudioRunning ? 'running' : 'not detected'}</span>
+            </div>
+        `;
 
-        return `
-            <div class="pm-container">
-            <h2>Provider Capability Matrix</h2>
-            <p class="pm-summary">${this.providers.length} model(s) configured</p>
+        const localSection = this.localModels.length > 0 ? `
+            <div class="pm-section-title">Local Models (free)</div>
+            <table class="pm-table">
+                <thead>
+                    <tr><th>Model</th><th>Source</th><th>Context</th><th>Tools</th><th>Cost/1M</th></tr>
+                </thead>
+                <tbody>
+                ${this.localModels.map(m => `
+                    <tr>
+                        <td><strong>${this.escapeHtml(m.model_id)}</strong> <span class="pm-local-badge">local</span></td>
+                        <td>${this.escapeHtml(m.source)}</td>
+                        <td>${(m.max_context_tokens / 1000).toFixed(0)}K</td>
+                        <td>${m.supports_tools ? '<span class="pm-check">✓</span>' : '<span class="pm-dash">—</span>'}</td>
+                        <td>$0.00</td>
+                    </tr>`).join('')}
+                </tbody>
+            </table>
+        ` : '';
 
+        const cloudSection = this.providers.length > 0 ? `
+            <div class="pm-section-title">Cloud / Configured Providers</div>
             <table class="pm-table">
                 <thead>
                     <tr>
-                        <th>Model</th>
-                        <th>Source</th>
-                        <th>Privacy</th>
-                        <th>Context</th>
-                        <th>Tools</th>
-                        <th>JSON</th>
-                        <th>Cost/1M In</th>
-                        <th>Cost/1M Out</th>
-                        <th>Approval</th>
+                        <th>Model</th><th>Source</th><th>Privacy</th><th>Context</th>
+                        <th>Tools</th><th>JSON</th><th>Cost/1M In</th><th>Cost/1M Out</th><th>Approval</th>
                     </tr>
                 </thead>
-                <tbody>${rows}</tbody>
+                <tbody>
+                ${this.providers.map(p => {
+                    const privacyColor = p.privacy_level === 'local' ? '#4caf50' : p.privacy_level === 'private_cloud' ? '#ff9800' : '#f44336';
+                    const ctx = p.max_context_tokens ? `${(p.max_context_tokens / 1000).toFixed(0)}K` : '<span class="pm-dash">—</span>';
+                    return `<tr>
+                        <td><strong>${this.escapeHtml(p.model_id)}</strong></td>
+                        <td>${this.escapeHtml(p.source)}</td>
+                        <td><span style="color:${privacyColor}">${this.escapeHtml(p.privacy_level)}</span></td>
+                        <td>${ctx}</td>
+                        <td>${p.supports_tool_calling ? '<span class="pm-check">✓</span>' : '<span class="pm-dash">—</span>'}</td>
+                        <td>${p.supports_json_mode ? '<span class="pm-check">✓</span>' : '<span class="pm-dash">—</span>'}</td>
+                        <td>$${p.estimated_cost_per_1m_input.toFixed(2)}</td>
+                        <td>$${p.estimated_cost_per_1m_output.toFixed(2)}</td>
+                        <td>${p.requires_approval ? '<span class="pm-approval-yes">⚠ Yes</span>' : 'No'}</td>
+                    </tr>`;
+                }).join('')}
+                </tbody>
             </table>
+        ` : '';
+
+        const noProviders = this.providers.length === 0 && this.localModels.length === 0
+            ? '<p>No providers detected. Start Ollama or add API keys in <code>.memopilot/config.yaml</code>.</p>'
+            : '';
+
+        return `
+            <div class="pm-container">
+                <h2>Provider Capability Matrix</h2>
+                <button class="pm-refresh-btn" onclick="acquireVsCodeApi().postMessage({type:'refresh'})">↻ Refresh local</button>
+                ${statusRow}
+                ${localSection}
+                ${cloudSection}
+                ${noProviders}
             </div>
         `;
     }
 
-    protected handleMessage(_message: { type: string }): void {
-        // Future: refresh, filter by privacy level
+    protected handleMessage(message: { type: string }): void {
+        if (message.type === 'refresh') {
+            void this.loadData();
+        }
     }
 }

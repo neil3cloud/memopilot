@@ -970,6 +970,15 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         statusProvider,
         refreshGovernanceViews,
     );
+
+    // Auto-index on activation — silent background, non-blocking
+    void triggerAutoIndex(backendClient, outputChannel);
+
+    context.subscriptions.push(
+        vscode.workspace.onDidChangeWorkspaceFolders(() => {
+            void triggerAutoIndex(backendClient, outputChannel);
+        }),
+    );
 }
 
 async function startBackend(
@@ -1043,6 +1052,41 @@ async function getGitDiffForReview(workspaceRoot: string): Promise<string> {
             resolve(error ? '' : stdout);
         });
     });
+}
+
+async function triggerAutoIndex(
+    client: BackendClient | undefined,
+    outputChannel: vscode.OutputChannel,
+): Promise<void> {
+    if (!client) { return; }
+
+    try {
+        const workspaceRoot = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+        if (!workspaceRoot) { return; }
+
+        const status = await client.getIndexStatus(workspaceRoot);
+        const lastIndexed = status.last_indexed_at ? new Date(status.last_indexed_at).getTime() : 0;
+        const hoursSince = (Date.now() - lastIndexed) / 3_600_000;
+
+        const shouldIndex =
+            !status.ever_indexed ||
+            status.stale_file_count > 0 ||
+            hoursSince > 24;
+
+        if (!shouldIndex) { return; }
+
+        const bar = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 99);
+        bar.text = '$(sync~spin) MemoPilot indexing...';
+        bar.show();
+
+        await client.indexWorkspace(true);
+        bar.text = '$(check) MemoPilot ready';
+        setTimeout(() => bar.dispose(), 3000);
+
+        outputChannel.appendLine('[MemoPilot] Auto-index complete.');
+    } catch {
+        // Silent failure — MemoPilot remains usable without index
+    }
 }
 
 export async function deactivate(): Promise<void> {

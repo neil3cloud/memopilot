@@ -77,6 +77,9 @@ export class MemoPilotPanel extends MemoPilotPanelBase {
             case 'restart-backend':
                 void vscode.commands.executeCommand('memopilot.restartBackend');
                 break;
+            case 'enter-api-key':
+                void this.handleEnterApiKey();
+                break;
             default:
                 break;
         }
@@ -158,6 +161,7 @@ export class MemoPilotPanel extends MemoPilotPanelBase {
             filesScanned: 0,
             totalFiles: 0,
             symbolsExtracted: 0,
+            needsSetup: false,
         };
 
         if (!this.client) {
@@ -174,7 +178,57 @@ export class MemoPilotPanel extends MemoPilotPanelBase {
             base.connected = false;
         }
 
+        if (base.connected) {
+            try {
+                const local = await this.client.discoverLocalProviders(base.workspaceRoot || undefined);
+                const hasLocal = local.models.length > 0;
+                // Check cloud provider config via index status (if memory_item_count > 0, some config exists)
+                // We detect "needs setup" if no local models and backend is responding (so it's a fresh install)
+                if (!hasLocal) {
+                    const status = await this.client.getIndexStatus(base.workspaceRoot || '');
+                    base.needsSetup = status.memory_item_count === 0;
+                }
+            } catch {
+                // If checks fail, don't show setup card
+            }
+        }
+
         return base;
+    }
+
+    private async handleEnterApiKey(): Promise<void> {
+        const provider = await vscode.window.showQuickPick(
+            ['anthropic', 'openai'],
+            { placeHolder: 'Select provider' },
+        );
+        if (!provider) { return; }
+
+        const key = await vscode.window.showInputBox({
+            prompt: `Enter your ${provider === 'anthropic' ? 'Anthropic' : 'OpenAI'} API key`,
+            password: true,
+            placeHolder: provider === 'anthropic' ? 'sk-ant-...' : 'sk-...',
+        });
+        if (!key) { return; }
+
+        const workspaceFolder = vscode.workspace.workspaceFolders?.[0];
+        if (!workspaceFolder) {
+            vscode.window.showErrorMessage('No workspace folder open.');
+            return;
+        }
+
+        const configDir = vscode.Uri.joinPath(workspaceFolder.uri, '.memopilot');
+        const configFile = vscode.Uri.joinPath(configDir, 'config.yaml');
+
+        try {
+            const keyField = provider === 'anthropic' ? 'anthropic_api_key' : 'openai_api_key';
+            const yaml = `# MemoPilot provider config — do not commit\n${keyField}: ${key}\n`;
+            await vscode.workspace.fs.createDirectory(configDir);
+            await vscode.workspace.fs.writeFile(configFile, Buffer.from(yaml, 'utf8'));
+            vscode.window.showInformationMessage(`API key saved to .memopilot/config.yaml`);
+            this.sendWorkspaceStatus();
+        } catch (err: unknown) {
+            vscode.window.showErrorMessage(`Failed to write config: ${err instanceof Error ? err.message : String(err)}`);
+        }
     }
 
     private getViewContentHtml(viewId: string): string {
@@ -290,6 +344,18 @@ export class MemoPilotPanel extends MemoPilotPanelBase {
                 postMsg('restart-backend');
                 return;
             }
+            if (e.target.closest('.mp-setup-key-btn')) {
+                postMsg('enter-api-key');
+                return;
+            }
+            if (e.target.closest('.mp-setup-ollama-btn')) {
+                postMsg('navigate', { viewId: 'provider-matrix' });
+                return;
+            }
+            if (e.target.closest('.mp-setup-copilot-btn')) {
+                postMsg('navigate', { viewId: 'provider-matrix' });
+                return;
+            }
         });
 
         window.handleMessage = function(msg) {
@@ -343,6 +409,16 @@ export class MemoPilotPanel extends MemoPilotPanelBase {
             }
             if (!status.connected) {
                 html += '<div style="margin-top:12px;"><button class="mp-restart-btn mp-btn">Restart Backend</button></div>';
+            }
+            if (status.needsSetup) {
+                html += '<div style="margin-top:20px;padding:16px;border:1px solid var(--mp-border);border-radius:6px;background:var(--vscode-editor-background);">'
+                    + '<strong style="font-size:14px;">First-time setup</strong>'
+                    + '<p style="font-size:12px;margin:8px 0 12px;opacity:0.8;">No AI providers detected. Choose how to enable AI patch generation:</p>'
+                    + '<div style="display:flex;flex-direction:column;gap:8px;">'
+                    + '<button class="mp-setup-ollama-btn" style="background:var(--mp-button-bg);color:var(--mp-button-fg);border:none;padding:8px 12px;border-radius:4px;cursor:pointer;text-align:left;">🦙 Install Ollama (free, local) — ollama.com</button>'
+                    + '<button class="mp-setup-key-btn" style="background:var(--mp-button-bg);color:var(--mp-button-fg);border:none;padding:8px 12px;border-radius:4px;cursor:pointer;text-align:left;">🔑 Enter API key (Anthropic or OpenAI)</button>'
+                    + '<button class="mp-setup-copilot-btn" style="background:var(--mp-button-bg);color:var(--mp-button-fg);border:none;padding:8px 12px;border-radius:4px;cursor:pointer;text-align:left;">🤖 Use Copilot subscription (VS Code only)</button>'
+                    + '</div></div>';
             }
             el.innerHTML = html;
         }
