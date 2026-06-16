@@ -555,19 +555,14 @@ export class BackendClient {
         return result as InitWorkspaceResponse;
     }
 
-    async indexWorkspace(): Promise<WorkspaceIndexResponse> {
-        const result = await this.manager.request('POST', '/v1/workspace/index');
+    async indexWorkspace(seedMemory: boolean = true): Promise<WorkspaceIndexResponse> {
+        const result = await this.manager.request('POST', '/v1/workspace/index', { seed_memory: seedMemory });
         return result as WorkspaceIndexResponse;
     }
 
     async rebuildMemory(): Promise<RebuildMemoryResponse> {
         const result = await this.manager.request('POST', '/v1/workspace/rebuild-memory');
         return result as RebuildMemoryResponse;
-    }
-
-    async indexWorkspace(seedMemory: boolean = true): Promise<WorkspaceIndexResponse> {
-        const result = await this.manager.request('POST', '/v1/workspace/index', { seed_memory: seedMemory });
-        return result as WorkspaceIndexResponse;
     }
 
     async getIndexStatus(workspaceRoot: string): Promise<WorkspaceIndexStatusResponse> {

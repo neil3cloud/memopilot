@@ -180,11 +180,19 @@ export class MemoPilotPanel extends MemoPilotPanelBase {
 
         if (base.connected) {
             try {
+                // Check if VS Code Copilot (host) models are available
+                const lm = (vscode as unknown as Record<string, unknown>).lm as
+                    | { selectChatModels: (selector: object) => Thenable<unknown[]> }
+                    | undefined;
+                const copilotModels = lm && typeof lm.selectChatModels === 'function'
+                    ? await lm.selectChatModels({ vendor: 'copilot' })
+                    : [];
+                const hasCopilot = Array.isArray(copilotModels) && copilotModels.length > 0;
+
                 const local = await this.client.discoverLocalProviders(base.workspaceRoot || undefined);
                 const hasLocal = local.models.length > 0;
-                // Check cloud provider config via index status (if memory_item_count > 0, some config exists)
-                // We detect "needs setup" if no local models and backend is responding (so it's a fresh install)
-                if (!hasLocal) {
+                // Needs setup only if neither Copilot nor local models are available
+                if (!hasLocal && !hasCopilot) {
                     const status = await this.client.getIndexStatus(base.workspaceRoot || '');
                     base.needsSetup = status.memory_item_count === 0;
                 }

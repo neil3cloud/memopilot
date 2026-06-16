@@ -11,6 +11,7 @@ export class ProviderMatrixPanel extends MemoPilotPanelBase {
     private localModels: LocalModelItem[] = [];
     private ollamaRunning = false;
     private lmstudioRunning = false;
+    private copilotModels: string[] = [];
     private loading = false;
     private error: string | undefined;
 
@@ -66,6 +67,20 @@ export class ProviderMatrixPanel extends MemoPilotPanelBase {
             this.localModels = local.models;
             this.ollamaRunning = local.ollama_running;
             this.lmstudioRunning = local.lmstudio_running;
+
+            // Detect authenticated Copilot models via VS Code LM API
+            try {
+                const lm = (vscode as unknown as Record<string, unknown>).lm as
+                    | { selectChatModels: (selector: object) => Thenable<{ id: string; name?: string }[]> }
+                    | undefined;
+                const models = lm && typeof lm.selectChatModels === 'function'
+                    ? await lm.selectChatModels({ vendor: 'copilot' })
+                    : [];
+                this.copilotModels = (models ?? []).map(m => m.id ?? m.name ?? 'copilot');
+            } catch {
+                this.copilotModels = [];
+            }
+
             this.error = undefined;
         } catch (err: unknown) {
             this.error = err instanceof Error ? err.message : String(err);
@@ -109,20 +124,36 @@ export class ProviderMatrixPanel extends MemoPilotPanelBase {
         const ollamaStatus = this.ollamaRunning ? 'on' : 'off';
         const lmsStatus = this.lmstudioRunning ? 'on' : 'off';
 
+        const copilotStatus = this.copilotModels.length > 0 ? 'on' : 'off';
+        const copilotLabel = this.copilotModels.length > 0
+            ? `authenticated (${this.copilotModels.length} model${this.copilotModels.length > 1 ? 's' : ''})`
+            : 'not available';
+
         const statusRow = `
             <div class="pm-status-row">
+                <span><span class="pm-status-dot pm-status-${copilotStatus}"></span> GitHub Copilot: ${copilotLabel}</span>
                 <span><span class="pm-status-dot pm-status-${ollamaStatus}"></span> Ollama: ${this.ollamaRunning ? 'running' : 'not detected'}</span>
                 <span><span class="pm-status-dot pm-status-${lmsStatus}"></span> LM Studio: ${this.lmstudioRunning ? 'running' : 'not detected'}</span>
             </div>
         `;
 
-        const localSection = this.localModels.length > 0 ? `
-            <div class="pm-section-title">Local Models (free)</div>
+        const copilotRows = this.copilotModels.map(id => `
+                    <tr>
+                        <td><strong>${this.escapeHtml(id)}</strong> <span class="pm-local-badge" style="background:#0e3a5e;color:#90caf9">copilot</span></td>
+                        <td>GitHub Copilot</td>
+                        <td>varies</td>
+                        <td><span class="pm-check">✓</span></td>
+                        <td>$0.00</td>
+                    </tr>`).join('');
+
+        const localSection = (this.localModels.length > 0 || this.copilotModels.length > 0) ? `
+            <div class="pm-section-title">Local / Host Models (free)</div>
             <table class="pm-table">
                 <thead>
                     <tr><th>Model</th><th>Source</th><th>Context</th><th>Tools</th><th>Cost/1M</th></tr>
                 </thead>
                 <tbody>
+                ${copilotRows}
                 ${this.localModels.map(m => `
                     <tr>
                         <td><strong>${this.escapeHtml(m.model_id)}</strong> <span class="pm-local-badge">local</span></td>
@@ -164,8 +195,8 @@ export class ProviderMatrixPanel extends MemoPilotPanelBase {
             </table>
         ` : '';
 
-        const noProviders = this.providers.length === 0 && this.localModels.length === 0
-            ? '<p>No providers detected. Start Ollama or add API keys in <code>.memopilot/config.yaml</code>.</p>'
+        const noProviders = this.providers.length === 0 && this.localModels.length === 0 && this.copilotModels.length === 0
+            ? '<p>No providers detected. Sign in to GitHub Copilot, start Ollama, or add API keys in <code>.memopilot/config.yaml</code>.</p>'
             : '';
 
         return `

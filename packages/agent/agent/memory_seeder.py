@@ -40,6 +40,15 @@ class MemorySeederService:
         seeded += await self._seed_test_registry(conn, workspace_root)
 
         await conn.commit()
+
+        # Rebuild FTS index so seeded items are immediately searchable
+        if seeded > 0:
+            try:
+                await conn.execute("INSERT INTO memory_fts(memory_fts) VALUES('rebuild')")
+                await conn.commit()
+            except Exception:
+                pass  # FTS table may not exist in older schemas — non-fatal
+
         return seeded
 
     # ------------------------------------------------------------------

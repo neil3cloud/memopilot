@@ -1,6 +1,6 @@
 # MemoPilot: Master Product and Implementation Reference
 
-**Document Version:** 2.6 (Workflow Intelligence + UI Redesign) **Target Product:** MemoPilot — Rule-Aware, Local-Memory, Cost-Governed AI Development Agent Extension for VS Code/Cursor **Status:** Production Reference
+**Document Version:** 2.7 (LLM Integration + Provider Wiring + Pipeline Fixes) **Target Product:** MemoPilot — Rule-Aware, Local-Memory, Cost-Governed AI Development Agent Extension for VS Code/Cursor **Status:** Production Reference — End-to-End LLM Pipeline Live
 
 ---
 
@@ -38,6 +38,7 @@
 30. [Tool Mode Integration (v2.4)](#30-tool-mode-integration-v24--june-2026)
 31. [Context Accuracy Refinement (v2.5)](#31-context-accuracy-refinement-v25--june-2026)
 32. [Workflow Intelligence + UI Redesign (v2.6)](#32-workflow-intelligence--ui-redesign-v26--june-2026)
+33. [LLM Integration + Provider Wiring + Pipeline Fixes (v2.7)](#33-llm-integration--provider-wiring--pipeline-fixes-v27--june-2026)
 
 ---
 
@@ -4067,4 +4068,129 @@ Phase 32:  Workflow Intelligence + UI Redesign
   P6: Smart memory timing (trusted auto-confirm gate, task_run_id requirement, derivation_source validation)
   P7: TaskEntryPanel redesign (stepper, guardrails, badges, suggested files, AI boundary, docs-only flow)
   P8: Code review fixes + tests (F821 unsafe, stricter provenance gate, 37 new tests, schema v21)
+```
+
+---
+
+## 33. LLM Integration + Provider Wiring + Pipeline Fixes (v2.7 — June 2026)
+
+### 33.1 Overview
+
+This phase delivered end-to-end LLM integration. Prior to this phase, all AI-dependent steps returned mock/deterministic data. After this phase, the full task pipeline — analyze → context → route → patch → approve → validate → apply — runs with a real LLM and has been verified end-to-end producing real patches via GitHub Copilot.
+
+**Verified result (2026-06-17):** Task "add NB.md file" → analyze → context (0 tokens) → route → Copilot relay → patch generated → user approved → validation passed → file applied to disk. Full pipeline in ~52 seconds.
+
+### 33.2 Changes Delivered
+
+#### Backend (`packages/agent/agent/api.py`)
+
+**Bug: `host` provider always skipped**
+- `generate_patch()` gated the `host` provider behind `config.get("host_models_available")` — a key that `config_loader.py` never sets (not in `_DEFAULTS`, not in the YAML template)
+- **Fix:** `host` is now always included in the provider fallback list. If Copilot is unavailable, `HostModelClient` posts a `no_host_models` error → `_relay_to_host()` returns `None` → the loop falls through to the next provider automatically
+
+**Bug: `fallback_order` from config ignored**
+- Provider loop was hardcoded; user's configured order was not respected
+- **Fix:** Loop now reads `config.get("fallback_order", [...])` and iterates in that order
+
+**Bug: `lmstudio` always raised `ValueError`**
+- `lmstudio` was added to the provider list even when `lmstudio_model` was not configured, causing `build_client()` to raise unconditionally
+- **Fix:** Guard added — `lmstudio` only included when `config.get("lmstudio_model")` is set
+
+#### Extension — `HostModelClient` wiring (`packages/extension/src/`)
+
+**Bug: `HostModelClient` was never instantiated**
+- The class existed but was an orphan — nothing created or started it
+- **Fix:** `TaskFlowController` now accepts an optional `BackendManager` parameter. `generatePatch()` creates a `HostModelClient(manager)` and calls `listenForTask(taskRunId)` before posting to `/v1/task/generate-patch`, so `LLM_REQUEST` SSE events are received and Copilot tokens are streamed back via `/v1/llm/host-response`
+
+**Fix: `extension.ts` passes `backendManager` to `TaskFlowController`**
+- `new TaskFlowController(backendClient, backendManager)` — both `client` and `manager` now provided
+
+#### Extension — Pipeline cascade fix
+
+**Bug: `buildContext()` and `routeModel()` auto-chained unconditionally**
+- Both methods had hardcoded `await this.routeModel()` / `await this.generatePatch()` at the end
+- "Generate Context Pack" triggered the full pipeline including `generatePatch()`, which failed with HTTP 503 when no providers were configured
+- **Fix:** Auto-proceed cascades removed from `buildContext()` and `routeModel()`. `startTask()` now drives the full pipeline explicitly with error guards between steps
+
+**Bug: `runPatchGeneration()` if/else chain only ran one step per click**
+- Used `if / else if / else` — called exactly one step then stopped. After building context and routing, clicking "Generate Patch" called `routeModel()` but never proceeded to `generatePatch()`
+- **Fix:** Replaced with sequential `if` blocks that always advance through all remaining steps
+
+#### Extension — Provider Matrix (`packages/extension/src/panels/ProviderMatrixPanel.ts`)
+
+**Enhancement: Copilot models shown in Provider Matrix**
+- `loadData()` now calls `vscode.lm.selectChatModels({ vendor: 'copilot' })` and stores discovered model IDs in `copilotModels[]`
+- Status row shows: GitHub Copilot authenticated (N models) / not available
+- Copilot models listed in "Local / Host Models (free)" section with blue `copilot` badge and $0.00 cost
+
+#### Extension — First-time setup detection (`packages/extension/src/panels/MemoPilotPanel.ts`)
+
+**Bug: "First-time setup" card shown to Copilot users**
+- `needsSetup` only checked for local Ollama/LM Studio models
+- **Fix:** Now also calls `vscode.lm.selectChatModels({ vendor: 'copilot' })` — setup card is suppressed if Copilot models are available
+
+#### Backend — `memory_seeder.py`
+
+**Bug: FTS index not rebuilt after memory seeding**
+- Seeded items were not immediately searchable
+- **Fix:** Added `INSERT INTO memory_fts(memory_fts) VALUES('rebuild')` after seeding
+
+#### Backend — `pyproject.toml`
+
+**Bug: `httpx` was a dev-only dependency**
+- Required by `local_model_discovery.py`, `llm_client.py`, `mcp_server.py` at runtime
+- **Fix:** Moved to `[project] dependencies`
+
+### 33.3 Extension Version
+
+Version bumped from `1.0.0` → `1.0.1` to work around VS Code extension folder lock on in-place reinstall.
+
+### 33.4 Provider Configuration
+
+Provider config lives in `.memopilot/config.yaml` (workspace) or `~/.memopilot/config.yaml` (global). Template auto-written on first backend start.
+
+```yaml
+provider: host           # host (VS Code Copilot) | ollama | anthropic | openai | lmstudio
+fallback_order:
+  - host                 # Always tried first — uses vscode.lm API, no API key needed
+  - ollama               # Local, free
+  - anthropic            # Requires anthropic_api_key
+  - openai               # Requires openai_api_key
+budget_profile: cost_saver
+
+# Cloud API keys (uncomment to enable)
+# anthropic_api_key: sk-ant-...
+# openai_api_key: sk-...
+```
+
+### 33.5 Copilot Relay Architecture
+
+```
+generate_patch() [backend]
+  └── emit LLM_REQUEST via SSE queue
+        └── HostModelClient.listenForTask() [extension]
+              └── SSE stream receives LLM_REQUEST event
+                    └── vscode.lm.selectChatModels({ vendor: 'copilot' })
+                          └── model.sendRequest(messages)
+                                └── stream tokens → POST /v1/llm/host-response
+                                      └── backend resolves relay future
+                                            └── generate_patch() returns diff
+```
+
+### 33.6 Sprint Summary
+
+```
+Phase 33:  LLM Integration + Provider Wiring + Pipeline Fixes
+  P1: httpx runtime dependency fix (pyproject.toml)
+  P2: lmstudio guard in provider fallback loop
+  P3: fallback_order config respected in generate_patch()
+  P4: FTS rebuild after memory seeding
+  P5: HostModelClient wired into TaskFlowController.generatePatch()
+  P6: extension.ts passes backendManager to TaskFlowController
+  P7: buildContext()/routeModel() auto-chain cascade removed
+  P8: runPatchGeneration() sequential pipeline fix (if/else → sequential if)
+  P9: MemoPilotPanel.ts Copilot detection in needsSetup
+  P10: ProviderMatrixPanel Copilot model discovery and display
+  P11: Version bump to 1.0.1
+  P12: End-to-end verification — full pipeline produces real patch via Copilot
 ```

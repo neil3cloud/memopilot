@@ -169,7 +169,9 @@ docs/          — Product documentation
 
 ## Current Implementation Status
 
-**Completed:** Phases 1–32 (All phases through v2.6 + Feature Refinement + Tool Mode + Context Accuracy + Workflow Intelligence) — Full Remediation + Refinement + Tool Integration + Context Accuracy + Workflow Intelligence
+**Completed:** Phases 1–33 (All phases through v2.7 + LLM Integration + Provider Wiring + Pipeline Fixes)
+
+- **LLM Integration (Phase 33):** End-to-end LLM pipeline live — `generate_patch()` calls GitHub Copilot (via `HostModelClient` SSE relay), Ollama, Anthropic, or OpenAI in configured fallback order. `HostModelClient` wired into `TaskFlowController.generatePatch()`. Pipeline cascade bugs fixed in both controller and panel. Copilot model detection in Provider Matrix and first-time setup check. Verified end-to-end: full analyze→context→route→patch→approve→validate→apply with real Copilot output.
 
 - **Schema Remediation (26 issues resolved):** Lockfile format with schema/api version, FTS5 sync triggers, governance migration (memory_class, memory_status, visibility_scope, reusable, review_required), trust level inverted (5=best), supersedes_id removed in favor of memory_relations, schema constraints, snapshots folder spec
 - **Workflow Correctness:** Patch apply via `git apply --check` with snapshot rollback, response cache quality filter (success-only, disabled for critical tasks), investigation sessions (pre-task evidence), 8 investigation API endpoints, task classifier two-pass priority (file type > directory), workspace profile YAML as source of truth, per-command validation timeouts, MCP per-context caps (pre_fetch=8, patch=5, investigation=12)
@@ -283,7 +285,7 @@ uv run pytest
 ### Install Extension
 
 ```bash
-code --install-extension packages/extension/memopilot-1.0.0.vsix
+code --install-extension packages/extension/memopilot-1.0.1.vsix
 ```
 
 ## Documentation

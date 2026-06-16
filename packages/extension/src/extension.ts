@@ -135,7 +135,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         }
         // Recreate task flow controller with new client
         if (backendClient) {
-            taskFlowController = new TaskFlowController(backendClient);
+            taskFlowController = new TaskFlowController(backendClient, backendManager);
         }
         await Promise.all([
             profileProvider.refresh(),

@@ -7,6 +7,8 @@ import {
     GeneratePatchResponse,
     ValidateResponse,
 } from '../BackendClient';
+import { BackendManager } from '../BackendManager';
+import { HostModelClient } from '../HostModelClient';
 
 export type TaskFlowStage =
     | 'idle'
@@ -45,7 +47,7 @@ export class TaskFlowController {
     private state: TaskFlowState;
     private listeners: StageChangeListener[] = [];
 
-    constructor(private client: BackendClient) {
+    constructor(private client: BackendClient, private manager?: BackendManager) {
         this.state = {
             stage: 'idle',
             taskDescription: '',
@@ -116,8 +118,12 @@ export class TaskFlowController {
             return;
         }
 
-        // Auto-proceed to context build
+        // Auto-proceed through the full pipeline
         await this.buildContext();
+        if (this.state.error) { return; }
+        await this.routeModel();
+        if (this.state.error) { return; }
+        await this.generatePatch();
     }
 
     /** Build the context pack */
@@ -138,9 +144,6 @@ export class TaskFlowController {
             this.transition('error', { error: this.errorMsg(err) });
             return;
         }
-
-        // Auto-proceed to model routing
-        await this.routeModel();
     }
 
     /** Select the model */
@@ -160,9 +163,6 @@ export class TaskFlowController {
             this.transition('error', { error: this.errorMsg(err) });
             return;
         }
-
-        // Auto-proceed to patch generation
-        await this.generatePatch();
     }
 
     /** Generate the patch, streaming tokens to listeners as they arrive */
@@ -175,6 +175,13 @@ export class TaskFlowController {
         // Generate a task run ID so we can open the SSE stream before posting
         const taskRunId = crypto.randomUUID();
         this.transition('generating_patch', { taskRunId, streamingToken: undefined });
+
+        // Start Copilot relay BEFORE posting so LLM_REQUEST events are handled
+        let hostDisposable: vscode.Disposable | undefined;
+        if (this.manager) {
+            const hostClient = new HostModelClient(this.manager);
+            hostDisposable = hostClient.listenForTask(taskRunId);
+        }
 
         // Open SSE stream to receive tokens as the LLM generates them
         let streamingContent = '';
@@ -197,6 +204,7 @@ export class TaskFlowController {
             this.transition('error', { error: this.errorMsg(err), streamingToken: undefined });
         } finally {
             stopStream();
+            hostDisposable?.dispose();
         }
     }
 

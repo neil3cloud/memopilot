@@ -3329,15 +3329,23 @@ async def generate_patch(request: GeneratePatchRequest) -> GeneratePatchResponse
     user_prompt = _build_prompt(description, request.context_files, context_text)
     task_run_id = request.task_run_id or str(uuid.uuid4())
 
-    # Determine provider fallback order
+    # Determine provider fallback order, respecting user-configured order
+    configured_order: list[str] = config.get("fallback_order", ["host", "ollama", "anthropic", "openai"])
     providers_with_keys: list[str] = []
-    if config.get("host_models_available"):
-        providers_with_keys.append("host")
-    for p in ("anthropic", "openai", "ollama", "lmstudio"):
-        key_field = f"{p}_api_key" if p in ("anthropic", "openai") else None
-        if key_field is None or config.get(key_field):
-            if p not in ("anthropic", "openai") or config.get(key_field):
+    for p in configured_order:
+        if p == "host":
+            # Always include host — the SSE relay handles the case where
+            # Copilot is unavailable by returning a no_host_models error,
+            # which causes _relay_to_host() to return None and fall through.
+            providers_with_keys.append("host")
+        elif p in ("anthropic", "openai"):
+            if config.get(f"{p}_api_key"):
                 providers_with_keys.append(p)
+        elif p == "ollama":
+            providers_with_keys.append("ollama")
+        elif p == "lmstudio":
+            if config.get("lmstudio_model"):
+                providers_with_keys.append("lmstudio")
 
     last_error = "No providers configured."
     result_text: str | None = None

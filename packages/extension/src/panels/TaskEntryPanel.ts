@@ -281,16 +281,20 @@ export class TaskEntryPanel extends MemoPilotPanelBase {
             if (this.flowController) {
                 const state = this.flowController.getState();
                 this.log(`runPatchGeneration: current flow state = ${state.stage}`);
-                if (!state.contextPack) {
+
+                // Step through the pipeline from wherever we left off
+                if (!this.flowController.getState().contextPack) {
                     this.log('runPatchGeneration: no contextPack → calling buildContext()');
                     await this.flowController.buildContext();
-                } else if (!state.modelDecision) {
+                    if (this.flowController.getState().error) { throw new Error(this.flowController.getState().error); }
+                }
+                if (!this.flowController.getState().modelDecision) {
                     this.log('runPatchGeneration: no modelDecision → calling routeModel()');
                     await this.flowController.routeModel();
-                } else {
-                    this.log('runPatchGeneration: context+route ready → calling generatePatch()');
-                    await this.flowController.generatePatch();
+                    if (this.flowController.getState().error) { throw new Error(this.flowController.getState().error); }
                 }
+                this.log('runPatchGeneration: context+route ready → calling generatePatch()');
+                await this.flowController.generatePatch();
                 const finalState = this.flowController.getState();
                 this.log(`runPatchGeneration: final state = ${finalState.stage}`);
                 if (finalState.patch) {
