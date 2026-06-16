@@ -71,7 +71,7 @@ from .llm_client import build_client
 from .memory_seeder import MemorySeederService
 from .memory_recall import MemoryRecallService, RecallRequest, RecallResponse
 from .migration_runner import run_migrations
-from .model_router import TIER_ORDER, ModelTier, get_outcome_routing_hint
+from .model_router import TIER_ORDER, ModelTier, get_outcome_routing_hint, route_model as _route_model_logic
 from .patch_assessor import PatchAssessorService
 from .policy_packs import PolicyPacksService
 from .privacy_dashboard_service import PrivacyDashboardService
@@ -3104,80 +3104,28 @@ async def route_model(request: ModelRouteRequest) -> ModelRouteResponse:
         except Exception:
             pass
 
-    claude_cost = (context_tokens / 1_000_000) * 3.0 + 0.015
-    candidates.append(
-        ModelChoice(
-            model_id="claude-3.5-sonnet",
-            provider="anthropic",
-            cost_estimate_usd=round(claude_cost, 4),
-            reasons=["Strong at structured code changes", "200K context window"],
-            fits_context=context_tokens <= 200_000,
-        )
-    )
+    context_tokens = request.context_tokens
+    task_type = request.task_type
 
-    allowed_candidates: list[ModelChoice] = []
-    candidate_checks: dict[str, object] = {}
-    for candidate in candidates:
-        provider_privacy = "local" if candidate.provider == "ollama" else "cloud"
-        provider_check = await cost_service.check_provider_budget(
-            provider=candidate.provider,
-            model=candidate.model_id,
-            privacy_level=provider_privacy,
-            estimated_cost_usd=candidate.cost_estimate_usd,
-            requires_approval=candidate.model_id in {"gpt-4o", "claude-3.5-sonnet"},
-            approval_granted=False,
-        )
-        candidate_checks[candidate.model_id] = provider_check
-        if candidate.fits_context and provider_check.allowed:
-            allowed_candidates.append(candidate)
-
-    selection_pool = (
-        allowed_candidates
-        or [candidate for candidate in candidates if candidate.fits_context]
-        or candidates
-    )
-    recommended = selection_pool[0]
-
-    if request.preferred_model:
-        for candidate in selection_pool:
-            if candidate.model_id == request.preferred_model:
-                recommended = candidate
-                break
-    elif not local_fits:
-        cloud_fits = [candidate for candidate in selection_pool if candidate.provider != "ollama"]
-        if cloud_fits:
-            recommended = min(cloud_fits, key=lambda item: item.cost_estimate_usd)
-    elif privacy == "cloud_ok" and task_type in ("complex", "architecture"):
-        for candidate in selection_pool:
-            if candidate.provider != "ollama":
-                recommended = candidate
-                break
-
-    def candidate_tier(candidate: ModelChoice) -> ModelTier:
-        if candidate.provider == "ollama":
+    def _decision_tier(d: object) -> ModelTier:
+        provider = getattr(d, "provider", None) or ""
+        if provider in ("ollama", "lmstudio"):
             return ModelTier.LOCAL
-        if candidate.provider == "anthropic":
+        if provider == "anthropic":
             return ModelTier.FRONTIER
         return ModelTier.CHEAP_CLOUD
 
-    base_tier = candidate_tier(recommended)
+    base_tier = _decision_tier(decision)
     escalation_source: str | None = None
-    routing_reason = {
-        ModelTier.LOCAL: (
-            "Routing to local based on context fit and privacy preferences. Frontier escalation "
-            "would only trigger after 2 failed non-frontier attempts on the same file within 30 "
-            "days, and local routes are not escalated automatically."
-        ),
-        ModelTier.CHEAP_CLOUD: (
-            "Routing to cheap_cloud based on the current context budget. Frontier escalation would "
-            "trigger after 2 failed non-frontier attempts on the same file within 30 days."
-        ),
-        ModelTier.FRONTIER: (
-            "Routing to frontier because the task already needs the highest-capability tier. "
-            "Frontier escalation would otherwise trigger after 2 failed non-frontier attempts on "
-            "the same file within 30 days, and no higher escalation tier exists."
-        ),
-    }[base_tier]
+    routing_reason = (
+        "Routing to local — fits local context window with zero cloud cost. "
+        "Frontier escalation triggers after 2 failed non-frontier attempts on the same file within 30 days."
+        if base_tier == ModelTier.LOCAL else
+        "Routing to cheap_cloud based on context budget. Frontier escalation triggers after "
+        "2 failed non-frontier attempts on the same file within 30 days."
+        if base_tier == ModelTier.CHEAP_CLOUD else
+        "Routing to frontier — task requires highest-capability tier. No further escalation available."
+    )
 
     if request.files_in_context and base_tier != ModelTier.LOCAL:
         conn = await db.connect()
@@ -3192,33 +3140,38 @@ async def route_model(request: ModelRouteRequest) -> ModelRouteResponse:
                 f"{hinted_reason} Without repeated file failures, this request would stay on "
                 f"{base_tier.value}."
             )
-            for candidate in candidates:
-                if candidate_tier(candidate) == hinted_tier:
-                    recommended = candidate
-                    break
+            base_tier = hinted_tier
 
     reason_list = [*recommended.reasons, routing_reason]
     if request.model_override:
         reason_list.append("Model override requested by caller.")
     recommended = recommended.model_copy(update={"reasons": reason_list})
 
-    alternatives = [
-        candidate for candidate in candidates if candidate.model_id != recommended.model_id
-    ]
-    recommended_check = candidate_checks.get(recommended.model_id)
-    budget_allowed = bool(
-        getattr(recommended_check, "allowed", recommended.cost_estimate_usd <= remaining_usd)
-    )
+    # Build one representative option per tier for the UI
     options = [
         ModelRouteOption(
-            tier=candidate_tier(candidate).value,
-            model_id=candidate.model_id,
-            provider=candidate.provider,
-            cost_estimate_usd=candidate.cost_estimate_usd,
-            fits_context=candidate.fits_context,
-        )
-        for candidate in sorted(candidates, key=lambda item: TIER_ORDER[candidate_tier(item)])
+            tier=ModelTier.LOCAL.value,
+            model_id=decision.model_id or "local-model",
+            provider=decision.provider or "ollama",
+            cost_estimate_usd=0.0,
+            fits_context=True,
+        ),
+        ModelRouteOption(
+            tier=ModelTier.CHEAP_CLOUD.value,
+            model_id="claude-haiku-4-5",
+            provider="anthropic",
+            cost_estimate_usd=round((context_tokens / 1_000_000) * 0.80, 4),
+            fits_context=context_tokens <= 200_000,
+        ),
+        ModelRouteOption(
+            tier=ModelTier.FRONTIER.value,
+            model_id="claude-sonnet-4-6",
+            provider="anthropic",
+            cost_estimate_usd=round((context_tokens / 1_000_000) * 3.00 + 0.015, 4),
+            fits_context=context_tokens <= 200_000,
+        ),
     ]
+
     return ModelRouteResponse(
         recommended=recommended,
         alternatives=[],
