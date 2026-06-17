@@ -11,7 +11,8 @@ type TaskEntryMessage = WebviewOutboundMessage
     | { type: 'generate-context' }
     | { type: 'generate-patch' }
     | { type: 'approve-patch' }
-    | { type: 'reject-patch' };
+    | { type: 'reject-patch' }
+    | { type: 'streaming-token'; payload: { content: string } };
 
 /**
  * Task Entry panel — modern card-based workflow screen.
@@ -69,6 +70,19 @@ export class TaskEntryPanel extends MemoPilotPanelBase {
         this.panel.onDidDispose(() => {
             TaskEntryPanel.currentPanel = undefined;
         }, null, this.disposables);
+
+        // Wire streaming token updates from TaskFlowController
+        if (this.flowController) {
+            const disposable = this.flowController.onStageChange((state) => {
+                if (state.stage === 'generating_patch' && state.streamingToken) {
+                    this.postMessage({
+                        type: 'streaming-token',
+                        payload: { content: state.streamingToken }
+                    });
+                }
+            });
+            this.disposables.push(disposable);
+        }
 
         this.render();
     }
@@ -643,6 +657,29 @@ export class TaskEntryPanel extends MemoPilotPanelBase {
             }
             @keyframes spin { to { transform: rotate(360deg); } }
 
+            /* Streaming token output */
+            #streaming-box {
+                display: none;
+                background: var(--vscode-editor-background, var(--vscode-sideBar-background));
+                border: 1px solid var(--mp-border);
+                border-radius: 4px;
+                padding: 12px;
+                margin-bottom: 16px;
+                max-height: 300px;
+                overflow-y: auto;
+                font-family: var(--vscode-editor-font-family, monospace);
+                font-size: 12px;
+            }
+            #streaming-box.visible {
+                display: block;
+            }
+            #streaming-content {
+                color: var(--mp-fg);
+                white-space: pre-wrap;
+                word-break: break-word;
+                line-height: 1.4;
+            }
+
             /* Hidden sections */
             .hidden { display: none !important; }
 
@@ -753,6 +790,12 @@ export class TaskEntryPanel extends MemoPilotPanelBase {
                 <div class="card">
                     <div class="card-title"><span class="codicon codicon-file-code"></span> Suggested Files</div>
                     <ul class="file-list" id="a-files"></ul>
+                </div>
+
+                <!-- Streaming Token Output (shown during patch generation) -->
+                <div id="streaming-box" class="card">
+                    <div class="card-title"><span class="codicon codicon-pulse"></span> Generating Patch...</div>
+                    <code id="streaming-content"></code>
                 </div>
 
                 <!-- Cost / AI Boundary Card -->
@@ -987,6 +1030,16 @@ export class TaskEntryPanel extends MemoPilotPanelBase {
 
         window.handleMessage = function(msg) {
             switch (msg.type) {
+                case 'streaming-token':
+                    var streamingBox = document.getElementById('streaming-box');
+                    var streamingContent = document.getElementById('streaming-content');
+                    if (streamingBox && streamingContent) {
+                        streamingBox.classList.add('visible');
+                        streamingContent.textContent += (msg.payload.content || '');
+                        // Auto-scroll to bottom
+                        streamingBox.scrollTop = streamingBox.scrollHeight;
+                    }
+                    break;
                 case 'view-content':
                     if (msg.payload.viewId === 'task-loading') {
                         // Already handled via loading state
@@ -1007,6 +1060,12 @@ export class TaskEntryPanel extends MemoPilotPanelBase {
                         if (resetWhich === 'context') { restoreBtn('context-btn'); }
                         else if (resetWhich === 'patch') { restoreBtn('patch-btn'); }
                         else if (resetWhich === 'approve') { restoreBtn('approve-btn'); }
+                        // Hide streaming box when patch generation completes
+                        var streamingBox2 = document.getElementById('streaming-box');
+                        if (streamingBox2 && resetWhich === 'patch') {
+                            streamingBox2.classList.remove('visible');
+                            document.getElementById('streaming-content').textContent = '';
+                        }
                     } else if (msg.payload.viewId === 'context-done') {
                         updateStepper('context');
                         restoreBtn('context-btn');
@@ -1054,6 +1113,12 @@ export class TaskEntryPanel extends MemoPilotPanelBase {
                     document.getElementById('error-area').textContent = msg.payload.message;
                     restoreBtn('context-btn');
                     restoreBtn('patch-btn');
+                    // Hide streaming box on error
+                    var streamingBox3 = document.getElementById('streaming-box');
+                    if (streamingBox3) {
+                        streamingBox3.classList.remove('visible');
+                        document.getElementById('streaming-content').textContent = '';
+                    }
                     break;
             }
         };
