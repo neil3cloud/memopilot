@@ -76,13 +76,15 @@ jobs:
         with:
           node-version: ${{ matrix.node-version }}
           cache: 'npm'
+          cache-dependency-path: packages/extension/package-lock.json
 
       - name: Install dependencies
+        working-directory: packages/extension
         run: npm ci
 
       - name: Type check
         working-directory: packages/extension
-        run: node_modules/.bin/tsc --noEmit
+        run: npx tsc --noEmit
 
       - name: Build extension
         working-directory: packages/extension
