@@ -138,11 +138,12 @@ class ProviderRegistryService:
         )
         version_row = await versions_cursor.fetchone()
         context_pack_path = version_row["pack_path"] if version_row else None
-        context_pack_text = (
-            Path(context_pack_path).read_text(encoding="utf-8", errors="replace")
-            if context_pack_path
-            else ""
-        )
+        context_pack_text = ""
+        if context_pack_path:
+            pack_path = Path(context_pack_path)
+            if not pack_path.exists():
+                raise ValueError(f"Context pack not available: {context_pack_path}")
+            context_pack_text = pack_path.read_text(encoding="utf-8", errors="replace")
         replay_payload: dict[str, str | int | float | bool | None] = {
             "task_run_id": task_run_id,
             "provider": row["provider"],

@@ -246,8 +246,11 @@ export class TaskEntryPanel extends MemoPilotPanelBase {
                 }
             } else {
                 this.log('runContextBuild: no flowController — calling client.buildContextPack() directly');
+                this.log(`  → task: "${this.lastTaskDescription}"`);
+                this.log(`  → suggested_files: [${this.lastAnalysis.suggested_files.join(', ')}]`);
+                this.log(`  → mode: ${this.lastAnalysis.suggested_mode}`);
                 const pack = await this.client.buildContextPack({
-                    task_description: this.lastAnalysis.intent_summary,
+                    task_description: this.lastTaskDescription,
                     suggested_files: this.lastAnalysis.suggested_files,
                     mode: this.lastAnalysis.suggested_mode,
                 });
@@ -281,13 +284,21 @@ export class TaskEntryPanel extends MemoPilotPanelBase {
             if (this.flowController) {
                 const state = this.flowController.getState();
                 this.log(`runPatchGeneration: current flow state = ${state.stage}`);
-                if (!state.contextPack) {
+                if (state.stage === 'awaiting_approval' && state.patch) {
+                    this.log('runPatchGeneration: patch already exists → preserving current review state');
+                } else if (!state.contextPack) {
                     this.log('runPatchGeneration: no contextPack → calling buildContext()');
                     await this.flowController.buildContext();
-                } else if (!state.modelDecision) {
+                }
+
+                let nextState = this.flowController.getState();
+                if (!nextState.error && !nextState.modelDecision) {
                     this.log('runPatchGeneration: no modelDecision → calling routeModel()');
                     await this.flowController.routeModel();
-                } else {
+                }
+
+                nextState = this.flowController.getState();
+                if (!nextState.error && nextState.stage !== 'awaiting_approval' && !nextState.patch) {
                     this.log('runPatchGeneration: context+route ready → calling generatePatch()');
                     await this.flowController.generatePatch();
                 }

@@ -2,8 +2,12 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 from httpx import AsyncClient
+
+from agent.db import DatabaseManager
 
 
 @pytest.mark.asyncio
@@ -134,6 +138,65 @@ async def test_context_version_diff_and_replay(client: AsyncClient, test_token: 
     assert replay_payload["task_run_id"] == task_run_id
     assert replay_payload["provider"] == "openai"
     assert replay_payload["context_pack_text"] != ""
+
+
+@pytest.mark.asyncio
+async def test_replay_ai_call_returns_404_when_context_pack_file_is_missing(
+    client: AsyncClient,
+    test_db: DatabaseManager,
+    test_token: str,
+    tmp_path: Path,
+):
+    headers = {"X-Agent-Token": test_token}
+    await client.post("/v1/workspace/init", headers=headers)
+
+    task = await client.post(
+        "/v1/task-runs/start",
+        headers=headers,
+        json={"user_request": "Investigate replay", "selected_model": "gpt-4o-mini"},
+    )
+    assert task.status_code == 200
+    task_run_id = task.json()["task_run_id"]
+
+    context_version = await client.post(
+        "/v1/context/versions",
+        headers=headers,
+        json={
+            "task_run_id": task_run_id,
+            "context_pack_text": "# stale pack\n\ncontent",
+            "selected_model": "gpt-4o-mini",
+        },
+    )
+    assert context_version.status_code == 200
+
+    missing_pack = tmp_path / "missing-context-pack.md"
+    conn = await test_db.connect()
+    await conn.execute(
+        "UPDATE context_pack_versions SET pack_path = ? WHERE task_run_id = ?",
+        (str(missing_pack), task_run_id),
+    )
+    await conn.commit()
+
+    usage = await client.post(
+        "/v1/cost/usage/record",
+        headers=headers,
+        json={
+            "task_run_id": task_run_id,
+            "provider": "openai",
+            "model": "gpt-4o-mini",
+            "input_tokens": 42,
+            "output_tokens": 8,
+            "estimated_cost": 0.02,
+            "actual_cost": 0.02,
+            "purpose": "replay-test",
+        },
+    )
+    assert usage.status_code == 200
+    ai_call_id = usage.json()["ai_call_id"]
+
+    replay = await client.get(f"/v1/ai/replay/{ai_call_id}", headers=headers)
+    assert replay.status_code == 404
+    assert "Context pack not available" in replay.json()["detail"]
 
 
 @pytest.mark.asyncio
