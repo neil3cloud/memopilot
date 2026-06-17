@@ -25,6 +25,9 @@ let backendManager: BackendManager | undefined;
 let backendClient: BackendClient | undefined;
 let taskFlowController: TaskFlowController | undefined;
 let statusBarItem: vscode.StatusBarItem;
+let healthCheckInterval: NodeJS.Timer | undefined;
+let unexpectedExitRetryCount = 0;
+const MAX_RESTART_RETRIES = 3;
 
 export async function activate(context: vscode.ExtensionContext): Promise<void> {
     const outputChannel = vscode.window.createOutputChannel('MemoPilot');
@@ -991,7 +994,45 @@ async function startBackend(
     if (!workspaceFolder) { return; }
 
     try {
-        backendManager = new BackendManager(workspaceFolder.uri.fsPath, outputChannel);
+        // Clear any existing health check interval
+        if (healthCheckInterval) {
+            clearInterval(healthCheckInterval);
+            healthCheckInterval = undefined;
+        }
+        unexpectedExitRetryCount = 0;
+
+        // Create handler for unexpected backend exits
+        const onUnexpectedExit = async () => {
+            outputChannel.appendLine(`[MemoPilot] Backend unexpected exit detected (attempt ${unexpectedExitRetryCount + 1}/${MAX_RESTART_RETRIES})`);
+            
+            if (unexpectedExitRetryCount >= MAX_RESTART_RETRIES) {
+                statusBarItem.text = '$(error) MemoPilot';
+                statusBarItem.tooltip = 'MemoPilot — Backend crashed and could not restart';
+                statusProvider.setStatus('error', 'Backend crashed and could not restart');
+                
+                const action = await vscode.window.showErrorMessage(
+                    'MemoPilot backend crashed and could not be automatically restarted.',
+                    'Restart Backend',
+                    'Dismiss'
+                );
+                if (action === 'Restart Backend') {
+                    await stopBackend();
+                    unexpectedExitRetryCount = 0;
+                    await startBackend(context, outputChannel, statusProvider, onConnectedRefresh);
+                }
+                return;
+            }
+
+            unexpectedExitRetryCount++;
+            const backoffMs = Math.pow(2, unexpectedExitRetryCount) * 1000; // 2s, 4s, 8s
+            outputChannel.appendLine(`[MemoPilot] Retrying backend start in ${backoffMs}ms...`);
+            
+            await new Promise(resolve => setTimeout(resolve, backoffMs));
+            await stopBackend();
+            await startBackend(context, outputChannel, statusProvider, onConnectedRefresh);
+        };
+
+        backendManager = new BackendManager(workspaceFolder.uri.fsPath, outputChannel, onUnexpectedExit);
         await backendManager.start();
 
         backendClient = new BackendClient(backendManager);
@@ -1005,6 +1046,25 @@ async function startBackend(
             // Initialize workspace .memopilot/ folder
             await backendClient.initWorkspace();
             outputChannel.appendLine('[MemoPilot] Workspace initialized.');
+            
+            // Set up periodic health checks (every 30 seconds)
+            healthCheckInterval = setInterval(async () => {
+                try {
+                    await backendClient?.health();
+                } catch (err) {
+                    outputChannel.appendLine(`[MemoPilot] Health check failed: ${err instanceof Error ? err.message : String(err)}`);
+                }
+            }, 30000);
+            
+            context.subscriptions.push(new (class {
+                dispose() {
+                    if (healthCheckInterval) {
+                        clearInterval(healthCheckInterval);
+                        healthCheckInterval = undefined;
+                    }
+                }
+            })());
+            
             await onConnectedRefresh();
         }
     } catch (err: unknown) {
@@ -1026,6 +1086,10 @@ async function startBackend(
 }
 
 async function stopBackend(): Promise<void> {
+    if (healthCheckInterval) {
+        clearInterval(healthCheckInterval);
+        healthCheckInterval = undefined;
+    }
     if (backendManager) {
         await backendManager.stop();
         backendManager = undefined;
