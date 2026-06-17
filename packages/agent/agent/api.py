@@ -84,6 +84,7 @@ from .review_memory_mode import CodeReviewMemoryModeService
 from .security_policy import CredentialRedactor, DatabaseWriteBlocker
 from .skill_loader import SkillLoaderService
 from .task_analyzer import LLMTaskAnalyzer
+from .vector_backfill_service import VectorBackfillService
 from .tool_mode_router import create_tool_mode_routes
 from .validation_runner import ValidationCommand, ValidationRunner
 from .workspace_indexer import WorkspaceIndexer
@@ -250,6 +251,23 @@ class TaskAnalyzeResponse(BaseModel):
     suggested_mode: str
     task_type: str = "general"
     risk: str = "medium"
+
+
+class VectorBackfillRequest(BaseModel):
+    workspace_root: str | None = None
+    entity_types: list[str] = Field(default_factory=lambda: ["memory_items", "symbols"])
+    limit: int | None = None
+
+
+class VectorBackfillResponse(BaseModel):
+    total_embedded: int
+    total_failed: int
+    memory_items_embedded: int
+    memory_items_failed: int
+    symbols_embedded: int
+    symbols_failed: int
+    model_used: str
+    workspace_root: str | None = None
 
 
 class ContextBuildRequest(BaseModel):
@@ -2038,6 +2056,39 @@ async def analyze_task(request: TaskAnalyzeRequest) -> TaskAnalyzeResponse:
         suggested_mode=mode,
         task_type=task_type,
         risk=risk,
+    )
+
+
+@app.post("/v1/vector/backfill", response_model=VectorBackfillResponse)
+async def backfill_vectors(request: VectorBackfillRequest) -> VectorBackfillResponse:
+    """Generate embeddings for existing memory items and symbols.
+    
+    Backfill operation can be triggered on-demand to enable semantic search
+    for existing memory and symbol data. Works with configured embedding models
+    (ollama, anthropic, openai).
+    """
+    db = _get_db()
+    config = _get_config()
+    
+    backfill_service = VectorBackfillService(db=db, config=config)
+    
+    # Perform backfill based on requested entity types
+    results = await backfill_service.backfill_all(
+        workspace_root=request.workspace_root
+    )
+    
+    memory_stats = results.get("memory_items", {})
+    symbol_stats = results.get("symbols", {})
+    
+    return VectorBackfillResponse(
+        total_embedded=results.get("total_embedded", 0),
+        total_failed=results.get("total_failed", 0),
+        memory_items_embedded=memory_stats.get("embedded_count", 0),
+        memory_items_failed=memory_stats.get("failed_count", 0),
+        symbols_embedded=symbol_stats.get("embedded_count", 0),
+        symbols_failed=symbol_stats.get("failed_count", 0),
+        model_used=memory_stats.get("model_used", symbol_stats.get("model_used", "unknown")),
+        workspace_root=request.workspace_root,
     )
 
 
