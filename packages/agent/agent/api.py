@@ -3248,6 +3248,11 @@ def _module_available(module_name: str) -> bool:
     return importlib.util.find_spec(module_name) is not None
 
 
+def _patch_python_files(request: ValidateRequest) -> list[str]:
+    """Return relative paths of Python files touched by the patch."""
+    return [p["path"] for p in request.patches if str(p.get("path", "")).endswith(".py")]
+
+
 def _validation_command_for_check(
     *,
     check_name: str,
@@ -3258,10 +3263,13 @@ def _validation_command_for_check(
     workspace = config.workspace_path
     normalized = check_name.strip().lower()
     if normalized == "syntax":
+        py_files = _patch_python_files(request)
+        if not py_files:
+            return None
         return ValidationCommand(
             name="Syntax Check",
             display_name="Syntax Check",
-            argv=[sys.executable, "-m", "compileall", "-q", str(workspace)],
+            argv=[sys.executable, "-m", "compileall", "-q", *py_files],
             timeout=timeout,
             cwd=workspace,
         )
@@ -3274,10 +3282,13 @@ def _validation_command_for_check(
             cwd=workspace,
         )
     if normalized == "ruff" and _module_available("ruff"):
+        py_files = _patch_python_files(request)
+        if not py_files:
+            return None
         return ValidationCommand(
             name="Ruff",
             display_name="Ruff",
-            argv=[sys.executable, "-m", "ruff", "check", "."],
+            argv=[sys.executable, "-m", "ruff", "check", *py_files],
             timeout=timeout,
             cwd=workspace,
         )
@@ -3290,10 +3301,13 @@ def _validation_command_for_check(
             cwd=workspace,
         )
     if normalized == "lint" and _module_available("ruff"):
+        py_files = _patch_python_files(request)
+        if not py_files:
+            return None
         return ValidationCommand(
             name="Lint",
             display_name="Lint",
-            argv=[sys.executable, "-m", "ruff", "check", "."],
+            argv=[sys.executable, "-m", "ruff", "check", *py_files],
             timeout=timeout,
             cwd=workspace,
         )
