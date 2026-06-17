@@ -1,4 +1,5 @@
 import * as vscode from 'vscode';
+import * as path from 'path';
 import {
     BackendClient,
     TaskAnalyzeResponse,
@@ -39,6 +40,12 @@ export interface TaskFlowState {
 
 type StageChangeListener = (state: TaskFlowState) => void;
 
+interface FileSnapshot {
+    uri: vscode.Uri;
+    existed: boolean;
+    content?: Uint8Array;
+}
+
 /**
  * Orchestrates the full MemoPilot task flow:
  * analyze → context build → model route → generate patch → approval → validate → apply
@@ -58,6 +65,10 @@ export class TaskFlowController {
 
     getState(): Readonly<TaskFlowState> {
         return this.state;
+    }
+
+    private resolvedMode(): string {
+        return this.state.analysis?.suggested_mode || this.state.mode || 'auto';
     }
 
     /** Seed the controller with an analysis already obtained externally */
@@ -137,12 +148,11 @@ export class TaskFlowController {
             const contextPack = await this.client.buildContextPack({
                 task_description: this.state.taskDescription,
                 suggested_files: this.state.analysis.suggested_files,
-                mode: this.state.mode,
+                mode: this.resolvedMode(),
             });
             this.transition('routing', { contextPack });
         } catch (err: unknown) {
             this.transition('error', { error: this.errorMsg(err) });
-            return;
         }
     }
 
@@ -156,12 +166,11 @@ export class TaskFlowController {
         try {
             const modelDecision = await this.client.routeModel({
                 context_tokens: this.state.contextPack.total_tokens,
-                task_type: this.state.mode,
+                task_type: this.resolvedMode(),
             });
             this.transition('generating_patch', { modelDecision });
         } catch (err: unknown) {
             this.transition('error', { error: this.errorMsg(err) });
-            return;
         }
     }
 
@@ -169,6 +178,10 @@ export class TaskFlowController {
     async generatePatch(): Promise<void> {
         if (!this.state.modelDecision || !this.state.contextPack) {
             this.transition('error', { error: 'Missing model decision or context' });
+            return;
+        }
+
+        if (this.state.stage === 'awaiting_approval' && this.state.patch) {
             return;
         }
 
@@ -194,7 +207,7 @@ export class TaskFlowController {
             const patch = await this.client.generatePatch({
                 task_description: this.state.taskDescription,
                 context_files: this.state.contextPack.files.map(f => f.path),
-                mode: this.state.mode,
+                mode: this.resolvedMode(),
                 model_id: this.state.modelDecision.recommended.model_id,
                 task_run_id: taskRunId,
             });
@@ -253,22 +266,95 @@ export class TaskFlowController {
             return;
         }
         const rootUri = workspaceFolders[0].uri;
+        const snapshots = new Map<string, FileSnapshot>();
+        const applied: FileSnapshot[] = [];
 
-        for (const filePatch of this.state.patch.patches) {
-            const fileUri = vscode.Uri.joinPath(rootUri, filePatch.path);
+        try {
+            for (const filePatch of this.state.patch.patches) {
+                const fileUri = vscode.Uri.joinPath(rootUri, filePatch.path);
+                const snapshot = await this.captureSnapshot(fileUri, snapshots);
 
-            if (filePatch.action === 'create' && filePatch.new_content !== null) {
-                await vscode.workspace.fs.writeFile(fileUri, Buffer.from(filePatch.new_content, 'utf-8'));
-            } else if (filePatch.action === 'modify' && filePatch.new_content !== null) {
-                await vscode.workspace.fs.writeFile(fileUri, Buffer.from(filePatch.new_content, 'utf-8'));
-            } else if (filePatch.action === 'delete') {
-                try {
-                    await vscode.workspace.fs.delete(fileUri);
-                } catch { /* file may not exist */ }
+                if (filePatch.action === 'create' || filePatch.action === 'modify') {
+                    if (filePatch.new_content === null) {
+                        throw new Error(`Patch for ${filePatch.path} is missing new content`);
+                    }
+                    await this.ensureParentDirectory(rootUri, filePatch.path);
+                    await vscode.workspace.fs.writeFile(fileUri, Buffer.from(filePatch.new_content, 'utf-8'));
+                } else if (filePatch.action === 'delete') {
+                    try {
+                        await vscode.workspace.fs.delete(fileUri);
+                    } catch (err: unknown) {
+                        if (!this.isFileNotFound(err)) {
+                            throw err;
+                        }
+                    }
+                }
+
+                applied.push(snapshot);
             }
+
+            this.transition('done');
+        } catch (err: unknown) {
+            try {
+                await this.rollbackAppliedChanges(rootUri, applied);
+            } catch (rollbackErr: unknown) {
+                console.error('Rollback failed:', this.errorMsg(rollbackErr));
+            }
+            throw err;
+        }
+    }
+
+    private async captureSnapshot(fileUri: vscode.Uri, snapshots: Map<string, FileSnapshot>): Promise<FileSnapshot> {
+        const key = fileUri.toString();
+        const existing = snapshots.get(key);
+        if (existing) {
+            return existing;
         }
 
-        this.transition('done');
+        try {
+            const content = await vscode.workspace.fs.readFile(fileUri);
+            const snapshot: FileSnapshot = { uri: fileUri, existed: true, content };
+            snapshots.set(key, snapshot);
+            return snapshot;
+        } catch (err: unknown) {
+            if (this.isFileNotFound(err)) {
+                const snapshot: FileSnapshot = { uri: fileUri, existed: false };
+                snapshots.set(key, snapshot);
+                return snapshot;
+            }
+            throw err;
+        }
+    }
+
+    private async rollbackAppliedChanges(rootUri: vscode.Uri, applied: FileSnapshot[]): Promise<void> {
+        for (const snapshot of applied.reverse()) {
+            if (snapshot.existed && snapshot.content !== undefined) {
+                await this.ensureParentDirectory(rootUri, snapshot.uri.path.replace(rootUri.path, '').replace(/^\//, ''));
+                await vscode.workspace.fs.writeFile(snapshot.uri, snapshot.content);
+                continue;
+            }
+
+            try {
+                await vscode.workspace.fs.delete(snapshot.uri);
+            } catch (err: unknown) {
+                if (!this.isFileNotFound(err)) {
+                    throw err;
+                }
+            }
+        }
+    }
+
+    private async ensureParentDirectory(rootUri: vscode.Uri, relativePath: string): Promise<void> {
+        const normalized = relativePath.replace(/\\/g, '/');
+        const dir = path.posix.dirname(normalized);
+        if (dir === '.' || dir === '') {
+            return;
+        }
+        await vscode.workspace.fs.createDirectory(vscode.Uri.joinPath(rootUri, ...dir.split('/')));
+    }
+
+    private isFileNotFound(err: unknown): boolean {
+        return err instanceof vscode.FileSystemError && /FileNotFound|EntryNotFound|not found/i.test(err.message);
     }
 
     /** Developer rejects the patch — reset to idle */

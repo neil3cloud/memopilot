@@ -24,6 +24,9 @@ async def test_model_route_basic(client: AsyncClient, test_token: str):
     assert data["recommended"]["provider"]
     assert isinstance(data["recommended"]["reasons"], list)
     assert data["budget_check"]["allowed"] is True
+    assert "reason" in data["budget_check"]
+    assert "status" in data["budget_check"]
+    assert data["budget_check"]["status"]["remaining_usd"] >= 0
 
 
 @pytest.mark.asyncio
