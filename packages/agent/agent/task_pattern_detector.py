@@ -336,7 +336,7 @@ class TaskPatternDetector:
         await conn.commit()
 
     def _pattern_id(self, workspace_root: str, pattern: TaskPattern) -> str:
-        payload = f"{workspace_root}|{pattern.pattern_type}|{pattern.context_path}".encode("utf-8")
+        payload = f"{workspace_root}|{pattern.pattern_type}|{pattern.context_path}".encode()
         return hashlib.sha1(payload).hexdigest()
 
     def _resolve_workspace_root(self, workspace_root: str) -> str:

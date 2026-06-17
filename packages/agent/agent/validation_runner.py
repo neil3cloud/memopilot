@@ -143,7 +143,7 @@ def classify_validation_diff(
     autofix_available = False
     autofix_candidates: list[dict[str, object]] = []
     if new_failures:
-        from .autofix_classifier import classify_diagnostic, AutofixSafety
+        from .autofix_classifier import AutofixSafety, classify_diagnostic
         for test_id, output in _select_failures(post_patch_run, new_failures):
             candidate = classify_diagnostic(code=test_id, message=output)
             if candidate.safety == AutofixSafety.SAFE:

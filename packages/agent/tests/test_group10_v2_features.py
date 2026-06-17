@@ -42,7 +42,11 @@ async def test_docx_pptx_and_image_endpoints(
     image_path = tmp_workspace / "screen.png"
     Image.new("RGB", (32, 32), color=(255, 255, 255)).save(image_path)
 
-    async def fake_analyze_image(_path: Path, allow_cloud: bool = False) -> ImageAnalysisResult:
+    async def fake_analyze_image(
+        _path: Path,
+        allow_cloud: bool = False,
+        workspace_root: str | None = None,
+    ) -> ImageAnalysisResult:
         return ImageAnalysisResult(
             description="Settings dialog with save button",
             ui_elements=["Save button"],

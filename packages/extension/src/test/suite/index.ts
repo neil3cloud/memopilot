@@ -9,6 +9,10 @@ export function run(): Promise<void> {
     });
 
     mocha.addFile(path.resolve(__dirname, './extension.test.js'));
+    mocha.addFile(path.resolve(__dirname, './panel.test.js'));
+    mocha.addFile(path.resolve(__dirname, './taskflow.test.js'));
+    mocha.addFile(path.resolve(__dirname, './backendclient.test.js'));
+    mocha.addFile(path.resolve(__dirname, './backendmanager.test.js'));
 
     return new Promise((resolve, reject) => {
         mocha.run((failures) => {

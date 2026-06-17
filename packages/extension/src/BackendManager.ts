@@ -21,12 +21,19 @@ export class BackendManager {
     private lockFilePath: string;
     private stderrBuffer: string = '';
     private stdoutBuffer: string = '';
+    private _stopping: boolean = false;
+    private onUnexpectedExit?: () => void;
 
-    constructor(workspacePath: string, outputChannel: vscode.OutputChannel) {
+    constructor(
+        workspacePath: string,
+        outputChannel: vscode.OutputChannel,
+        onUnexpectedExit?: () => void
+    ) {
         this.workspacePath = workspacePath;
         this.outputChannel = outputChannel;
         this.token = crypto.randomBytes(32).toString('hex');
         this.lockFilePath = path.join(workspacePath, '.memopilot', 'agent.lock');
+        this.onUnexpectedExit = onUnexpectedExit;
     }
 
     get baseUrl(): string {
@@ -44,6 +51,7 @@ export class BackendManager {
     }
 
     async start(): Promise<void> {
+        this._stopping = false;
         const pythonPath = await this.resolvePython();
         const agentDir = this.resolveAgentDir();
         const agentParent = path.resolve(agentDir, '..');
@@ -100,6 +108,13 @@ export class BackendManager {
         this.process.on('exit', (code) => {
             this.outputChannel.appendLine(`[MemoPilot] Backend exited with code ${code}`);
             this.port = undefined;
+
+            // Detect unexpected exit: if we didn't call stop(), the backend crashed
+            if (!this._stopping && this.onUnexpectedExit) {
+                this.outputChannel.appendLine(`[MemoPilot] Backend exited unexpectedly (code ${code})`);
+                // Schedule callback after brief delay to allow any final logs to appear
+                setTimeout(() => this.onUnexpectedExit?.(), 2000);
+            }
         });
 
         // Wait for lockfile to appear with port
@@ -111,6 +126,7 @@ export class BackendManager {
     }
 
     async stop(): Promise<void> {
+        this._stopping = true;
         if (this.process) {
             this.process.kill('SIGTERM');
             this.process = undefined;

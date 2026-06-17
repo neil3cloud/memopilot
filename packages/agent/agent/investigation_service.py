@@ -23,6 +23,7 @@ from pydantic import BaseModel, Field
 from .config import Config
 from .db import DatabaseManager
 from .evidence_classifier import EvidenceSourceClassifier
+from .image_analysis import analyze_image
 from .plan_service import PlanModeService, PlanResult, PlanStep
 from .security_policy import CredentialRedactor
 from .workspace_roots import WorkspaceRootsService
@@ -217,6 +218,7 @@ class InvestigationService:
         investigation_session_id: str | None = None,
         column_mapping: dict[str, str] | None = None,
         workspace_root: str | None = None,
+        allow_cloud_image_analysis: bool = False,
     ) -> AttachedEvidence:
         conn = await self._db.connect()
         session_root: str | None = None
@@ -240,10 +242,11 @@ class InvestigationService:
         extraction_method = classification.extraction_method
         trust_level = classification.trust_level
 
-        findings, extraction_status, ocr_required = self._extract_findings(
+        findings, extraction_status, ocr_required = await self._extract_findings(
             source_type=source_type,
             evidence_path=resolved_path,
             column_mapping=column_mapping or {},
+            allow_cloud_image_analysis=allow_cloud_image_analysis,
         )
         if ocr_required and source_type == "pdf_doc":
             trust_level = 4
@@ -630,12 +633,13 @@ class InvestigationService:
             raise ValueError(f"Evidence path not found: {resolved}")
         return resolved
 
-    def _extract_findings(
+    async def _extract_findings(
         self,
         *,
         source_type: str,
         evidence_path: Path | None,
         column_mapping: dict[str, str],
+        allow_cloud_image_analysis: bool,
     ) -> tuple[list[str], str, bool]:
         if source_type == "external_work_item":
             return (
@@ -655,7 +659,11 @@ class InvestigationService:
                 f"Evidence file too large ({file_size} bytes, max {MAX_EVIDENCE_FILE_SIZE_BYTES})"
             )
         if source_type in {"image", "screenshot"}:
-            return self._extract_image_findings(evidence_path, source_type)
+            return await self._extract_image_findings(
+                evidence_path,
+                source_type,
+                allow_cloud_image_analysis=allow_cloud_image_analysis,
+            )
         if source_type == "csv_data":
             headers, rows = self._extract_csv_rows(evidence_path)
             mapping = self._normalize_column_mapping(column_mapping, headers)
@@ -705,10 +713,11 @@ class InvestigationService:
         except OSError:
             return None
 
-    def _extract_image_findings(
+    async def _extract_image_findings(
         self,
         evidence_path: Path,
         source_type: str,
+        allow_cloud_image_analysis: bool,
     ) -> tuple[list[str], str, bool]:
         findings: list[str] = []
         try:
@@ -729,13 +738,24 @@ class InvestigationService:
                 if metadata:
                     findings.append(f"Image metadata keys: {', '.join(metadata)}")
 
-                ocr_lines = self._extract_image_text(image)
-                if ocr_lines:
-                    findings.extend(ocr_lines)
-                    return findings, "ok", False
+            analysis = await analyze_image(
+                evidence_path,
+                allow_cloud=allow_cloud_image_analysis,
+                workspace_root=str(self._config.workspace_path),
+            )
+            if analysis.description:
+                findings.append(f"Image summary: {analysis.description}")
+            if analysis.ui_elements:
+                findings.append("UI elements: " + ", ".join(analysis.ui_elements[:10]))
+            if analysis.error_messages:
+                findings.extend([f"Image warning: {item}" for item in analysis.error_messages[:5]])
+            if analysis.ocr_text:
+                ocr_lines = [line.strip() for line in analysis.ocr_text.splitlines() if line.strip()]
+                findings.extend([f"OCR: {line}" for line in ocr_lines[:20]])
+                return findings, "ok", False
 
-                findings.append("OCR unavailable; retained metadata-based image analysis.")
-                return findings, "metadata_only", False
+            findings.append("OCR unavailable; retained metadata-based image analysis.")
+            return findings, "metadata_only", False
         except UnidentifiedImageError:
             return (
                 [f"Image file could not be decoded: {evidence_path.name}"],

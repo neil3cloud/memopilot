@@ -71,24 +71,28 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Set up pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 9
+
       - name: Set up Node.js ${{ matrix.node-version }}
         uses: actions/setup-node@v4
         with:
           node-version: ${{ matrix.node-version }}
-          cache: 'npm'
-          cache-dependency-path: packages/extension/package-lock.json
+          cache: 'pnpm'
 
       - name: Install dependencies
-        working-directory: packages/extension
-        run: npm ci --ignore-scripts
+        run: pnpm install --ignore-scripts
 
       - name: Type check
         working-directory: packages/extension
-        run: npx tsc --noEmit
+        shell: bash
+        run: ./node_modules/.bin/tsc --noEmit
 
       - name: Build extension
         working-directory: packages/extension
-        run: npm run build
+        run: pnpm run build
 
   summary:
     name: CI Summary
