@@ -36,8 +36,13 @@ MemoPilot's architecture is fully scaffolded end-to-end and **end-to-end LLM int
 | **Pipeline — Controller** | Step-aware UI transitions | ✅ Implemented | Buttons show/hide per active step |
 | **Pipeline — Controller** | File apply on approval | ✅ Implemented | Writes `new_content` to disk via VS Code FS API |
 | **Pipeline — Controller** | GitHub Copilot relay | ✅ Implemented | `HostModelClient` wired into `generatePatch()`; tokens streamed via SSE back to backend |
-| **Testing** | Backend unit tests | ✅ 286+ tests passing | Comprehensive coverage of all backend services |
+| **Testing** | Backend unit tests | ✅ 357 tests passing | Comprehensive coverage of all backend services |
 | **Testing** | Extension type-checking | ✅ Clean | tsc --noEmit passes |
+| **CI/CD** | GitHub Actions CI | ✅ Full Coverage | Runs backend tests (3.11/3.12/3.13), lint, and extension build on all PRs |
+| **Release** | VSIX Build & Release | ✅ Automated | GitHub Actions releases tagged versions to GitHub Release + Marketplace (optional) |
+| **Security** | Secret Management | ✅ Documented | API keys in `~/.memopilot/config.yaml`, HMAC token in `agent.lock`, local-first by default |
+| **Documentation** | Changelog | ✅ Up to date | CHANGELOG.md tracks all changes by version |
+| **Documentation** | Security Policy | ✅ Comprehensive | SECURITY.md covers data handling, authentication, threats, and compliance |
 
 ---
 
@@ -106,7 +111,54 @@ packages/extension/src/
 
 ## Recommended Next Steps
 
-1. **Surface streaming tokens in UI** — forward `streamingToken` from `TaskFlowController` state to the TaskEntryPanel webview so users see tokens as they arrive
-2. **LLM-powered task analysis** — replace keyword matching with a local model call (Ollama + phi-3) for better file identification
-3. **Outcome-based routing** — track per-module failure history and escalate to a stronger model after repeated failures
-4. **Token streaming UI indicator** — show a live "generating..." animation with token count while the LLM is producing
+### Phase 2: Marketplace & Production Hardening
+
+1. **Watchdog & Reliability** (Milestone 1)
+   - Backend auto-restart on crash with 3x backoff retry
+   - Liveliness probe every 30s to detect hangs
+   - Extension test suite expansion (TaskFlow, BackendClient, BackendManager units)
+
+2. **UI Polish** (Milestone 2)
+   - Real-time token streaming in TaskEntryPanel (currently shows spinner)
+   - Visual feedback during generation with token counter
+   - Error recovery flows for network/provider failures
+
+3. **Real MCP Execution** (Milestone 3)
+   - Wire `mcp_orchestrator.py` to `mcp_server.py` dispatcher
+   - Replace simulated calls with real tool execution
+   - MCP test coverage for tool invocations
+
+4. **Intelligence Upgrades** (Milestone 4)
+   - **4-A**: LLM-powered task analysis with local model fallback
+   - **4-B**: sqlite-vec for semantic memory recall (hybrid FTS5+vector search)
+   - **4-C**: Image analysis wired into task flow (cloud vision as optional fallback)
+
+5. **Marketplace Distribution** (Milestone 5 — In Progress)
+   - ✅ VSIX automation workflow (GitHub Actions on git tags)
+   - ✅ GitHub Release with auto-generated CHANGELOG
+   - ✅ Security & secret management documentation
+   - ⏳ E2E Copilot verification checklist
+   - ⏳ Publish to VS Code Marketplace (requires PAT)
+
+### How to Release
+
+```bash
+# 1. Update version in packages/extension/package.json
+# 2. Update CHANGELOG.md with new features
+# 3. Commit and tag:
+git tag v1.0.2
+git push origin v1.0.2
+
+# 4. GitHub Actions release.yml will:
+#    - Extract version from tag
+#    - Build VSIX
+#    - Create GitHub Release with VSIX attached
+#    - (Optional) Publish to Marketplace if VSCE_PAT secret is configured
+```
+
+### VS Code Marketplace Setup (One-Time)
+
+1. Create publisher account at [Visual Studio Marketplace](https://marketplace.visualstudio.com/manage)
+2. Generate Personal Access Token (PAT)
+3. Add to GitHub Secrets as `VSCE_PAT`
+4. Push a tag — release workflow will auto-publish

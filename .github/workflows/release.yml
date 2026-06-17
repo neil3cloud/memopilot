@@ -1,0 +1,97 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  build-release:
+    name: Build & Release VSIX
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 9
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: 'pnpm'
+
+      - name: Install dependencies
+        run: pnpm install --ignore-scripts
+
+      - name: Extract version from tag
+        id: version
+        run: echo "VERSION=${GITHUB_REF#refs/tags/v}" >> $GITHUB_OUTPUT
+
+      - name: Update extension version
+        working-directory: packages/extension
+        run: |
+          sed -i 's/"version": "[^"]*"/"version": "${{ steps.version.outputs.VERSION }}"/' package.json
+
+      - name: Build extension
+        working-directory: packages/extension
+        run: npm run build
+
+      - name: Package VSIX
+        working-directory: packages/extension
+        run: pnpm run package
+
+      - name: Get VSIX filename
+        id: vsix
+        working-directory: packages/extension
+        run: |
+          VSIX_FILE=$(ls memopilot-*.vsix | head -1)
+          echo "FILENAME=$VSIX_FILE" >> $GITHUB_OUTPUT
+          echo "PATH=packages/extension/$VSIX_FILE" >> $GITHUB_OUTPUT
+
+      - name: Create GitHub Release
+        uses: actions/create-release@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tag_name: ${{ github.ref }}
+          release_name: Release ${{ steps.version.outputs.VERSION }}
+          body: |
+            ## MemoPilot v${{ steps.version.outputs.VERSION }}
+
+            **What's New:**
+            - See [CHANGELOG.md](./CHANGELOG.md) for detailed changes
+
+            **Installation:**
+            1. Download `${{ steps.vsix.outputs.FILENAME }}`
+            2. In VS Code: Extensions → Install from VSIX...
+            3. Select the downloaded file
+
+            **VS Code Marketplace:**
+            [View on Marketplace](https://marketplace.visualstudio.com/items?itemName=memopilot.memopilot)
+          draft: false
+          prerelease: false
+
+      - name: Upload VSIX to Release
+        uses: actions/upload-release-asset@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          upload_url: ${{ steps.create_release.outputs.upload_url }}
+          asset_path: ${{ steps.vsix.outputs.PATH }}
+          asset_name: ${{ steps.vsix.outputs.FILENAME }}
+          asset_content_type: application/zip
+
+      - name: Publish to VS Code Marketplace (optional)
+        if: '!contains(github.ref, ''alpha'') && !contains(github.ref, ''beta'')'
+        working-directory: packages/extension
+        env:
+          VSCE_PAT: ${{ secrets.VSCE_PAT }}
+        run: |
+          if [ -n "$VSCE_PAT" ]; then
+            pnpm exec vsce publish --pat "$VSCE_PAT" --no-dependencies
+          else
+            echo "⚠️  VSCE_PAT not configured. Skipping marketplace publish."
+          fi
