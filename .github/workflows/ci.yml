@@ -84,7 +84,7 @@ jobs:
 
       - name: Type check
         working-directory: packages/extension
-        run: npx tsc --noEmit
+        run: ./node_modules/.bin/tsc --noEmit
 
       - name: Build extension
         working-directory: packages/extension
