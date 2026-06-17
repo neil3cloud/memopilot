@@ -80,7 +80,7 @@ jobs:
 
       - name: Install dependencies
         working-directory: packages/extension
-        run: npm ci --ignore-scripts --omit=dev
+        run: npm ci --ignore-scripts
 
       - name: Type check
         working-directory: packages/extension
