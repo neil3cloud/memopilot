@@ -880,6 +880,7 @@ class AttachEvidenceRequest(BaseModel):
     task_run_id: str | None = None
     investigation_session_id: str | None = None
     column_mapping: dict[str, str] | None = None
+    allow_cloud_image_analysis: bool = False
     workspace_root: str | None = None
 
 
@@ -4601,6 +4602,7 @@ async def attach_investigation_evidence(
             task_run_id=request.task_run_id,
             investigation_session_id=session_id,
             column_mapping=request.column_mapping,
+            allow_cloud_image_analysis=request.allow_cloud_image_analysis,
             workspace_root=request.workspace_root,
         )
     except ValueError as exc:
@@ -4663,6 +4665,7 @@ async def attach_evidence(request: AttachEvidenceRequest) -> AttachEvidenceRespo
             task_run_id=request.task_run_id,
             investigation_session_id=request.investigation_session_id,
             column_mapping=request.column_mapping,
+            allow_cloud_image_analysis=request.allow_cloud_image_analysis,
             workspace_root=request.workspace_root,
         )
     except ValueError as exc:
@@ -5543,6 +5546,7 @@ async def analyze_image_evidence(request: AnalyzeImageRequest) -> ImageAnalysisR
     result: ImageAnalysisResult = await analyze_image(
         await _resolve_workspace_file(request.file_path, request.workspace_root),
         allow_cloud=request.allow_cloud,
+        workspace_root=request.workspace_root,
     )
     return ImageAnalysisResponse(**result.__dict__)
 
