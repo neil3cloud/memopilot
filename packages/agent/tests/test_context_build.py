@@ -97,3 +97,33 @@ async def test_context_build_caps_at_20_files(client: AsyncClient, test_token: s
     assert resp.status_code == 200
     data = resp.json()
     assert len(data["files"]) <= 20
+
+
+@pytest.mark.asyncio
+async def test_context_build_falls_back_to_index_when_suggested_files_empty(
+    client: AsyncClient,
+    test_token: str,
+    tmp_workspace,
+):
+    (tmp_workspace / "memory_indexing_service.py").write_text(
+        "def build_memory_index() -> str:\n    return 'ok'\n",
+        encoding="utf-8",
+    )
+
+    headers = {"X-Agent-Token": test_token}
+    await client.post("/v1/workspace/init", headers=headers)
+    index_response = await client.post("/v1/workspace/index", headers=headers)
+    assert index_response.status_code == 200
+
+    resp = await client.post(
+        "/v1/context/build",
+        headers=headers,
+        json={
+            "task_description": "Improve memory indexing service",
+            "suggested_files": [],
+        },
+    )
+    assert resp.status_code == 200
+    data = resp.json()
+    paths = [entry["path"] for entry in data["files"]]
+    assert "memory_indexing_service.py" in paths

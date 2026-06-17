@@ -1,6 +1,6 @@
 import * as vscode from 'vscode';
 import * as path from 'path';
-import { BackendClient } from './BackendClient';
+import { BackendClient, IndexStatusResponse } from './BackendClient';
 import { BackendManager } from './BackendManager';
 import { registerLanguageModelTools } from './tools/LanguageModelToolsRegistrar';
 import { StatusTreeProvider } from './views/StatusTreeProvider';
@@ -25,6 +25,24 @@ let backendManager: BackendManager | undefined;
 let backendClient: BackendClient | undefined;
 let taskFlowController: TaskFlowController | undefined;
 let statusBarItem: vscode.StatusBarItem;
+let workspaceIndexingInFlight = false;
+
+async function refreshIndexStatus(
+    client: BackendClient,
+    statusProvider: StatusTreeProvider,
+    outputChannel: vscode.OutputChannel,
+): Promise<IndexStatusResponse | undefined> {
+    try {
+        const indexStatus = await client.getIndexStatus();
+        statusProvider.updateIndexStatus(indexStatus);
+        return indexStatus;
+    } catch (err: unknown) {
+        const msg = err instanceof Error ? err.message : String(err);
+        outputChannel.appendLine(`[MemoPilot] Failed to fetch index status: ${msg}`);
+        statusProvider.updateIndexStatus(undefined);
+        return undefined;
+    }
+}
 
 export async function activate(context: vscode.ExtensionContext): Promise<void> {
     const outputChannel = vscode.window.createOutputChannel('MemoPilot');
@@ -69,8 +87,13 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
             vscode.window.showWarningMessage('MemoPilot backend is not connected.');
             return;
         }
+        if (workspaceIndexingInFlight) {
+            vscode.window.showInformationMessage('MemoPilot workspace indexing is already in progress.');
+            return;
+        }
 
         try {
+            workspaceIndexingInFlight = true;
             await vscode.window.withProgress(
                 { location: vscode.ProgressLocation.Notification, title: 'MemoPilot: Indexing workspace...' },
                 async () => {
@@ -87,11 +110,14 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
                     vscode.window.showInformationMessage(
                         `MemoPilot: ${parts.join(', ')} (${result.duration_ms}ms).`,
                     );
+                    await refreshIndexStatus(backendClient!, statusProvider, outputChannel);
                 },
             );
         } catch (err: unknown) {
             const msg = err instanceof Error ? err.message : String(err);
             vscode.window.showErrorMessage(`MemoPilot workspace indexing failed: ${msg}`);
+        } finally {
+            workspaceIndexingInFlight = false;
         }
     };
 
@@ -997,6 +1023,25 @@ async function startBackend(
             await backendClient.initWorkspace();
             outputChannel.appendLine('[MemoPilot] Workspace initialized.');
             await onConnectedRefresh();
+
+            const indexStatus = await refreshIndexStatus(backendClient, statusProvider, outputChannel);
+            if (indexStatus?.never_indexed && !workspaceIndexingInFlight) {
+                workspaceIndexingInFlight = true;
+                outputChannel.appendLine('[MemoPilot] Auto-indexing workspace in background...');
+                void (async () => {
+                    try {
+                        await backendClient!.indexWorkspace();
+                    } catch (err: unknown) {
+                        const msg = err instanceof Error ? err.message : String(err);
+                        outputChannel.appendLine(`[MemoPilot] Background index failed: ${msg}`);
+                    } finally {
+                        workspaceIndexingInFlight = false;
+                        if (backendClient) {
+                            await refreshIndexStatus(backendClient, statusProvider, outputChannel);
+                        }
+                    }
+                })();
+            }
         }
     } catch (err: unknown) {
         const msg = err instanceof Error ? err.message : String(err);

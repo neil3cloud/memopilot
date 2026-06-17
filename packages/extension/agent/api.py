@@ -126,6 +126,14 @@ class RebuildMemoryResponse(WorkspaceIndexResponse):
     rebuilt: bool
 
 
+class IndexStatusResponse(BaseModel):
+    indexed_files: int
+    stale_files: int
+    symbols_count: int
+    last_indexed_at: str | None = None
+    never_indexed: bool
+
+
 class BudgetStatusResponse(BaseModel):
     monthly_budget_usd: float
     spent_usd: float
@@ -1701,6 +1709,38 @@ async def rebuild_memory() -> RebuildMemoryResponse:
     )
 
 
+@app.get("/v1/workspace/index/status", response_model=IndexStatusResponse)
+async def workspace_index_status() -> IndexStatusResponse:
+    """Return a lightweight summary of workspace indexing state."""
+    conn = await _get_db().connect()
+
+    file_cursor = await conn.execute(
+        """
+        SELECT
+            COALESCE(SUM(CASE WHEN stale = 0 THEN 1 ELSE 0 END), 0) AS indexed_files,
+            COALESCE(SUM(CASE WHEN stale = 1 THEN 1 ELSE 0 END), 0) AS stale_files,
+            MAX(last_indexed_at) AS last_indexed_at
+        FROM file_index
+        """
+    )
+    file_row = await file_cursor.fetchone()
+
+    symbols_cursor = await conn.execute("SELECT COUNT(*) AS symbols_count FROM symbols")
+    symbols_row = await symbols_cursor.fetchone()
+
+    indexed_files = int(file_row["indexed_files"] or 0)
+    stale_files = int(file_row["stale_files"] or 0)
+    symbols_count = int(symbols_row["symbols_count"] or 0)
+
+    return IndexStatusResponse(
+        indexed_files=indexed_files,
+        stale_files=stale_files,
+        symbols_count=symbols_count,
+        last_indexed_at=file_row["last_indexed_at"],
+        never_indexed=(indexed_files == 0 and stale_files == 0 and symbols_count == 0),
+    )
+
+
 def _to_budget_status_response(status) -> BudgetStatusResponse:
     return BudgetStatusResponse(
         monthly_budget_usd=status.monthly_budget_usd,
@@ -1895,6 +1935,7 @@ async def analyze_task(request: TaskAnalyzeRequest) -> TaskAnalyzeResponse:
 
     # Suggest files by searching memory for relevant symbols
     suggested_files: list[str] = []
+    keywords = _extract_search_keywords(description)
     try:
         memory_service = MemoryManagerService(config=config, db=db)
         items = await memory_service.list_items(
@@ -1902,8 +1943,6 @@ async def analyze_task(request: TaskAnalyzeRequest) -> TaskAnalyzeResponse:
             limit=200,
             workspace_root=request.workspace_root,
         )
-        # Simple keyword matching from task description
-        keywords = [w.lower() for w in description.split() if len(w) > 3]
         for item in items:
             title_lower = item.title.lower()
             if any(kw in title_lower for kw in keywords):
@@ -1913,6 +1952,17 @@ async def analyze_task(request: TaskAnalyzeRequest) -> TaskAnalyzeResponse:
                 break
     except Exception:
         pass
+
+    if len(suggested_files) < 10 and keywords:
+        for file_path in await _suggest_files_from_index(
+            db=db,
+            keywords=keywords,
+            limit=10,
+        ):
+            if file_path not in suggested_files:
+                suggested_files.append(file_path)
+            if len(suggested_files) >= 10:
+                break
 
     # Build intent summary (first sentence or truncated description)
     intent_summary = description.split(".")[0].strip()
@@ -1932,6 +1982,119 @@ async def analyze_task(request: TaskAnalyzeRequest) -> TaskAnalyzeResponse:
 
 def _estimate_context_tokens(text: str) -> int:
     return max(1, (len(text) + 3) // 4)
+
+
+_INDEX_KEYWORD_STOPWORDS = {
+    "also",
+    "about",
+    "across",
+    "agent",
+    "after",
+    "before",
+    "build",
+    "change",
+    "code",
+    "context",
+    "from",
+    "have",
+    "into",
+    "just",
+    "mode",
+    "project",
+    "task",
+    "that",
+    "their",
+    "them",
+    "there",
+    "these",
+    "they",
+    "this",
+    "those",
+    "want",
+    "with",
+}
+
+
+def _extract_search_keywords(text: str) -> list[str]:
+    tokens = re.findall(r"[A-Za-z_][A-Za-z0-9_]+", text.lower())
+    keywords: list[str] = []
+    seen: set[str] = set()
+    for token in tokens:
+        if len(token) < 4 or token in _INDEX_KEYWORD_STOPWORDS:
+            continue
+        if token in seen:
+            continue
+        seen.add(token)
+        keywords.append(token)
+        if len(keywords) >= 20:
+            break
+    return keywords
+
+
+async def _suggest_files_from_index(
+    *,
+    db: DatabaseManager,
+    keywords: list[str],
+    limit: int,
+) -> list[str]:
+    if not keywords or limit <= 0:
+        return []
+
+    conn = await db.connect()
+    suggested_files: list[str] = []
+    seen_paths: set[str] = set()
+
+    file_where = " OR ".join("lower(file_path) LIKE ?" for _ in keywords)
+    file_params: tuple[object, ...] = (
+        *(f"%{kw}%" for kw in keywords),
+        max(limit * 5, 50),
+    )
+    file_cursor = await conn.execute(
+        f"""
+        SELECT file_path
+        FROM file_index
+        WHERE stale = 0 AND ({file_where})
+        ORDER BY COALESCE(last_indexed_at, '') DESC, file_path ASC
+        LIMIT ?
+        """,
+        file_params,
+    )
+    file_rows = await file_cursor.fetchall()
+    for row in file_rows:
+        file_path = str(row["file_path"])
+        if file_path in seen_paths:
+            continue
+        seen_paths.add(file_path)
+        suggested_files.append(file_path)
+        if len(suggested_files) >= limit:
+            return suggested_files
+
+    symbol_where = " OR ".join("lower(name) LIKE ?" for _ in keywords)
+    symbol_params: tuple[object, ...] = (
+        *(f"%{kw}%" for kw in keywords),
+        max((limit - len(suggested_files)) * 10, 50),
+    )
+    symbol_cursor = await conn.execute(
+        f"""
+        SELECT DISTINCT file_path
+        FROM symbols
+        WHERE ({symbol_where})
+        ORDER BY file_path ASC
+        LIMIT ?
+        """,
+        symbol_params,
+    )
+    symbol_rows = await symbol_cursor.fetchall()
+    for row in symbol_rows:
+        file_path = str(row["file_path"])
+        if file_path in seen_paths:
+            continue
+        seen_paths.add(file_path)
+        suggested_files.append(file_path)
+        if len(suggested_files) >= limit:
+            break
+
+    return suggested_files
 
 
 def _extract_primary_symbol(task_description: str) -> str | None:
@@ -2050,6 +2213,14 @@ async def _generate_context_pack_response(request: ContextBuildRequest) -> Conte
     config = _get_config()
     db = _get_db()
     files_to_include = request.file_overrides if request.file_overrides else request.suggested_files
+    if not files_to_include:
+        fallback_keywords = _extract_search_keywords(request.task_description)
+        files_to_include = await _suggest_files_from_index(
+            db=db,
+            keywords=fallback_keywords,
+            limit=15,
+        )
+
     workspace_service = WorkspaceRootsService(config=config, db=db)
     workspace_root = str(await workspace_service.resolve_workspace_root(request.workspace_root))
 
