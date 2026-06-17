@@ -63,7 +63,7 @@ from .git_history_indexer import GitHistoryIndexer
 from .graph_retriever import GraphRetriever
 from .image_analysis import ImageAnalysisResult, analyze_image
 from .investigation_service import InvestigationService
-from .mcp_orchestrator import MCPOrchestrator, ToolCall
+from .mcp_orchestrator import MCPOrchestrator, MCPDispatcher, ToolCall
 from .local_model_discovery import discover_all_local
 from .memory_manager_service import MemoryManagerService
 from .config_loader import load_provider_config
@@ -104,6 +104,23 @@ _RETENTION_INTERVAL_SECONDS = 6 * 60 * 60
 # Host model relay state — extension acts as LLM proxy for VS Code Copilot
 _task_sse_queues: dict[str, asyncio.Queue] = {}
 _host_relay_futures: dict[str, asyncio.Future] = {}
+
+
+async def _create_mcp_dispatcher() -> MCPDispatcher:
+    """Create a dispatcher function that executes real MCP tool calls."""
+    from .mcp_server import MCPServer
+    
+    server = MCPServer()
+    
+    async def dispatch(tool_name: str, args: dict[str, Any]) -> str:
+        """Execute an MCP tool call and return result text."""
+        try:
+            result = await server._dispatch(tool_name, args)
+            return result
+        except Exception as e:
+            return f"Error executing {tool_name}: {str(e)}"
+    
+    return dispatch
 
 
 class HealthResponse(BaseModel):
@@ -3328,6 +3345,43 @@ async def generate_patch(request: GeneratePatchRequest) -> GeneratePatchResponse
 
     user_prompt = _build_prompt(description, request.context_files, context_text)
     task_run_id = request.task_run_id or str(uuid.uuid4())
+
+    # Run MCP agentic loop to execute helper tools (memory search, context build, etc.)
+    try:
+        dispatcher = await _create_mcp_dispatcher()
+        orchestrator = MCPOrchestrator(
+            db=db,
+            config=config,
+            dispatcher=dispatcher,
+        )
+        
+        # Define MCP tool calls to execute before patch generation
+        mcp_calls = [
+            ToolCall(
+                tool_name="memory_search",
+                input_data={"query": description, "limit": 5},
+            ),
+            ToolCall(
+                tool_name="model_route",
+                input_data={
+                    "task_type": request.mode or "auto",
+                    "context_tokens": len(context_text.split()) if context_text else 0,
+                    "privacy_level": "local_preferred",
+                },
+            ),
+        ]
+        
+        # Execute agentic loop (capped at 2 iterations for patch generation context)
+        await orchestrator.run_agentic_loop(
+            task_run_id=task_run_id,
+            server_name="memopilot",
+            tool_calls=mcp_calls,
+            max_iterations=2,
+            context="patch_generation",
+        )
+    except Exception as e:
+        # MCP orchestration is optional — continue with patch generation if it fails
+        logger.warning(f"MCP orchestration failed for task {task_run_id}: {e}")
 
     # Determine provider fallback order, respecting user-configured order
     configured_order: list[str] = config.get("fallback_order", ["host", "ollama", "anthropic", "openai"])
