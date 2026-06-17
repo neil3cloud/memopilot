@@ -31,6 +31,14 @@ export interface WorkspaceIndexStatusResponse {
     memory_item_count: number;
 }
 
+export interface IndexStatusResponse {
+    indexed_files: number;
+    stale_files: number;
+    symbols_count: number;
+    last_indexed_at: string | null;
+    never_indexed: boolean;
+}
+
 export interface RebuildMemoryResponse {
     rebuilt: boolean;
     total_files_scanned: number;
@@ -565,7 +573,13 @@ export class BackendClient {
         return result as RebuildMemoryResponse;
     }
 
-    async getIndexStatus(workspaceRoot: string): Promise<WorkspaceIndexStatusResponse> {
+    async getIndexStatus(): Promise<IndexStatusResponse>;
+    async getIndexStatus(workspaceRoot: string): Promise<WorkspaceIndexStatusResponse>;
+    async getIndexStatus(workspaceRoot?: string): Promise<IndexStatusResponse | WorkspaceIndexStatusResponse> {
+        if (workspaceRoot === undefined) {
+            const result = await this.manager.request('GET', '/v1/workspace/index/status');
+            return result as IndexStatusResponse;
+        }
         const result = await this.manager.request('GET', `/v1/workspace/index-status?workspace_root=${encodeURIComponent(workspaceRoot)}`);
         return result as WorkspaceIndexStatusResponse;
     }

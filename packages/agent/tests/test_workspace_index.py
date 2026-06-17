@@ -100,3 +100,44 @@ async def test_workspace_index_marks_removed_files_as_stale(
     stale_row = await cursor.fetchone()
     assert stale_row is not None
     assert stale_row["stale"] == 1
+
+
+@pytest.mark.asyncio
+async def test_workspace_index_status_reports_never_indexed(
+    client: AsyncClient,
+    test_token: str,
+):
+    headers = {"X-Agent-Token": test_token}
+    await client.post("/v1/workspace/init", headers=headers)
+
+    status_response = await client.get("/v1/workspace/index/status", headers=headers)
+    assert status_response.status_code == 200
+    data = status_response.json()
+    assert data["indexed_files"] == 0
+    assert data["stale_files"] == 0
+    assert data["symbols_count"] == 0
+    assert data["never_indexed"] is True
+
+
+@pytest.mark.asyncio
+async def test_workspace_index_status_reports_counts_after_index(
+    client: AsyncClient,
+    test_token: str,
+    tmp_workspace,
+):
+    (tmp_workspace / "memory_indexer.py").write_text(
+        "def index_memory() -> str:\n    return 'ok'\n",
+        encoding="utf-8",
+    )
+
+    headers = {"X-Agent-Token": test_token}
+    await client.post("/v1/workspace/init", headers=headers)
+    index_response = await client.post("/v1/workspace/index", headers=headers)
+    assert index_response.status_code == 200
+
+    status_response = await client.get("/v1/workspace/index/status", headers=headers)
+    assert status_response.status_code == 200
+    data = status_response.json()
+    assert data["indexed_files"] >= 1
+    assert data["symbols_count"] >= 1
+    assert data["never_indexed"] is False

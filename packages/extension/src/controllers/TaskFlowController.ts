@@ -150,6 +150,12 @@ export class TaskFlowController {
                 suggested_files: this.state.analysis.suggested_files,
                 mode: this.resolvedMode(),
             });
+            if (contextPack.files.length === 0) {
+                this.transition('error', {
+                    error: 'Context pack is empty — no relevant files were found. Refine the task description or add files manually.',
+                });
+                return;
+            }
             this.transition('routing', { contextPack });
         } catch (err: unknown) {
             this.transition('error', { error: this.errorMsg(err) });

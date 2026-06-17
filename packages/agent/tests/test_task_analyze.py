@@ -203,3 +203,55 @@ async def test_task_analyze_uses_directory_signals_when_no_filename_match(
     data = response.json()
     assert data["task_type"] == "billing_change"
     assert data["risk"] == "high"
+
+
+@pytest.mark.asyncio
+async def test_task_analyze_falls_back_to_indexed_files_when_memory_has_no_match(
+    client: AsyncClient,
+    test_token: str,
+    tmp_workspace,
+):
+    (tmp_workspace / "memory_indexing_service.py").write_text(
+        "def memory_indexing_service() -> None:\n    pass\n",
+        encoding="utf-8",
+    )
+
+    headers = {"X-Agent-Token": test_token}
+    await client.post("/v1/workspace/init", headers=headers)
+    index_response = await client.post("/v1/workspace/index", headers=headers)
+    assert index_response.status_code == 200
+
+    response = await client.post(
+        "/v1/task/analyze",
+        headers=headers,
+        json={"description": "Improve memory indexing service"},
+    )
+    assert response.status_code == 200
+    data = response.json()
+    assert "memory_indexing_service.py" in data["suggested_files"]
+
+
+@pytest.mark.asyncio
+async def test_task_analyze_keeps_domain_keywords_for_index_fallback(
+    client: AsyncClient,
+    test_token: str,
+    tmp_workspace,
+):
+    (tmp_workspace / "workspace_memory_indexing.py").write_text(
+        "def improve_local_memory_indexing() -> None:\n    pass\n",
+        encoding="utf-8",
+    )
+
+    headers = {"X-Agent-Token": test_token}
+    await client.post("/v1/workspace/init", headers=headers)
+    index_response = await client.post("/v1/workspace/index", headers=headers)
+    assert index_response.status_code == 200
+
+    response = await client.post(
+        "/v1/task/analyze",
+        headers=headers,
+        json={"description": "i want to improve the local memory indexing"},
+    )
+    assert response.status_code == 200
+    data = response.json()
+    assert "workspace_memory_indexing.py" in data["suggested_files"]
