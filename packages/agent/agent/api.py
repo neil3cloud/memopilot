@@ -2433,7 +2433,7 @@ async def _generate_context_pack_response(request: ContextBuildRequest) -> Conte
     context_pack_hash = hashlib.sha256(
         json.dumps(response_payload, sort_keys=True).encode("utf-8")
     ).hexdigest()
-    recall_service = MemoryRecallService(db)
+    recall_service = MemoryRecallService(db, config)
     await recall_service.record_recall_trace(
         context_pack_hash=context_pack_hash,
         request_json=request.model_dump_json(),
