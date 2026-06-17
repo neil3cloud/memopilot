@@ -54,6 +54,7 @@ from .context_quality_scorer import (
     ContextPackSnapshot,
     score_context_pack,
 )
+from .cost_guard import BudgetCheck as CostGuardBudgetCheck
 from .cost_guard import CostGuardService, check_budget_gate, infer_selected_tier
 from .db import DatabaseManager
 from .document_ingestion import extract_csv, extract_docx, extract_excel, extract_pdf, extract_pptx
@@ -124,6 +125,19 @@ class WorkspaceIndexResponse(BaseModel):
 
 class RebuildMemoryResponse(WorkspaceIndexResponse):
     rebuilt: bool
+
+
+def _workspace_index_response_kwargs(result: object) -> dict[str, object]:
+    return {
+        "python_project": result.python_project,
+        "total_files_scanned": result.total_files_scanned,
+        "indexed_files": result.indexed_files,
+        "unchanged_files": result.unchanged_files,
+        "stale_files": result.stale_files,
+        "skipped_files": result.skipped_files,
+        "symbols_extracted": result.symbols_extracted,
+        "duration_ms": result.duration_ms,
+    }
 
 
 class BudgetStatusResponse(BaseModel):
@@ -297,6 +311,8 @@ class ModelRouteOption(BaseModel):
 class BudgetCheck(BaseModel):
     allowed: bool
     remaining_usd: float
+    reason: str | None = None
+    status: BudgetStatusResponse | None = None
 
 
 class ModelRouteResponse(BaseModel):
@@ -1671,16 +1687,7 @@ async def index_workspace() -> WorkspaceIndexResponse:
     result = await indexer.index_workspace()
     profile_service = WorkspaceProfileService(config=config, db=db)
     await profile_service.ensure_profile()
-    return WorkspaceIndexResponse(
-        python_project=result.python_project,
-        total_files_scanned=result.total_files_scanned,
-        indexed_files=result.indexed_files,
-        unchanged_files=result.unchanged_files,
-        stale_files=result.stale_files,
-        skipped_files=result.skipped_files,
-        symbols_extracted=result.symbols_extracted,
-        duration_ms=result.duration_ms,
-    )
+    return WorkspaceIndexResponse(**_workspace_index_response_kwargs(result))
 
 
 @app.post("/v1/workspace/rebuild-memory", response_model=RebuildMemoryResponse)
@@ -1688,17 +1695,7 @@ async def rebuild_memory() -> RebuildMemoryResponse:
     """Rebuild indexed workspace memory from source code."""
     indexer = WorkspaceIndexer(config=_get_config(), db=_get_db())
     result = await indexer.rebuild_memory()
-    return RebuildMemoryResponse(
-        rebuilt=True,
-        python_project=result.python_project,
-        total_files_scanned=result.total_files_scanned,
-        indexed_files=result.indexed_files,
-        unchanged_files=result.unchanged_files,
-        stale_files=result.stale_files,
-        skipped_files=result.skipped_files,
-        symbols_extracted=result.symbols_extracted,
-        duration_ms=result.duration_ms,
-    )
+    return RebuildMemoryResponse(rebuilt=True, **_workspace_index_response_kwargs(result))
 
 
 def _to_budget_status_response(status) -> BudgetStatusResponse:
@@ -1719,6 +1716,26 @@ def _to_budget_status_response(status) -> BudgetStatusResponse:
         warning_threshold=status.warning_threshold,
         at_warning=status.at_warning,
         last_updated_at=status.last_updated_at,
+    )
+
+
+def _to_model_route_budget_check_response(
+    check: CostGuardBudgetCheck | None,
+    *,
+    fallback_remaining_usd: float,
+    fallback_allowed: bool,
+) -> BudgetCheck:
+    if check is None:
+        return BudgetCheck(
+            allowed=fallback_allowed,
+            remaining_usd=round(fallback_remaining_usd, 2),
+        )
+
+    return BudgetCheck(
+        allowed=fallback_allowed,
+        remaining_usd=round(check.status.remaining_usd, 2),
+        reason=check.reason,
+        status=_to_budget_status_response(check.status),
     )
 
 
@@ -3124,7 +3141,11 @@ async def route_model(request: ModelRouteRequest) -> ModelRouteResponse:
     return ModelRouteResponse(
         recommended=recommended,
         alternatives=alternatives,
-        budget_check=BudgetCheck(allowed=budget_allowed, remaining_usd=round(remaining_usd, 2)),
+        budget_check=_to_model_route_budget_check_response(
+            recommended_check if isinstance(recommended_check, CostGuardBudgetCheck) else None,
+            fallback_remaining_usd=remaining_usd,
+            fallback_allowed=budget_allowed,
+        ),
         options=options,
         escalation_source=escalation_source,
         base_tier=base_tier.value,

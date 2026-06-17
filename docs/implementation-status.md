@@ -1,6 +1,6 @@
 # MemoPilot Implementation Status
 
-> Last updated: 2026-06-16 | Schema v21 | Extension v1.0.0
+> Last updated: 2026-06-17 | Schema v21 | Extension v1.0.1 (Hardening)
 
 ## Overview
 
@@ -32,9 +32,10 @@ MemoPilot's architecture is fully scaffolded end-to-end — the UI workflow, bac
 | **Backend — Core** | Privacy Dashboard | ✅ Implemented | Tracks cloud calls, local/cloud classification |
 | **Backend — Core** | Evidence Board | ✅ Implemented | Stores and queries evidence items |
 | **Backend — Core** | Workspace Profile | ✅ Implemented | Language detection, framework inference, export |
-| **Pipeline — Controller** | TaskFlowController (extension) | ✅ Implemented | State machine: analyze→context→route→patch→approve→validate→apply |
+| **Pipeline — Controller** | TaskFlowController (extension) | ✅ Hardened | Non-chaining steps, mode normalization, duplicate patch prevention, transactional file apply |
 | **Pipeline — Controller** | Step-aware UI transitions | ✅ Implemented | Buttons show/hide per active step |
-| **Pipeline — Controller** | File apply on approval | ✅ Implemented | Writes `new_content` to disk via VS Code FS API |
+| **Pipeline — Controller** | File apply with rollback | ✅ Hardened | Snapshots files before apply; rolls back earlier writes on failure; preserves root error |
+| **Backend — API** | Replay AI Call (`/v1/ai/replay/{ai_call_id}`) | ✅ Hardened | Graceful 404 for missing context pack files; no 500 on deleted packs |
 | **Testing** | Backend unit tests | ✅ 286+ tests passing | Comprehensive coverage of all backend services |
 | **Testing** | Extension type-checking | ✅ Clean | tsc --noEmit passes |
 
@@ -49,6 +50,9 @@ MemoPilot's architecture is fully scaffolded end-to-end — the UI workflow, bac
 5. **Validation** — runs real linters/compilers on workspace
 6. **Cost tracking** — records mock costs, enforces budgets
 7. **Approval gate** — requires explicit user action before applying patches
+8. **Patch apply with rollback** — snapshots files before write; rolls back on failure; preserves root error
+9. **Replay error handling** — graceful 404 when context pack files are missing
+10. **Flow isolation** — buildContext, routeModel, generatePatch no longer auto-chain; panel controls progression
 
 ---
 
@@ -105,6 +109,37 @@ packages/extension/src/
 ├── panels/TaskEntryPanel.ts           # New Task UI — working
 └── BackendClient.ts                   # API client — all endpoints defined
 ```
+
+---
+
+## Code Review Hardening (2026-06-17)
+
+### Extension TaskFlowController (packages/extension/src/controllers/TaskFlowController.ts)
+- ✅ Removed hidden auto-chaining: buildContext/routeModel/generatePatch are now single-step, non-chaining methods
+- ✅ Added mode normalization: resolvedMode() ensures analysis.suggested_mode is preferred, with fallback to 'auto'
+- ✅ Duplicate patch prevention: generatePatch() returns early if already in awaiting_approval stage with existing patch
+- ✅ Transactional file apply: captureSnapshot() saves original file contents; rollbackAppliedChanges() restores on failure
+- ✅ Error preservation: rollback errors are logged but not thrown; original write error is preserved and re-thrown
+
+### Backend Replay Hardening (packages/agent/agent/provider_registry.py)
+- ✅ Missing context pack handling: raises ValueError if pack_path does not exist on disk
+- ✅ API graceful degradation: HTTPException(404) with "Context pack not available" instead of 500
+- ✅ Prevents silent data loss: developer sees which AI call's context is unavailable for replay
+
+### API Contract Enrichment (packages/agent/agent/api.py)
+- ✅ BudgetCheck response expanded: now includes optional reason and status fields
+- ✅ Backward compatible: reason and status default to None for non-routing contexts
+- ✅ Deduplication: _workspace_index_response_kwargs() shared mapper for index_workspace and rebuild_memory endpoints
+- ✅ Prevents silent divergence: future fields added to WorkspaceIndexResult auto-sync to both responses
+
+### TaskEntryPanel Consistency (packages/extension/src/panels/TaskEntryPanel.ts)
+- ✅ Fallback path alignment: direct buildContextPack call uses task_description (not intent_summary)
+- ✅ Logging parity: fallback path logs the same fields as the main flow (mode, files, summary)
+- ✅ Explicit progression: runPatchGeneration() checks state and only calls needed steps
+
+### Test Coverage Added
+- ✅ test_model_route_basic: verifies budget_check.reason and budget_check.status in response shape
+- ✅ test_replay_ai_call_returns_404_when_context_pack_file_is_missing: validates graceful 404 for missing packs
 
 ---
 
