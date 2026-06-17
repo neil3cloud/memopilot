@@ -79,7 +79,7 @@ jobs:
       - name: Install pnpm
         uses: pnpm/action-setup@v2
         with:
-          version: 11
+          version: '11.6.0'
 
       - name: Get pnpm store directory
         id: pnpm-cache
@@ -100,7 +100,7 @@ jobs:
 
       - name: Type check
         working-directory: packages/extension
-        run: pnpm exec tsc --noEmit
+        run: node_modules/.bin/tsc --noEmit
 
       - name: Build extension
         working-directory: packages/extension
