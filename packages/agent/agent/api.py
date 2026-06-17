@@ -83,6 +83,7 @@ from .retention import enforce_retention
 from .review_memory_mode import CodeReviewMemoryModeService
 from .security_policy import CredentialRedactor, DatabaseWriteBlocker
 from .skill_loader import SkillLoaderService
+from .task_analyzer import LLMTaskAnalyzer
 from .tool_mode_router import create_tool_mode_routes
 from .validation_runner import ValidationCommand, ValidationRunner
 from .workspace_indexer import WorkspaceIndexer
@@ -2007,6 +2008,27 @@ async def analyze_task(request: TaskAnalyzeRequest) -> TaskAnalyzeResponse:
     intent_summary = description.split(".")[0].strip()
     if len(intent_summary) > 100:
         intent_summary = intent_summary[:97] + "..."
+
+    # Try to enhance analysis with LLM if available
+    heuristic_result = {
+        "intent_summary": intent_summary,
+        "complexity": complexity,
+        "task_type": task_type,
+        "risk": risk,
+        "suggested_mode": mode,
+    }
+    
+    try:
+        analyzer = LLMTaskAnalyzer(config=config)
+        enhanced = await analyzer.analyze_with_fallback(description, heuristic_result)
+        intent_summary = enhanced.get("intent_summary", intent_summary)
+        complexity = enhanced.get("complexity", complexity)
+        task_type = enhanced.get("task_type", task_type)
+        risk = enhanced.get("risk", risk)
+        mode = enhanced.get("suggested_mode", mode)
+    except Exception:
+        # LLM analysis failed — continue with heuristic results
+        pass
 
     return TaskAnalyzeResponse(
         intent_summary=intent_summary,
