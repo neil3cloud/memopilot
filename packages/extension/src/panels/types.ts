@@ -13,6 +13,7 @@ export type WebviewOutboundMessage =
     | { type: 'request-cost-status' }
     | { type: 'restart-backend' }
     | { type: 'cancel-indexing' }
+    | { type: 'enter-api-key' }
     | { type: 'ready' };
 
 /** Messages sent FROM extension TO webview */
@@ -21,6 +22,7 @@ export type WebviewInboundMessage =
     | { type: 'navigation-items'; payload: NavigationItemDTO[] }
     | { type: 'active-view'; payload: { viewId: string } }
     | { type: 'view-content'; payload: { viewId: string; html: string } }
+    | { type: 'streaming-token'; payload: { content: string } }
     | { type: 'error'; payload: { message: string } };
 
 export type WebviewMessage = WebviewOutboundMessage | WebviewInboundMessage;
@@ -38,6 +40,7 @@ export interface WorkspaceStatusDTO {
     filesScanned: number;
     totalFiles: number;
     symbolsExtracted: number;
+    needsSetup?: boolean;
 }
 
 export interface NavigationItemDTO {

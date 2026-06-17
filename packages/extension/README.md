@@ -62,14 +62,15 @@ AI coding assistants are powerful — but uncontrolled. They send too much conte
 - **Context quality score** — 6-factor weighted score with verdict (good/acceptable/poor/rebuild) visible in sidebar before patching
 
 ### 🤖 Cost-Aware Model Routing
-- Routes tasks: local model → cheap cloud → frontier (only when needed)
+- Routes tasks: **GitHub Copilot (host)** → local model → cheap cloud → frontier (only when needed)
+- **GitHub Copilot first** — if you're authenticated, Copilot is used with no API key required; tokens streamed via the VS Code Language Model API
 - **Outcome-based escalation** — if a module fails 2+ times with cheaper models, automatically routes to frontier
 - Per-model cost comparison shown before every AI call (all tiers side by side)
 - Inline model override — switch models without restarting the task
 - Routing reason explains both the decision and what would trigger escalation
 - Monthly budget enforcement with graduated response (80% warning → 90% frontier approval → 100% block)
 - Budget profiles: `balanced`, `cost_saver`, `strict_local`, `enterprise_privacy`
-- Provider capability matrix shows what each model can do
+- Provider capability matrix shows Copilot, Ollama, LM Studio, and cloud models in a single view
 
 ### 🔒 Patch Safety & Approval
 - Task classifier determines risk level deterministically (no LLM needed)
@@ -184,7 +185,7 @@ AI coding assistants are powerful — but uncontrolled. They send too much conte
 
 1. Install from the VS Code Marketplace, or:
    ```
-   code --install-extension memopilot-1.0.0.vsix
+   code --install-extension memopilot-1.0.1.vsix
    ```
 2. Open a workspace. MemoPilot activates automatically.
 3. The backend starts, creates `.memopilot/`, and indexes your workspace.
@@ -281,6 +282,24 @@ tool_mode:
 | `cost_saver` | Blocks frontier unless explicitly approved per-task |
 | `strict_local` | All AI calls must use local models (Ollama, LM Studio) |
 | `enterprise_privacy` | Only local-privacy providers permitted |
+
+### Provider Config (`.memopilot/config.yaml`)
+
+This file is auto-created and gitignored on first run. It is never committed.
+
+```yaml
+provider: host           # host (VS Code Copilot) | ollama | anthropic | openai | lmstudio
+fallback_order:
+  - host                 # GitHub Copilot via vscode.lm API — no API key needed
+  - ollama               # Local, free, no API key
+  - anthropic            # Requires anthropic_api_key
+  - openai               # Requires openai_api_key
+
+# anthropic_api_key: sk-ant-...
+# openai_api_key: sk-...
+```
+
+**GitHub Copilot is the default and requires no configuration** — just sign in to Copilot in VS Code.
 
 ### Rules (`.memopilot/rules/*.yaml`)
 

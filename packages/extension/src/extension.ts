@@ -43,6 +43,9 @@ async function refreshIndexStatus(
         return undefined;
     }
 }
+let healthCheckInterval: ReturnType<typeof setInterval> | undefined;
+let unexpectedExitRetryCount = 0;
+const MAX_RESTART_RETRIES = 3;
 
 export async function activate(context: vscode.ExtensionContext): Promise<void> {
     const outputChannel = vscode.window.createOutputChannel('MemoPilot');
@@ -161,7 +164,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         }
         // Recreate task flow controller with new client
         if (backendClient) {
-            taskFlowController = new TaskFlowController(backendClient);
+            taskFlowController = new TaskFlowController(backendClient, backendManager);
         }
         await Promise.all([
             profileProvider.refresh(),
@@ -996,6 +999,15 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         statusProvider,
         refreshGovernanceViews,
     );
+
+    // Auto-index on activation — silent background, non-blocking
+    void triggerAutoIndex(backendClient, outputChannel);
+
+    context.subscriptions.push(
+        vscode.workspace.onDidChangeWorkspaceFolders(() => {
+            void triggerAutoIndex(backendClient, outputChannel);
+        }),
+    );
 }
 
 async function startBackend(
@@ -1008,7 +1020,45 @@ async function startBackend(
     if (!workspaceFolder) { return; }
 
     try {
-        backendManager = new BackendManager(workspaceFolder.uri.fsPath, outputChannel);
+        // Clear any existing health check interval
+        if (healthCheckInterval) {
+            clearInterval(healthCheckInterval);
+            healthCheckInterval = undefined;
+        }
+        unexpectedExitRetryCount = 0;
+
+        // Create handler for unexpected backend exits
+        const onUnexpectedExit = async () => {
+            outputChannel.appendLine(`[MemoPilot] Backend unexpected exit detected (attempt ${unexpectedExitRetryCount + 1}/${MAX_RESTART_RETRIES})`);
+            
+            if (unexpectedExitRetryCount >= MAX_RESTART_RETRIES) {
+                statusBarItem.text = '$(error) MemoPilot';
+                statusBarItem.tooltip = 'MemoPilot — Backend crashed and could not restart';
+                statusProvider.setStatus('error', 'Backend crashed and could not restart');
+                
+                const action = await vscode.window.showErrorMessage(
+                    'MemoPilot backend crashed and could not be automatically restarted.',
+                    'Restart Backend',
+                    'Dismiss'
+                );
+                if (action === 'Restart Backend') {
+                    await stopBackend();
+                    unexpectedExitRetryCount = 0;
+                    await startBackend(context, outputChannel, statusProvider, onConnectedRefresh);
+                }
+                return;
+            }
+
+            unexpectedExitRetryCount++;
+            const backoffMs = Math.pow(2, unexpectedExitRetryCount) * 1000; // 2s, 4s, 8s
+            outputChannel.appendLine(`[MemoPilot] Retrying backend start in ${backoffMs}ms...`);
+            
+            await new Promise(resolve => setTimeout(resolve, backoffMs));
+            await stopBackend();
+            await startBackend(context, outputChannel, statusProvider, onConnectedRefresh);
+        };
+
+        backendManager = new BackendManager(workspaceFolder.uri.fsPath, outputChannel, onUnexpectedExit);
         await backendManager.start();
 
         backendClient = new BackendClient(backendManager);
@@ -1022,6 +1072,25 @@ async function startBackend(
             // Initialize workspace .memopilot/ folder
             await backendClient.initWorkspace();
             outputChannel.appendLine('[MemoPilot] Workspace initialized.');
+            
+            // Set up periodic health checks (every 30 seconds)
+            healthCheckInterval = setInterval(async () => {
+                try {
+                    await backendClient?.health();
+                } catch (err) {
+                    outputChannel.appendLine(`[MemoPilot] Health check failed: ${err instanceof Error ? err.message : String(err)}`);
+                }
+            }, 30000);
+            
+            context.subscriptions.push(new (class {
+                dispose() {
+                    if (healthCheckInterval) {
+                        clearInterval(healthCheckInterval);
+                        healthCheckInterval = undefined;
+                    }
+                }
+            })());
+            
             await onConnectedRefresh();
 
             const indexStatus = await refreshIndexStatus(backendClient, statusProvider, outputChannel);
@@ -1062,6 +1131,10 @@ async function startBackend(
 }
 
 async function stopBackend(): Promise<void> {
+    if (healthCheckInterval) {
+        clearInterval(healthCheckInterval);
+        healthCheckInterval = undefined;
+    }
     if (backendManager) {
         await backendManager.stop();
         backendManager = undefined;
@@ -1088,6 +1161,41 @@ async function getGitDiffForReview(workspaceRoot: string): Promise<string> {
             resolve(error ? '' : stdout);
         });
     });
+}
+
+async function triggerAutoIndex(
+    client: BackendClient | undefined,
+    outputChannel: vscode.OutputChannel,
+): Promise<void> {
+    if (!client) { return; }
+
+    try {
+        const workspaceRoot = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+        if (!workspaceRoot) { return; }
+
+        const status = await client.getIndexStatus(workspaceRoot);
+        const lastIndexed = status.last_indexed_at ? new Date(status.last_indexed_at).getTime() : 0;
+        const hoursSince = (Date.now() - lastIndexed) / 3_600_000;
+
+        const shouldIndex =
+            !status.ever_indexed ||
+            status.stale_file_count > 0 ||
+            hoursSince > 24;
+
+        if (!shouldIndex) { return; }
+
+        const bar = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 99);
+        bar.text = '$(sync~spin) MemoPilot indexing...';
+        bar.show();
+
+        await client.indexWorkspace(true);
+        bar.text = '$(check) MemoPilot ready';
+        setTimeout(() => bar.dispose(), 3000);
+
+        outputChannel.appendLine('[MemoPilot] Auto-index complete.');
+    } catch {
+        // Silent failure — MemoPilot remains usable without index
+    }
 }
 
 export async function deactivate(): Promise<void> {

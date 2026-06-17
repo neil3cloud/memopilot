@@ -11,9 +11,9 @@ import aiosqlite
 
 from .config import Config
 from .db import DatabaseManager
+from .graph_retriever import GraphRetriever
 from .project_scanner import WorkspaceScanner
 from .symbol_extractor import SymbolExtractor
-from .graph_retriever import GraphRetriever
 
 
 @dataclass(frozen=True)

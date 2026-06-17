@@ -15,7 +15,7 @@ import re
 import subprocess
 import uuid
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import datetime
 
 from .db import DatabaseManager
 
@@ -123,7 +123,7 @@ class GitHistoryIndexer:
                     subprocess.run,
                     [
                         "git", "log",
-                        f"--format=%H|%an|%ai|%s",
+                        "--format=%H|%an|%ai|%s",
                         "--numstat",
                         f"--max-count={max_commits}",
                         f"--since={max_days} days ago",

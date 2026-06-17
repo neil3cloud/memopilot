@@ -16,7 +16,6 @@ from dataclasses import dataclass
 
 from .db import DatabaseManager
 
-
 _EXCLUDED_PREFIXES = ("tests/", "test_", "migrations/", "__pycache__/")
 _EXCLUDED_KINDS = {"import"}
 _TOP_LEVEL_KINDS = {"function", "class"}

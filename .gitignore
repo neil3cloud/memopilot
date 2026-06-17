@@ -6,6 +6,9 @@ dist/
 .vscode-test/
 .vscode-test-workspace/
 
+# Extension bundled agent (build artifact, copied by prebundle-agent)
+packages/extension/agent/
+
 # Python
 __pycache__/
 *.pyc

@@ -36,9 +36,10 @@ def test_config(tmp_workspace: Path) -> Config:
 @pytest_asyncio.fixture
 async def test_db(test_config: Config) -> DatabaseManager:
     """Create an in-memory database manager for tests."""
-    # Use in-memory SQLite for speed
+    from agent.migration_runner import run_migrations
     db = DatabaseManager(Path(":memory:"))
-    await db.connect()
+    conn = await db.connect()
+    await run_migrations(conn)
     yield db
     await db.close()
 

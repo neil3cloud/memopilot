@@ -11,7 +11,7 @@ export interface InitWorkspaceResponse {
     memopilot_dir: string;
 }
 
-export interface IndexWorkspaceResponse {
+export interface WorkspaceIndexResponse {
     python_project: boolean;
     total_files_scanned: number;
     indexed_files: number;
@@ -20,6 +20,15 @@ export interface IndexWorkspaceResponse {
     skipped_files: number;
     symbols_extracted: number;
     duration_ms: number;
+    memory_items_seeded: number;
+}
+
+export interface WorkspaceIndexStatusResponse {
+    ever_indexed: boolean;
+    file_count: number;
+    stale_file_count: number;
+    last_indexed_at: string | null;
+    memory_item_count: number;
 }
 
 export interface IndexStatusResponse {
@@ -176,6 +185,9 @@ export interface GeneratePatchRequest {
     mode?: string;
     model_id?: string;
     dry_run?: boolean;
+    task_run_id?: string;
+    context_pack_hash?: string;
+    workspace_root?: string;
 }
 
 export interface FilePatch {
@@ -360,6 +372,21 @@ export interface ProviderCapabilitiesResponse {
     items: ProviderCapabilityItemResponse[];
 }
 
+export interface LocalModelItem {
+    model_id: string;
+    source: string;
+    max_context_tokens: number;
+    supports_tools: boolean;
+    cost_per_1m_input: number;
+    status: string;
+}
+
+export interface LocalDiscoverResponse {
+    models: LocalModelItem[];
+    ollama_running: boolean;
+    lmstudio_running: boolean;
+}
+
 export interface ReplayAICallResponse {
     ai_call_id: string;
     task_run_id: string;
@@ -536,19 +563,25 @@ export class BackendClient {
         return result as InitWorkspaceResponse;
     }
 
-    async indexWorkspace(): Promise<IndexWorkspaceResponse> {
-        const result = await this.manager.request('POST', '/v1/workspace/index');
-        return result as IndexWorkspaceResponse;
-    }
-
-    async getIndexStatus(): Promise<IndexStatusResponse> {
-        const result = await this.manager.request('GET', '/v1/workspace/index/status');
-        return result as IndexStatusResponse;
+    async indexWorkspace(seedMemory: boolean = true): Promise<WorkspaceIndexResponse> {
+        const result = await this.manager.request('POST', '/v1/workspace/index', { seed_memory: seedMemory });
+        return result as WorkspaceIndexResponse;
     }
 
     async rebuildMemory(): Promise<RebuildMemoryResponse> {
         const result = await this.manager.request('POST', '/v1/workspace/rebuild-memory');
         return result as RebuildMemoryResponse;
+    }
+
+    async getIndexStatus(): Promise<IndexStatusResponse>;
+    async getIndexStatus(workspaceRoot: string): Promise<WorkspaceIndexStatusResponse>;
+    async getIndexStatus(workspaceRoot?: string): Promise<IndexStatusResponse | WorkspaceIndexStatusResponse> {
+        if (workspaceRoot === undefined) {
+            const result = await this.manager.request('GET', '/v1/workspace/index/status');
+            return result as IndexStatusResponse;
+        }
+        const result = await this.manager.request('GET', `/v1/workspace/index-status?workspace_root=${encodeURIComponent(workspaceRoot)}`);
+        return result as WorkspaceIndexStatusResponse;
     }
 
     async getWorkspaceProfile(): Promise<WorkspaceProfileResponse> {
@@ -642,6 +675,61 @@ export class BackendClient {
     async generatePatch(request: GeneratePatchRequest): Promise<GeneratePatchResponse> {
         const result = await this.manager.request('POST', '/v1/task/generate-patch', request);
         return result as GeneratePatchResponse;
+    }
+
+    /**
+     * Open an SSE stream for a task run and call onToken for each TOKEN event.
+     * Returns a dispose function that cancels the stream.
+     */
+    openTokenStream(taskRunId: string, onToken: (token: string) => void): () => void {
+        // eslint-disable-next-line @typescript-eslint/no-require-imports
+        const http = require('http') as typeof import('http');
+        const url = new URL(`/v1/task/${encodeURIComponent(taskRunId)}/stream`, this.manager.baseUrl);
+        let req: import('http').ClientRequest | undefined;
+        let cancelled = false;
+
+        const connect = () => {
+            if (cancelled) { return; }
+            req = http.request(
+                {
+                    hostname: '127.0.0.1',
+                    port: parseInt(url.port || '80', 10),
+                    path: url.pathname + url.search,
+                    headers: {
+                        'X-Agent-Token': this.manager.authToken,
+                        'Accept': 'text/event-stream',
+                        'Cache-Control': 'no-cache',
+                    },
+                },
+                (res) => {
+                    let buffer = '';
+                    res.on('data', (chunk: Buffer) => {
+                        buffer += chunk.toString('utf8');
+                        const lines = buffer.split('\n');
+                        buffer = lines.pop() ?? '';
+                        for (const line of lines) {
+                            if (line.startsWith('data: ')) {
+                                try {
+                                    const event = JSON.parse(line.slice(6)) as { type: string; token?: string };
+                                    if (event.type === 'TOKEN' && event.token) {
+                                        onToken(event.token);
+                                    }
+                                } catch { /* skip malformed */ }
+                            }
+                        }
+                    });
+                },
+            );
+            req.on('error', () => { /* backend ended */ });
+            req.end();
+        };
+
+        connect();
+
+        return () => {
+            cancelled = true;
+            req?.destroy();
+        };
     }
 
     async validatePatches(request: ValidateRequest): Promise<ValidateResponse> {
@@ -773,6 +861,12 @@ export class BackendClient {
     async listProviderCapabilities(): Promise<ProviderCapabilitiesResponse> {
         const result = await this.manager.request('GET', '/v1/providers/capabilities');
         return result as ProviderCapabilitiesResponse;
+    }
+
+    async discoverLocalProviders(workspaceRoot?: string): Promise<LocalDiscoverResponse> {
+        const qs = workspaceRoot ? `?workspace_root=${encodeURIComponent(workspaceRoot)}` : '';
+        const result = await this.manager.request('GET', `/v1/providers/local-discover${qs}`);
+        return result as LocalDiscoverResponse;
     }
 
     async replayAICall(aiCallId: string): Promise<ReplayAICallResponse> {
