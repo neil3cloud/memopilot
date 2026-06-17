@@ -45,12 +45,12 @@ class LLMTaskAnalyzer:
         # Try to get an LLM provider
         provider_chain = ["ollama", "anthropic", "openai", "lmstudio"]
         configured_order = self._config.get("fallback_order", provider_chain)
-        
+
         for provider in configured_order:
             if provider == "host":
                 # Skip host models for task analysis (no LLM_REQUEST events)
                 continue
-            
+
             try:
                 if provider == "ollama":
                     client = build_client("ollama", self._config)
@@ -68,23 +68,23 @@ class LLMTaskAnalyzer:
                     client = build_client("lmstudio", self._config)
                 else:
                     continue
-                
+
                 # Call LLM for analysis
                 response = await client.complete(
                     self._ANALYSIS_SYSTEM_PROMPT,
                     f"Task: {task_description}",
                     max_tokens=256,
                 )
-                
+
                 # Parse response
                 llm_result = self._parse_llm_response(response.content)
                 if llm_result:
                     return self._merge_results(heuristic_result, llm_result)
-                
+
             except Exception:
                 # Continue to next provider
                 continue
-        
+
         # All LLM providers failed or unavailable — return heuristic result
         return heuristic_result
 
@@ -97,7 +97,7 @@ class LLMTaskAnalyzer:
                 text = text.split("```")[1]
                 if text.startswith("json"):
                     text = text[4:]
-            
+
             result = json.loads(text)
             return result
         except (json.JSONDecodeError, IndexError, ValueError):
@@ -110,26 +110,26 @@ class LLMTaskAnalyzer:
     ) -> dict[str, Any]:
         """Merge LLM results with heuristic fallback."""
         merged = heuristic.copy()
-        
+
         # Use LLM results if valid, otherwise keep heuristic
         llm_complexity = llm.get("complexity", "").lower()
         if llm_complexity in ("low", "medium", "high"):
             merged["complexity"] = llm_complexity
-        
+
         llm_risk = llm.get("risk", "").lower()
         if llm_risk in ("low", "medium", "high"):
             merged["risk"] = llm_risk
-        
+
         llm_type = llm.get("estimated_task_type", "").lower()
         if llm_type and llm_type != "other":
             merged["task_type"] = llm_type
-        
+
         llm_mode = llm.get("suggested_mode", "").lower()
         if llm_mode in ("fix", "refactor", "test", "document", "auto"):
             merged["suggested_mode"] = llm_mode
-        
+
         llm_intent = llm.get("intent_summary", "").strip()
         if llm_intent and len(llm_intent) > 5:
             merged["intent_summary"] = llm_intent[:100]
-        
+
         return merged

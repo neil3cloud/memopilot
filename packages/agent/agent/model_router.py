@@ -11,7 +11,6 @@ import aiosqlite
 from .db import DatabaseManager
 from .local_model_discovery import LocalModel, discover_all_local
 
-
 # ---------------------------------------------------------------------------
 # Tier enum and ordering (used by /v1/model/route endpoint)
 # ---------------------------------------------------------------------------

@@ -6,7 +6,6 @@ semantic search functionality.
 
 from __future__ import annotations
 
-import uuid
 from typing import Any
 
 from .config import Config
@@ -39,41 +38,41 @@ class VectorBackfillService:
         """
         try:
             conn = await self._db.connect()
-            
+
             # Get preferred model from config
             config_row = await conn.execute(
                 "SELECT preferred_model, embedding_dimension FROM vector_config WHERE id = 1"
             )
             config_data = await config_row.fetchone()
             model = config_data[0] if config_data else "ollama:nomic-embed-text"
-            
+
             # Query memory items
             query = "SELECT id, title, body FROM memory_items"
             params: list[Any] = []
-            
+
             if workspace_root:
                 query += " WHERE source_path LIKE ?"
                 params.append(f"{workspace_root}%")
-            
+
             if limit:
                 query += " LIMIT ?"
                 params.append(limit)
-            
+
             cursor = await conn.execute(query, params)
             items = await cursor.fetchall()
-            
+
             embedded_count = 0
             failed_count = 0
-            
+
             # Process each memory item
             for item_id, title, body in items:
                 try:
                     # Create text to embed (title + body summary)
                     text_to_embed = f"{title}\n{body[:500]}"  # First 500 chars of body
-                    
+
                     # Generate embedding
                     embedding = await self._vector_service.embed_text(text_to_embed, model)
-                    
+
                     if embedding:
                         # Store in vectors table
                         stored = await self._vector_service.store_vector(
@@ -90,7 +89,7 @@ class VectorBackfillService:
                         failed_count += 1
                 except Exception:
                     failed_count += 1
-            
+
             # Update indexing status
             if workspace_root:
                 await self._vector_service.update_index_status(
@@ -99,7 +98,7 @@ class VectorBackfillService:
                     memory_items_indexed=embedded_count,
                     model=model,
                 )
-            
+
             return {
                 "total_items": len(items),
                 "embedded_count": embedded_count,
@@ -132,32 +131,32 @@ class VectorBackfillService:
         """
         try:
             conn = await self._db.connect()
-            
+
             # Get preferred model from config
             config_row = await conn.execute(
                 "SELECT preferred_model FROM vector_config WHERE id = 1"
             )
             config_data = await config_row.fetchone()
             model = config_data[0] if config_data else "ollama:nomic-embed-text"
-            
+
             # Query symbols
             query = "SELECT id, name, summary, signature FROM symbols"
             params: list[Any] = []
-            
+
             if workspace_root:
                 query += " WHERE file_path LIKE ?"
                 params.append(f"{workspace_root}%")
-            
+
             if limit:
                 query += " LIMIT ?"
                 params.append(limit)
-            
+
             cursor = await conn.execute(query, params)
             symbols = await cursor.fetchall()
-            
+
             embedded_count = 0
             failed_count = 0
-            
+
             # Process each symbol
             for symbol_id, name, summary, signature in symbols:
                 try:
@@ -167,12 +166,12 @@ class VectorBackfillService:
                         parts.append(summary)
                     if signature:
                         parts.append(signature)
-                    
+
                     text_to_embed = "\n".join(parts)
-                    
+
                     # Generate embedding
                     embedding = await self._vector_service.embed_text(text_to_embed, model)
-                    
+
                     if embedding:
                         # Store in vectors table
                         stored = await self._vector_service.store_vector(
@@ -189,7 +188,7 @@ class VectorBackfillService:
                         failed_count += 1
                 except Exception:
                     failed_count += 1
-            
+
             # Update indexing status
             if workspace_root:
                 await self._vector_service.update_index_status(
@@ -198,7 +197,7 @@ class VectorBackfillService:
                     memory_items_indexed=0,
                     model=model,
                 )
-            
+
             return {
                 "total_items": len(symbols),
                 "embedded_count": embedded_count,
@@ -225,7 +224,7 @@ class VectorBackfillService:
         """
         memory_stats = await self.backfill_memory_items(workspace_root)
         symbol_stats = await self.backfill_symbols(workspace_root)
-        
+
         return {
             "memory_items": memory_stats,
             "symbols": symbol_stats,

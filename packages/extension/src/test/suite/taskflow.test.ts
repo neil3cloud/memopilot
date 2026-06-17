@@ -65,7 +65,7 @@ suite('TaskFlowController', () => {
     });
 
     test('Transitions to analyzing when startTask is called', async () => {
-        controller.startTask('Fix failing tests');
+        controller.startTask('Fix failing tests', [], 'auto');
         const state = controller.getState();
         assert.strictEqual(state.stage, 'analyzing', 'Stage should be analyzing');
         
@@ -74,7 +74,7 @@ suite('TaskFlowController', () => {
     });
 
     test('streamingToken accumulates during patch generation', async () => {
-        controller.startTask('Generate a patch');
+        controller.startTask('Generate a patch', [], 'auto');
         
         // Simulate streaming tokens
         const onStageChangeHandler = (state: any) => {
@@ -92,8 +92,16 @@ suite('TaskFlowController', () => {
     });
 
     test('Rejection resets flow state', () => {
-        // Move to approving stage
-        controller.getState().stage = 'awaiting_approval';
+        // Move to approving stage via setAnalysis
+        controller.setAnalysis('test task', [], 'auto', {
+            intent_summary: 'test',
+            suggested_files: [],
+            applicable_rules: [],
+            estimated_complexity: 'low',
+            suggested_mode: 'auto',
+            task_type: 'general',
+            risk: 'low',
+        });
         
         // Reject the patch
         controller.reject();
@@ -114,7 +122,7 @@ suite('TaskFlowController', () => {
         } as any;
         
         const controllerWithBadClient = new TaskFlowController(badClient, mockManager as any);
-        controllerWithBadClient.startTask('Test task');
+        controllerWithBadClient.startTask('Test task', [], 'auto');
         
         // Wait for async error handling
         await new Promise(resolve => setTimeout(resolve, 100));
@@ -130,7 +138,7 @@ suite('TaskFlowController', () => {
             stageChangeCount++;
         });
         
-        controller.startTask('Test');
+        controller.startTask('Test', [], 'auto');
         await new Promise(resolve => setTimeout(resolve, 150));
         
         assert.ok(stageChangeCount > 0, 'Stage change events should be emitted');

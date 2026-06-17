@@ -4,8 +4,9 @@ from __future__ import annotations
 
 import json
 import uuid
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
-from typing import Any, Awaitable, Callable, Literal
+from typing import Any, Literal
 
 from .config import Config
 from .db import DatabaseManager
@@ -87,7 +88,7 @@ class MCPOrchestrator:
 
             status = "blocked" if policy.blocked else "success"
             blocked_reason = policy.reason
-            
+
             if policy.blocked:
                 result_summary = "Blocked DB write statement in MCP payload."
             elif self._dispatcher is not None:

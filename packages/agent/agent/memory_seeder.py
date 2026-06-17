@@ -10,7 +10,6 @@ All seeded items are trust_level=5, memory_status='confirmed'.
 
 from __future__ import annotations
 
-import json
 import uuid
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -23,7 +22,7 @@ if TYPE_CHECKING:
 
 
 class MemorySeederService:
-    def __init__(self, *, config: "Config", db: "DatabaseManager") -> None:
+    def __init__(self, *, config: Config, db: DatabaseManager) -> None:
         self._config = config
         self._db = db
 

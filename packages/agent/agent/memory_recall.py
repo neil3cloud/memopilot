@@ -96,7 +96,7 @@ class MemoryRecallService:
 
     async def recall(self, request: RecallRequest) -> RecallResponse:
         conn = await self._get_connection()
-        
+
         # Try hybrid search: FTS + vector search (if embeddings available)
         rows = await self._search_rows_hybrid(conn, request)
 
@@ -180,24 +180,24 @@ class MemoryRecallService:
     ):
         """Search using FTS + vector search (if available)."""
         fts_rows = await self._search_rows(conn, request)
-        
+
         # If no vector service or query is empty, return FTS results only
         if not self._vector_service or not request.query.strip():
             return fts_rows
-        
+
         # Try vector search for semantic enhancement
         try:
             embedding = await self._vector_service.embed_text(request.query)
             if not embedding:
                 return fts_rows
-            
+
             # Get semantic neighbors from vector index
             vector_results = await self._vector_service.search_vectors(
                 embedding=embedding,
                 entity_type="memory_item",
                 limit=max(request.limit * 3, 30),
             )
-            
+
             # Convert vector results to memory IDs with scores
             vector_scores: dict[str, float] = {}
             for result in vector_results:
@@ -205,7 +205,7 @@ class MemoryRecallService:
                 similarity = result.get("similarity", 0.0)
                 if entity_id:
                     vector_scores[entity_id] = similarity
-            
+
             # Merge FTS and vector results
             if vector_scores:
                 return await self._merge_search_results(
@@ -214,7 +214,7 @@ class MemoryRecallService:
         except Exception:
             # Vector search failed — return FTS results
             pass
-        
+
         return fts_rows
 
     async def _merge_search_results(
@@ -233,24 +233,24 @@ class MemoryRecallService:
             # Normalize FTS rank (lower is better, invert for scoring)
             fts_score = max(0.0, 1.0 - abs(fts_rank) / 100.0) if fts_rank else 0.5
             fts_scores[memory_id] = (idx, fts_score)
-        
+
         # Combine all memory IDs from both sources
         all_memory_ids = set(fts_scores.keys()) | set(vector_scores.keys())
-        
+
         # Score each result: weighted average of FTS and vector scores
         combined_scores: dict[str, float] = {}
         for memory_id in all_memory_ids:
             fts_score = fts_scores.get(memory_id, (999, 0.0))[1]
             vector_score = vector_scores.get(memory_id, 0.0)
-            
+
             # Weight: 60% FTS, 40% vector (can be tuned)
             combined = (fts_score * 0.6) + (vector_score * 0.4)
             combined_scores[memory_id] = combined
-        
+
         # Fetch full rows for all combined IDs (FTS might not have some)
         all_rows = list(fts_rows)
         fts_ids = {str(row["id"]) for row in fts_rows}
-        
+
         # Fetch vector-only results that weren't in FTS
         vector_only_ids = all_memory_ids - fts_ids
         if vector_only_ids:
@@ -270,13 +270,13 @@ class MemoryRecallService:
             )
             vector_rows = await cursor.fetchall()
             all_rows.extend(vector_rows)
-        
+
         # Sort by combined score (descending)
         all_rows.sort(
             key=lambda row: combined_scores.get(str(row["id"]), 0.0),
             reverse=True,
         )
-        
+
         return all_rows
 
     async def _search_rows(

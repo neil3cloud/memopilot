@@ -6,8 +6,6 @@ and context packs.
 
 from __future__ import annotations
 
-import asyncio
-import json
 import struct
 import uuid
 from typing import Any
@@ -31,7 +29,7 @@ class VectorIndexService:
         Returns None if no embedder available.
         """
         model_to_use = model or self._config.get("embedding_model", "")
-        
+
         # Try ollama first
         try:
             embedding = await self._embed_ollama(text, model_to_use or "nomic-embed-text")
@@ -39,7 +37,7 @@ class VectorIndexService:
                 return embedding
         except Exception:
             pass
-        
+
         # Try anthropic
         try:
             if self._config.get("anthropic_api_key"):
@@ -48,7 +46,7 @@ class VectorIndexService:
                     return embedding
         except Exception:
             pass
-        
+
         # Try openai
         try:
             if self._config.get("openai_api_key"):
@@ -57,16 +55,16 @@ class VectorIndexService:
                     return embedding
         except Exception:
             pass
-        
+
         return None
 
     async def _embed_ollama(self, text: str, model: str = "nomic-embed-text") -> list[float] | None:
         """Generate embedding using ollama."""
         import httpx
-        
-        url = f"http://127.0.0.1:11434/api/embed"
+
+        url = "http://127.0.0.1:11434/api/embed"
         payload = {"model": model, "input": text}
-        
+
         try:
             async with httpx.AsyncClient(timeout=30.0) as client:
                 response = await client.post(url, json=payload)
@@ -85,15 +83,15 @@ class VectorIndexService:
     async def _embed_openai(self, text: str) -> list[float] | None:
         """Generate embedding using OpenAI."""
         import httpx
-        
+
         api_key = self._config.get("openai_api_key")
         if not api_key:
             return None
-        
+
         url = "https://api.openai.com/v1/embeddings"
         headers = {"Authorization": f"Bearer {api_key}"}
         payload = {"model": "text-embedding-3-small", "input": text}
-        
+
         try:
             async with httpx.AsyncClient(timeout=30.0) as client:
                 response = await client.post(url, json=payload, headers=headers)
@@ -114,12 +112,12 @@ class VectorIndexService:
         """Store embedding for an entity (symbol, memory item, etc.)."""
         if not embedding:
             return False
-        
+
         try:
             conn = await self._db.connect()
             # Convert embedding list to binary format for sqlite-vec
             embedding_bytes = self._embedding_to_bytes(embedding)
-            
+
             await conn.execute(
                 """
                 INSERT OR REPLACE INTO vectors
@@ -153,11 +151,11 @@ class VectorIndexService:
         """
         if not embedding:
             return []
-        
+
         try:
             conn = await self._db.connect()
             embedding_bytes = self._embedding_to_bytes(embedding)
-            
+
             # sqlite-vec query: find k-nearest neighbors
             query = """
                 SELECT 
@@ -168,18 +166,18 @@ class VectorIndexService:
                 WHERE embedding MATCH ?
                   AND k = ?
             """
-            
+
             params = [embedding_bytes, limit]
-            
+
             if entity_type:
-                query = query.replace("FROM vectors", f"FROM vectors WHERE entity_type = ?", 1)
+                query = query.replace("FROM vectors", "FROM vectors WHERE entity_type = ?", 1)
                 params.insert(1, entity_type)
-            
+
             query += " ORDER BY distance ASC"
-            
+
             cursor = await conn.execute(query, params)
             rows = await cursor.fetchall()
-            
+
             results = []
             for row in rows:
                 entity_id, etype, distance = row
@@ -191,7 +189,7 @@ class VectorIndexService:
                     "distance": distance,
                     "similarity": similarity,
                 })
-            
+
             return results
         except Exception:
             return []
@@ -219,7 +217,7 @@ class VectorIndexService:
                 }
         except Exception:
             pass
-        
+
         return {
             "enabled": False,
             "preferred_model": None,

@@ -42,6 +42,7 @@ from .code_review_memory import (
     extract_review_lessons,
 )
 from .config import Config
+from .config_loader import load_provider_config
 from .context_budget import (
     TIER_ORDER_BY_TASK_TYPE,
     ContextBudget,
@@ -63,15 +64,15 @@ from .git_history_indexer import GitHistoryIndexer
 from .graph_retriever import GraphRetriever
 from .image_analysis import ImageAnalysisResult, analyze_image
 from .investigation_service import InvestigationService
-from .mcp_orchestrator import MCPOrchestrator, MCPDispatcher, ToolCall
-from .local_model_discovery import discover_all_local
-from .memory_manager_service import MemoryManagerService
-from .config_loader import load_provider_config
 from .llm_client import build_client
-from .memory_seeder import MemorySeederService
+from .local_model_discovery import discover_all_local
+from .mcp_orchestrator import MCPDispatcher, MCPOrchestrator, ToolCall
+from .memory_manager_service import MemoryManagerService
 from .memory_recall import MemoryRecallService, RecallRequest, RecallResponse
+from .memory_seeder import MemorySeederService
 from .migration_runner import run_migrations
-from .model_router import TIER_ORDER, ModelTier, get_outcome_routing_hint, route_model as _route_model_logic
+from .model_router import TIER_ORDER, ModelTier, get_outcome_routing_hint
+from .model_router import route_model as _route_model_logic
 from .patch_assessor import PatchAssessorService
 from .policy_packs import PolicyPacksService
 from .privacy_dashboard_service import PrivacyDashboardService
@@ -84,9 +85,9 @@ from .review_memory_mode import CodeReviewMemoryModeService
 from .security_policy import CredentialRedactor, DatabaseWriteBlocker
 from .skill_loader import SkillLoaderService
 from .task_analyzer import LLMTaskAnalyzer
-from .vector_backfill_service import VectorBackfillService
 from .tool_mode_router import create_tool_mode_routes
 from .validation_runner import ValidationCommand, ValidationRunner
+from .vector_backfill_service import VectorBackfillService
 from .workspace_indexer import WorkspaceIndexer
 from .workspace_init import ensure_global_config
 from .workspace_profile_service import WorkspaceProfileService
@@ -111,9 +112,9 @@ _host_relay_futures: dict[str, asyncio.Future] = {}
 async def _create_mcp_dispatcher() -> MCPDispatcher:
     """Create a dispatcher function that executes real MCP tool calls."""
     from .mcp_server import MCPServer
-    
+
     server = MCPServer()
-    
+
     async def dispatch(tool_name: str, args: dict[str, Any]) -> str:
         """Execute an MCP tool call and return result text."""
         try:
@@ -121,7 +122,7 @@ async def _create_mcp_dispatcher() -> MCPDispatcher:
             return result
         except Exception as e:
             return f"Error executing {tool_name}: {str(e)}"
-    
+
     return dispatch
 
 
@@ -2036,7 +2037,7 @@ async def analyze_task(request: TaskAnalyzeRequest) -> TaskAnalyzeResponse:
         "risk": risk,
         "suggested_mode": mode,
     }
-    
+
     try:
         analyzer = LLMTaskAnalyzer(config=config)
         enhanced = await analyzer.analyze_with_fallback(description, heuristic_result)
@@ -2070,17 +2071,17 @@ async def backfill_vectors(request: VectorBackfillRequest) -> VectorBackfillResp
     """
     db = _get_db()
     config = _get_config()
-    
+
     backfill_service = VectorBackfillService(db=db, config=config)
-    
+
     # Perform backfill based on requested entity types
     results = await backfill_service.backfill_all(
         workspace_root=request.workspace_root
     )
-    
+
     memory_stats = results.get("memory_items", {})
     symbol_stats = results.get("symbols", {})
-    
+
     return VectorBackfillResponse(
         total_embedded=results.get("total_embedded", 0),
         total_failed=results.get("total_failed", 0),
@@ -3296,7 +3297,7 @@ async def task_stream(task_run_id: str, request: Request):
                     yield f"data: {json.dumps(event)}\n\n"
                     if event.get("type") in ("DONE", "ERROR"):
                         break
-                except asyncio.TimeoutError:
+                except TimeoutError:
                     yield "data: {\"type\": \"HEARTBEAT\"}\n\n"
         finally:
             _task_sse_queues.pop(task_run_id, None)
@@ -3354,7 +3355,7 @@ async def _relay_to_host(task_run_id: str, system: str, user: str, ctx_tokens: i
     try:
         result: str = await asyncio.wait_for(fut, timeout=120.0)
         return result
-    except (asyncio.TimeoutError, Exception):
+    except (TimeoutError, Exception):
         _host_relay_futures.pop(task_run_id, None)
         return None
 
@@ -3428,7 +3429,7 @@ async def generate_patch(request: GeneratePatchRequest) -> GeneratePatchResponse
             config=config,
             dispatcher=dispatcher,
         )
-        
+
         # Define MCP tool calls to execute before patch generation
         mcp_calls = [
             ToolCall(
@@ -3444,7 +3445,7 @@ async def generate_patch(request: GeneratePatchRequest) -> GeneratePatchResponse
                 },
             ),
         ]
-        
+
         # Execute agentic loop (capped at 2 iterations for patch generation context)
         await orchestrator.run_agentic_loop(
             task_run_id=task_run_id,

@@ -25,7 +25,7 @@ let backendManager: BackendManager | undefined;
 let backendClient: BackendClient | undefined;
 let taskFlowController: TaskFlowController | undefined;
 let statusBarItem: vscode.StatusBarItem;
-let healthCheckInterval: NodeJS.Timer | undefined;
+let healthCheckInterval: ReturnType<typeof setInterval> | undefined;
 let unexpectedExitRetryCount = 0;
 const MAX_RESTART_RETRIES = 3;
 

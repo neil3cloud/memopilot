@@ -7,7 +7,7 @@ Returns [] immediately when nothing is running — never raises.
 from __future__ import annotations
 
 import asyncio
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 import httpx
 
