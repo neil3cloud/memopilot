@@ -5,13 +5,17 @@ from __future__ import annotations
 import json
 import uuid
 from dataclasses import dataclass
-from typing import Any, Literal
+from typing import Any, Awaitable, Callable, Literal
 
 from .config import Config
 from .db import DatabaseManager
 from .security_policy import CredentialRedactor, DatabaseWriteBlocker
 
 MCPContext = Literal["pre_fetch", "patch_generation", "investigation"]
+
+# Type alias for an MCP tool dispatcher (real or simulated)
+# Receives (tool_name: str, arguments: dict[str, Any]) and returns text result
+MCPDispatcher = Callable[[str, dict[str, Any]], Awaitable[str]]
 
 
 @dataclass(frozen=True)
@@ -49,11 +53,13 @@ class MCPOrchestrator:
         config: Config,
         redactor: CredentialRedactor | None = None,
         blocker: DatabaseWriteBlocker | None = None,
+        dispatcher: MCPDispatcher | None = None,
     ) -> None:
         self._db = db
         self._config = config
         self._redactor = redactor or CredentialRedactor()
         self._blocker = blocker or DatabaseWriteBlocker()
+        self._dispatcher = dispatcher
 
     async def run_agentic_loop(
         self,
@@ -81,11 +87,19 @@ class MCPOrchestrator:
 
             status = "blocked" if policy.blocked else "success"
             blocked_reason = policy.reason
-            result_summary = (
-                "Blocked DB write statement in MCP payload."
-                if policy.blocked
-                else f"Simulated MCP call executed for tool '{call.tool_name}'."
-            )
+            
+            if policy.blocked:
+                result_summary = "Blocked DB write statement in MCP payload."
+            elif self._dispatcher is not None:
+                # Execute real MCP call via dispatcher
+                try:
+                    result_summary = await self._dispatcher(call.tool_name, call.input_data)
+                except Exception as e:
+                    status = "error"
+                    result_summary = f"MCP dispatch failed: {str(e)}"
+            else:
+                # Simulated call (backward compatible)
+                result_summary = f"Simulated MCP call executed for tool '{call.tool_name}'."
 
             await conn.execute(
                 """
