@@ -28,19 +28,6 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
-from .approval_gate import (
-    ComplianceWarning,
-    build_compliance_warnings,
-    determine_approval_tier,
-    rank_patch_files,
-)
-from .code_review_memory import (
-    ReviewLesson as ReviewMemoryLesson,
-)
-from .code_review_memory import (
-    approve_lesson,
-    extract_review_lessons,
-)
 from .config import Config
 from .config_loader import load_provider_config
 from .context_budget import (
@@ -55,16 +42,15 @@ from .context_quality_scorer import (
     ContextPackSnapshot,
     score_context_pack,
 )
+from .context_renderer import ContextPackRenderer
 from .cost_guard import BudgetCheck as CostGuardBudgetCheck
 from .cost_guard import CostGuardService, check_budget_gate, infer_selected_tier
 from .db import DatabaseManager
 from .document_ingestion import extract_csv, extract_docx, extract_excel, extract_pdf, extract_pptx
 from .endpoint_registry import ENDPOINT_STATUS
-from .flow_builder import FlowBuilderService
 from .git_history_indexer import GitHistoryIndexer
 from .graph_retriever import GraphRetriever
 from .image_analysis import ImageAnalysisResult, analyze_image
-from .investigation_service import InvestigationService
 from .llm_client import build_client
 from .local_model_discovery import discover_all_local
 from .mcp_orchestrator import MCPDispatcher, MCPOrchestrator, ToolCall
@@ -72,9 +58,6 @@ from .memory_manager_service import MemoryManagerService
 from .memory_recall import MemoryRecallService, RecallRequest, RecallResponse
 from .memory_seeder import MemorySeederService
 from .migration_runner import run_migrations
-from .model_router import TIER_ORDER, ModelTier, get_outcome_routing_hint
-from .model_router import route_model as _route_model_logic
-from .patch_assessor import PatchAssessorService
 from .policy_packs import PolicyPacksService
 from .privacy_dashboard_service import PrivacyDashboardService
 from .provider_registry import ProviderCapabilityRecord, ProviderRegistryService
@@ -82,15 +65,11 @@ from .provider_resilience import ProviderCallError, ProviderResilienceService
 from .repo_map_generator import RepoMapGenerator
 from .response_cache import ResponseCacheService
 from .retention import enforce_retention
-from .review_memory_mode import CodeReviewMemoryModeService
 from .security_policy import CredentialRedactor, DatabaseWriteBlocker
 from .skill_loader import SkillLoaderService
-from .task_analyzer import LLMTaskAnalyzer
-from .tool_mode_router import create_tool_mode_routes
-from .validation_runner import ValidationCommand, ValidationRunner
 from .vector_backfill_service import VectorBackfillService
 from .workspace_indexer import WorkspaceIndexer
-from .workspace_init import ensure_global_config
+from .workspace_init import ensure_global_config, generate_workspace_bootstrap
 from .workspace_profile_service import WorkspaceProfileService
 from .workspace_roots import WorkspaceRootsService
 
@@ -219,18 +198,6 @@ class BudgetCheckResponse(BaseModel):
     budget: BudgetStatusResponse
 
 
-class StartTaskRunRequest(BaseModel):
-    user_request: str
-    task_type: str | None = None
-    mode: str | None = None
-    risk_level: str | None = None
-    selected_model: str | None = None
-    estimated_cost: float | None = Field(default=None, ge=0)
-    constraints: list[str] = Field(default_factory=list)
-    notes: str | None = None
-    workspace_root: str | None = None
-
-
 class BudgetGateResponse(BaseModel):
     blocked: bool
     reason: str
@@ -246,16 +213,7 @@ class TaskRunCostResponse(BaseModel):
     selected_tier: str = "local"
 
 
-class StartTaskRunResponse(BaseModel):
-    task_run_id: str
-    status: str
-    estimated_cost: float | None = None
-    actual_cost: float = 0.0
-    cost: TaskRunCostResponse | None = None
-    budget_gate: BudgetGateResponse | None = None
-
-
-class TaskAnalyzeRequest(BaseModel):
+class TaskHistoryEntry(BaseModel):
     description: str
     constraints: list[str] = Field(default_factory=list)
     mode: str | None = None
@@ -347,6 +305,43 @@ class ContextBuildResponse(BaseModel):
     callers_not_in_context: list[str] | None = None     # file paths of callers not included
     repo_map: str | None = None                          # compact structural overview
     commit_history: str | None = None                    # structured decision history
+
+
+class ContextAssembleRequest(BaseModel):
+    task_description: str
+    files_in_focus: list[str] = Field(default_factory=list)
+    task_type_hint: str = "general"
+    workspace_root: str | None = None
+    caller: str = "memopilot_ui"
+    max_output_tokens: int = Field(default=8000, ge=200, le=16000)
+
+
+class ContextAssembleResponse(BaseModel):
+    rendered_markdown: str
+    context_pack_hash: str
+    total_tokens: int
+    stale_exclusion_count: int = 0
+    redacted_values_count: int = 0
+    quality_verdict: str | None = None
+
+
+class SymbolSearchRequest(BaseModel):
+    query: str
+    limit: int = Field(default=10, ge=1, le=50)
+
+
+class SymbolSearchItemResponse(BaseModel):
+    name: str
+    kind: str
+    file_path: str
+    start_line: int | None = None
+    end_line: int | None = None
+    signature: str | None = None
+    summary: str | None = None
+
+
+class SymbolSearchResponse(BaseModel):
+    symbols: list[SymbolSearchItemResponse]
 
 
 class ModelRouteRequest(BaseModel):
@@ -524,31 +519,6 @@ class DismissWritebackResponse(BaseModel):
 class PendingWritebacksResponse(BaseModel):
     count: int
     runs: list[dict[str, object]] = Field(default_factory=list)
-
-
-class ValidationCommandRequest(BaseModel):
-    name: str
-    command: list[str] = Field(min_length=1)
-    timeout: int | None = Field(default=None, ge=1)
-
-
-class ValidateRequest(BaseModel):
-    patches: list[dict] = Field(default_factory=list)
-    checks: list[str] = Field(default_factory=lambda: ["syntax", "lint", "test_impact"])
-    commands: list[ValidationCommandRequest] = Field(default_factory=list)
-    command_timeouts: dict[str, int] = Field(default_factory=dict)
-
-
-class ValidationCheck(BaseModel):
-    name: str
-    status: str  # "pass", "fail", "warn", "skipped", "timeout"
-    message: str
-
-
-class ValidateResponse(BaseModel):
-    overall_status: str  # "pass", "fail", "warn"
-    checks: list[ValidationCheck]
-    can_apply: bool
 
 
 class TaskHistoryEntry(BaseModel):
@@ -826,60 +796,6 @@ class MemoryReviewRequest(BaseModel):
     workspace_root: str | None = None
 
 
-class SubmitReviewEvidenceRequest(BaseModel):
-    pr_number: int
-    body: str
-    path: str | None = None
-    line: int | None = None
-    workspace_root: str | None = None
-
-
-class SubmitReviewEvidenceResponse(BaseModel):
-    evidence_id: str
-    approved: bool
-
-
-class ApproveReviewLessonRequest(BaseModel):
-    evidence_id: str
-    lesson_title: str
-    lesson_body: str
-    workspace_root: str | None = None
-
-
-class ApproveReviewLessonResponse(BaseModel):
-    memory_item_id: str
-    evidence_id: str
-
-
-class ExtractReviewLessonsRequest(BaseModel):
-    review_comments: list[dict[str, object]] = Field(default_factory=list)
-
-
-class ReviewMemoryLessonResponse(BaseModel):
-    summary: str
-    context: str
-    source_pr: str | None = None
-    source_reviewer: str | None = None
-    approved: bool = False
-
-
-class ExtractReviewLessonsResponse(BaseModel):
-    lessons: list[ReviewMemoryLessonResponse]
-
-
-class ApproveReviewMemoryLessonRequest(BaseModel):
-    summary: str
-    context: str
-    source_pr: str | None = None
-    source_reviewer: str | None = None
-    workspace_root: str | None = None
-
-
-class ApproveReviewMemoryLessonResponse(BaseModel):
-    memory_item_id: str
-    approved: bool
-
-
 class PrivacyRecentCloudCallResponse(BaseModel):
     provider: str
     model: str
@@ -897,104 +813,6 @@ class PrivacyDashboardResponse(BaseModel):
     pre_call_approval_summary: str
     mcp_data_status: str
     recent_cloud_calls: list[PrivacyRecentCloudCallResponse]
-
-
-class AttachEvidenceRequest(BaseModel):
-    evidence_path: str | None = None
-    source_url: str | None = None
-    task_run_id: str | None = None
-    investigation_session_id: str | None = None
-    column_mapping: dict[str, str] | None = None
-    allow_cloud_image_analysis: bool = False
-    workspace_root: str | None = None
-
-
-class AttachEvidenceResponse(BaseModel):
-    evidence_id: str
-    source_type: str
-    trust_level: int
-    extraction_method: str
-    extraction_status: str
-    findings: list[str]
-    redacted_values: int
-    source_path: str | None = None
-    investigation_session_id: str | None = None
-
-
-class EvidenceBoardItemResponse(BaseModel):
-    evidence_id: str
-    source_type: str
-    source_path: str | None = None
-    source_url: str | None = None
-    trust_level: int
-    extraction_method: str
-    extraction_status: str
-    redacted_values: int
-    findings: list[str]
-    investigation_session_id: str | None = None
-
-
-class EvidenceBoardResponse(BaseModel):
-    items: list[EvidenceBoardItemResponse]
-
-
-class StartInvestigationRequest(BaseModel):
-    title: str
-    description: str = ""
-    mode: str = "investigation"
-    workspace_root: str | None = None
-
-
-class InvestigationSessionResponse(BaseModel):
-    id: str
-    title: str
-    description: str | None = None
-    mode: str
-    status: str
-    workspace_root: str
-    created_at: str
-    updated_at: str
-    evidence_count: int = 0
-    evidence: list[EvidenceBoardItemResponse] = Field(default_factory=list)
-
-
-class RemoveEvidenceResponse(BaseModel):
-    evidence_id: str
-    removed: bool
-
-
-class EvidenceColumnsPreviewRequest(BaseModel):
-    evidence_path: str
-    workspace_root: str | None = None
-
-
-class EvidenceColumnsPreviewResponse(BaseModel):
-    source_type: str
-    columns: list[str]
-    suggested_mapping: dict[str, str]
-    requires_confirmation: bool
-
-
-class RunInvestigationRequest(BaseModel):
-    title: str
-    description: str = ""
-    acceptance_criteria: list[str] = Field(default_factory=list)
-    task_run_id: str | None = None
-    workspace_root: str | None = None
-
-
-class RunInvestigationResponse(BaseModel):
-    context_pack: str
-    context_pack_path: str
-    impacted_files: list[str]
-    related_tests: list[str]
-    missing_test_coverage: list[str]
-    evidence_count: int
-
-
-class InvestigationPlanFromFindingsRequest(BaseModel):
-    investigation_session_id: str
-    workspace_root: str | None = None
 
 
 class ContextTemplateItemResponse(BaseModel):
@@ -1099,155 +917,7 @@ def _serialize_ranked_files(
 
 
 
-def _serialize_compliance_warnings(
-    warnings: list[ComplianceWarning],
-) -> list[ComplianceWarningResponse]:
-    return [
-        ComplianceWarningResponse(
-            rule_id=warning.rule_id,
-            rule_text=warning.rule_text,
-            warning_message=warning.warning_message,
-            actions=[
-                ComplianceActionResponse(
-                    label=action.label,
-                    action_type=action.action_type,
-                    prefill_task_request=action.prefill_task_request,
-                    prefill_mode=action.prefill_mode,
-                    prefill_context_hints=action.prefill_context_hints,
-                )
-                for action in warning.actions
-            ],
-        )
-        for warning in warnings
-    ]
 
-
-HIGH_RISK_PATTERNS = re.compile(
-    r"(billing|payment|invoice|auth|security|credential|secret|crypto|token)",
-    re.IGNORECASE,
-)
-CRITICAL_RISK_PATTERNS = re.compile(
-    r"(migration|schema|database|deploy|infrastructure|ci[/-]cd)",
-    re.IGNORECASE,
-)
-TEST_PATTERNS = re.compile(r"(test_|_test\.|\.test\.|spec\.)", re.IGNORECASE)
-SECRET_PATTERNS = re.compile(
-    r"(?:"
-    r"(?:api[_-]?key|secret[_-]?key|password|token|auth[_-]?token)"
-    r"\s*[=:]\s*['\"][^'\"]{8,}"
-    r"|(?:-----BEGIN (?:RSA |EC )?PRIVATE KEY-----)"
-    r"|(?:sk-[a-zA-Z0-9]{20,})"
-    r"|(?:ghp_[a-zA-Z0-9]{36})"
-    r"|(?:AKIA[A-Z0-9]{16})"
-    r")",
-    re.IGNORECASE,
-)
-
-
-def _parse_diff_files(diff_text: str) -> list[str]:
-    """Extract file paths from a unified diff."""
-    files: list[str] = []
-    seen: set[str] = set()
-    for line in diff_text.splitlines():
-        if line.startswith("+++ b/"):
-            candidate = line[6:]
-        elif line.startswith("+++ ") and not line.startswith("+++ /dev/null"):
-            candidate = line[4:]
-        else:
-            continue
-        if candidate and candidate not in seen:
-            seen.add(candidate)
-            files.append(candidate)
-    return files
-
-
-def _classify_file_risk(file_path: str) -> tuple[str, str]:
-    """Classify a file's risk level and category."""
-    if TEST_PATTERNS.search(file_path):
-        return ("low", "test coverage")
-    if CRITICAL_RISK_PATTERNS.search(file_path):
-        return ("critical", "infrastructure")
-    if HIGH_RISK_PATTERNS.search(file_path):
-        return ("high", "sensitive logic")
-    return ("medium", "general logic")
-
-
-def _check_diff_for_secrets(diff_text: str) -> bool:
-    """Check if the diff contains potential secrets."""
-    return bool(SECRET_PATTERNS.search(diff_text))
-
-
-def _render_patch_review_report(
-    *,
-    task_run_id: str,
-    overall_risk: str,
-    overall_category: str,
-    compliance_score: float,
-    compliance_passed: list[str],
-    compliance_warnings: list[PatchReviewComplianceWarning],
-    ranked_files: list[PatchReviewRankedFile],
-    secret_detected: bool,
-    caller: str,
-) -> str:
-    """Render the patch review as a Markdown report."""
-    risk_emoji = {"critical": "🔴", "high": "🟠", "medium": "🟡", "low": "🟢"}.get(
-        overall_risk,
-        "⚪",
-    )
-
-    lines = [
-        "## MemoPilot Patch Review Report\n",
-        f"**Task Run ID:** `{task_run_id}`",
-        f"**Risk Level:** {risk_emoji} {overall_risk.upper()} — {overall_category}",
-        f"**Rule Compliance Score:** {compliance_score:.0f}%",
-    ]
-
-    if caller in ("copilot_lm_tool", "cursor_mcp_tool"):
-        lines.append(
-            "**Governance Note:** This patch was applied outside MemoPilot's native flow. "
-            "Post-hoc review only — no approval gate, validation, or memory writeback occurred.\n"
-        )
-
-    lines.append("\n### Changed Files (by risk)\n")
-    for file_item in ranked_files:
-        emoji = {"critical": "🔴", "high": "🟠", "medium": "🟡", "low": "🟢"}.get(
-            file_item.risk_level,
-            "⚪",
-        )
-        lines.append(
-            f"{emoji} {file_item.risk_level.upper():8s} "
-            f"{file_item.path}   [{file_item.risk_category}]"
-        )
-
-    lines.append("\n### Rule Compliance\n")
-    for passed in compliance_passed:
-        lines.append(f"✓ {passed}")
-    for warning in compliance_warnings:
-        lines.append(f"⚠ {warning.message}")
-
-    lines.append("\n### Secret Scan\n")
-    if secret_detected:
-        lines.append(
-            "⚠ **Potential secret detected in diff.** "
-            "Review and remove before committing."
-        )
-    else:
-        lines.append("✓ No secrets detected in diff.")
-
-    recommendations: list[str] = []
-    if secret_detected:
-        recommendations.append("Remove detected secrets from the diff immediately.")
-    if not any("test" in file_item.path.lower() for file_item in ranked_files):
-        recommendations.append("Add tests for the changed code before merging.")
-    recommendations.append(
-        "Run `MemoPilot: Run Validation` to execute tests and linters on the applied changes."
-    )
-
-    lines.append("\n### Recommended Actions\n")
-    for index, recommendation in enumerate(recommendations, start=1):
-        lines.append(f"{index}. {recommendation}")
-
-    return "\n".join(lines)
 
 
 class ProviderCapabilityItemResponse(BaseModel):
@@ -1737,7 +1407,12 @@ async def init_workspace() -> InitWorkspaceResponse:
     await wave4_service.ensure_default_workspace_root()
 
     profile_service = WorkspaceProfileService(config=config, db=db)
-    await profile_service.ensure_profile()
+    profile = await profile_service.ensure_profile()
+    generate_workspace_bootstrap(
+        workspace_path=config.workspace_path,
+        memopilot_dir=config.memopilot_dir,
+        profile=profile.profile,
+    )
 
     logger.info(f"Workspace initialized: {config.memopilot_dir} (schema v{schema_version})")
 
@@ -1761,7 +1436,7 @@ async def get_index_status(workspace_root: str | None = None) -> WorkspaceIndexS
                SUM(stale) AS stale_count,
                MAX(last_indexed_at) AS last_indexed_at
         FROM file_index
-        WHERE workspace_root = ? OR workspace_root IS NULL
+        WHERE workspace_root = ?
         """,
         (root,),
     )
@@ -1771,7 +1446,7 @@ async def get_index_status(workspace_root: str | None = None) -> WorkspaceIndexS
         """
         SELECT COUNT(*) AS cnt FROM memory_items
         WHERE memory_status = 'confirmed'
-          AND (workspace_root = ? OR workspace_root IS NULL)
+                    AND workspace_root = ?
         """,
         (root,),
     )
@@ -1809,7 +1484,9 @@ async def index_workspace(request: WorkspaceIndexRequest | None = None) -> Works
 @app.get("/v1/workspace/index/status", response_model=IndexStatusResponse)
 async def workspace_index_status() -> IndexStatusResponse:
     """Return a lightweight summary of workspace indexing state."""
+    config = _get_config()
     conn = await _get_db().connect()
+    root = str(config.workspace_path)
 
     file_cursor = await conn.execute(
         """
@@ -1818,7 +1495,10 @@ async def workspace_index_status() -> IndexStatusResponse:
             COALESCE(SUM(CASE WHEN stale = 1 THEN 1 ELSE 0 END), 0) AS stale_files,
             MAX(last_indexed_at) AS last_indexed_at
         FROM file_index
+        WHERE workspace_root = ?
         """
+        ,
+        (root,),
     )
     file_row = await file_cursor.fetchone()
 
@@ -1874,9 +1554,29 @@ def _to_model_route_budget_check_response(
     fallback_allowed: bool,
 ) -> BudgetCheck:
     if check is None:
+        remaining = round(max(0.0, fallback_remaining_usd), 2)
         return BudgetCheck(
             allowed=fallback_allowed,
-            remaining_usd=round(fallback_remaining_usd, 2),
+            remaining_usd=remaining,
+            reason="No provider budget check required for local or sentinel routing.",
+            status=BudgetStatusResponse(
+                monthly_budget_usd=remaining,
+                spent_usd=0.0,
+                saved_usd=0.0,
+                remaining_usd=remaining,
+                warning_threshold_usd=0.0,
+                warning_triggered=False,
+                blocked=not fallback_allowed,
+                spend_ratio=0.0,
+                current_month_spend=0.0,
+                monthly_budget=remaining,
+                remaining=remaining,
+                pct_used=0.0,
+                at_limit=not fallback_allowed,
+                warning_threshold=0.80,
+                at_warning=False,
+                last_updated_at=None,
+            ),
         )
 
     return BudgetCheck(
@@ -1923,206 +1623,6 @@ async def check_budget(request: BudgetCheckRequest) -> BudgetCheckResponse:
         reason=result.reason,
         estimated_cost_usd=result.estimated_cost_usd,
         budget=_to_budget_status_response(result.status),
-    )
-
-
-def _collect_task_paths(request: TaskAnalyzeRequest) -> list[str]:
-    raw_paths = [*request.file_paths, *request.changed_files, *request.context_files]
-    path_pattern = re.compile(r"(?:[A-Za-z]:)?[\\/][^\s,;]+|[\w.-]+(?:[\\/][\w.-]+)+")
-    for source in (request.description, request.notes or ""):
-        raw_paths.extend(match.group(0) for match in path_pattern.finditer(source))
-
-    seen: set[str] = set()
-    normalized_paths: list[str] = []
-    for raw_path in raw_paths:
-        candidate = raw_path.strip().strip("`\"'")
-        if not candidate:
-            continue
-        normalized = candidate.replace("\\", "/")
-        if normalized not in seen:
-            seen.add(normalized)
-            normalized_paths.append(normalized)
-    return normalized_paths
-
-
-def _classify_task_from_signals(request: TaskAnalyzeRequest) -> tuple[str, str]:
-    normalized_paths = [path.lower() for path in _collect_task_paths(request)]
-
-    for path in normalized_paths:
-        file_name = path.rsplit("/", 1)[-1]
-        if (
-            file_name.endswith("_test.py")
-            or (file_name.startswith("test_") and file_name.endswith(".py"))
-            or file_name.endswith(".spec.ts")
-            or file_name.endswith(".test.ts")
-        ):
-            return "test_generation", "low"
-        if file_name.endswith("_migration.py") or "/migrations/" in f"/{path}/":
-            return "schema_change", "critical"
-
-    for path in normalized_paths:
-        if any(segment in path for segment in ("/auth/", "/security/", "/permission/", "/oauth/")):
-            return "security_change", "high"
-        if any(
-            segment in path for segment in ("/billing/", "/payment/", "/invoice/", "/subscription/")
-        ):
-            return "billing_change", "high"
-
-    combined_text = f"{request.description} {request.notes or ''}".lower()
-    joined_paths = " ".join(normalized_paths)
-    if any(signal in joined_paths for signal in ("migration", "schema", "alembic")) or any(
-        keyword in combined_text for keyword in ("migration", "schema", "alembic")
-    ):
-        return "schema_change", "critical"
-    if any(keyword in combined_text for keyword in ("explain", "summarize", "describe")):
-        return "explanation", "low"
-    if any(keyword in combined_text for keyword in ("document", "docstring", "comment", "readme")):
-        return "documentation", "low"
-    if (
-        any(keyword in combined_text for keyword in ("refactor", "restructure", "move", "rename"))
-        and len(normalized_paths) == 1
-    ):
-        return "bounded_refactor", "medium"
-    if any(keyword in combined_text for keyword in ("fix", "bug", "error", "exception", "broken")):
-        return "bug_fix", "medium"
-    return "general", "medium"
-
-
-@app.post("/v1/task/analyze", response_model=TaskAnalyzeResponse)
-async def analyze_task(request: TaskAnalyzeRequest) -> TaskAnalyzeResponse:
-    """Parse task intent and suggest context scope without starting a run."""
-    config = _get_config()
-    db = _get_db()
-
-    description = request.description.strip()
-    if not description:
-        raise HTTPException(status_code=400, detail="Task description is required.")
-
-    task_type, risk = _classify_task_from_signals(request)
-
-    # Determine suggested mode from classification and keywords
-    mode = request.mode
-    if not mode:
-        mode_by_task_type = {
-            "billing_change": "fix",
-            "bounded_refactor": "refactor",
-            "bug_fix": "fix",
-            "documentation": "document",
-            "schema_change": "refactor",
-            "security_change": "fix",
-            "test_generation": "test",
-        }
-        mode = mode_by_task_type.get(task_type)
-    if not mode:
-        lower = description.lower()
-        if any(kw in lower for kw in ("fix", "bug", "error", "broken")):
-            mode = "fix"
-        elif any(kw in lower for kw in ("test", "spec", "coverage")):
-            mode = "test"
-        elif any(kw in lower for kw in ("refactor", "restructure", "move", "rename")):
-            mode = "refactor"
-        elif any(kw in lower for kw in ("doc", "comment", "readme")):
-            mode = "document"
-        else:
-            mode = "auto"
-
-    # Estimate complexity from description length and keywords
-    complexity_signals = 0
-    if len(description) > 200:
-        complexity_signals += 1
-    if any(kw in description.lower() for kw in ("multiple", "all", "every", "across")):
-        complexity_signals += 1
-    if any(kw in description.lower() for kw in ("database", "migration", "schema")):
-        complexity_signals += 1
-    complexity = (
-        "low" if complexity_signals == 0 else "medium" if complexity_signals <= 1 else "high"
-    )
-
-    # Find applicable rules from active policy packs
-    applicable_rules: list[str] = []
-    try:
-        policy_service = PolicyPacksService(config=config, db=db)
-        active_rules = await policy_service.list_active_policy_rules(
-            workspace_root=request.workspace_root
-        )
-        applicable_rules.extend([item.rule for item in active_rules[:5]])
-    except Exception:
-        pass
-
-    # Add constraint-derived rules
-    if "follow_all_rules" in request.constraints:
-        pass  # Already including all active rules above
-    if (
-        "run_tests" in request.constraints
-        and "Run tests after applying changes" not in applicable_rules
-    ):
-        applicable_rules.append("Run tests after applying changes")
-
-    # Suggest files by searching memory for relevant symbols
-    suggested_files: list[str] = []
-    keywords = _extract_search_keywords(description)
-    try:
-        memory_service = MemoryManagerService(config=config, db=db)
-        items = await memory_service.list_items(
-            filter_name="file_summaries",
-            limit=200,
-            workspace_root=request.workspace_root,
-        )
-        for item in items:
-            title_lower = item.title.lower()
-            if any(kw in title_lower for kw in keywords):
-                if item.source_path and item.source_path not in suggested_files:
-                    suggested_files.append(item.source_path)
-            if len(suggested_files) >= 10:
-                break
-    except Exception:
-        pass
-
-    if len(suggested_files) < 10 and keywords:
-        for file_path in await _suggest_files_from_index(
-            db=db,
-            keywords=keywords,
-            limit=10,
-        ):
-            if file_path not in suggested_files:
-                suggested_files.append(file_path)
-            if len(suggested_files) >= 10:
-                break
-
-    # Build intent summary (first sentence or truncated description)
-    intent_summary = description.split(".")[0].strip()
-    if len(intent_summary) > 100:
-        intent_summary = intent_summary[:97] + "..."
-
-    # Try to enhance analysis with LLM if available
-    heuristic_result = {
-        "intent_summary": intent_summary,
-        "complexity": complexity,
-        "task_type": task_type,
-        "risk": risk,
-        "suggested_mode": mode,
-    }
-
-    try:
-        analyzer = LLMTaskAnalyzer(config=config)
-        enhanced = await analyzer.analyze_with_fallback(description, heuristic_result)
-        intent_summary = enhanced.get("intent_summary", intent_summary)
-        complexity = enhanced.get("complexity", complexity)
-        task_type = enhanced.get("task_type", task_type)
-        risk = enhanced.get("risk", risk)
-        mode = enhanced.get("suggested_mode", mode)
-    except Exception:
-        # LLM analysis failed — continue with heuristic results
-        pass
-
-    return TaskAnalyzeResponse(
-        intent_summary=intent_summary,
-        suggested_files=suggested_files,
-        applicable_rules=applicable_rules[:10],
-        estimated_complexity=complexity,
-        suggested_mode=mode,
-        task_type=task_type,
-        risk=risk,
     )
 
 
@@ -2358,6 +1858,69 @@ def _build_stack_trace_items(request: ContextBuildRequest) -> list[ContextItem]:
             )
         ]
     return []
+
+
+def _render_assembled_context(
+    *,
+    request: ContextAssembleRequest,
+    context_pack: ContextBuildResponse,
+) -> ContextAssembleResponse:
+    renderer = ContextPackRenderer()
+    active_rules = [{"rule_text": rule} for rule in context_pack.rules]
+    active_skills = [{"name": skill, "description": ""} for skill in context_pack.skills]
+    file_snippets = [
+        {"path": item.path, "content": item.content or ""}
+        for item in context_pack.files
+    ]
+
+    memory_items: list[dict[str, Any]] = []
+    for item in context_pack.included_items or []:
+        if item.get("source_type") != "memory":
+            continue
+        memory_items.append(
+            {
+                "title": str(item.get("source", "Project memory")),
+                "body": str(item.get("content", "")),
+                "memory_class": "fact",
+                "trust_level": int(item.get("trust_level", 0) or 0),
+                "source": str(item.get("source", "")),
+            }
+        )
+
+    stale_exclusions = context_pack.stale_exclusions
+    rendered = renderer.render(
+        caller=request.caller,
+        task_description=request.task_description,
+        active_rules=active_rules,
+        active_skills=active_skills,
+        memory_items=memory_items or None,
+        file_snippets=file_snippets,
+        stale_exclusion_count=stale_exclusions.count if stale_exclusions else 0,
+        stale_affected_modules=stale_exclusions.affected_modules if stale_exclusions else None,
+        max_tokens=request.max_output_tokens,
+    )
+
+    extras: list[str] = []
+    if context_pack.quality_score:
+        extras.append(
+            "## Context Quality\n\n"
+            f"Verdict: {context_pack.quality_score.verdict} | "
+            f"Score: {context_pack.quality_score.total}\n"
+        )
+    if context_pack.repo_map:
+        extras.append(f"## Repo Map\n\n{context_pack.repo_map}\n")
+    if context_pack.commit_history:
+        extras.append(f"## Recent History\n\n{context_pack.commit_history}\n")
+
+    assembled = "\n".join([rendered, *extras]).strip()
+    return ContextAssembleResponse(
+        rendered_markdown=assembled,
+        context_pack_hash=context_pack.context_pack_hash,
+        total_tokens=context_pack.total_tokens,
+        stale_exclusion_count=stale_exclusions.count if stale_exclusions else 0,
+        redacted_values_count=0,
+        quality_verdict=context_pack.quality_score.verdict if context_pack.quality_score else None,
+    )
 
 
 def _read_context_file_item(workspace_root: str, file_path: str) -> ContextItem:
@@ -2740,6 +2303,22 @@ async def generate_context_pack(request: ContextBuildRequest) -> ContextBuildRes
     return await _generate_context_pack_response(request)
 
 
+@app.post("/v1/context/assemble", response_model=ContextAssembleResponse)
+async def assemble_context(request: ContextAssembleRequest) -> ContextAssembleResponse:
+    context_pack = await _generate_context_pack_response(
+        ContextBuildRequest(
+            task_description=request.task_description,
+            suggested_files=request.files_in_focus,
+            task_type=request.task_type_hint,
+            workspace_root=request.workspace_root,
+            caller=request.caller,
+            output_format="markdown_for_llm",
+            max_output_tokens=request.max_output_tokens,
+        )
+    )
+    return _render_assembled_context(request=request, context_pack=context_pack)
+
+
 @app.post("/v1/context/build", response_model=ContextBuildResponse, deprecated=True)
 async def build_context_pack(request: ContextBuildRequest) -> ContextBuildResponse:
     return await _generate_context_pack_response(request)
@@ -2813,74 +2392,6 @@ class PatchRejectionResponse(BaseModel):
     suggestion: str | None = None
 
 
-@app.post("/v1/patch/reject", response_model=PatchRejectionResponse)
-async def record_patch_rejection(request: PatchRejectionRequest) -> PatchRejectionResponse:
-    """Record why a patch was rejected with structured category handling.
-
-    Each rejection category triggers specific learning actions:
-    - wrong_approach: stores rejected approach, next attempt tries differently
-    - missed_business_rule: creates pending instruction for developer to confirm
-    - wrong_file: stores scope restriction for future patches
-    - broke_existing_behavior: stores regression evidence, suggests adding tests
-    - incomplete: feeds back into Plan mode for completeness
-    """
-    valid_categories = {
-        "wrong_approach", "missed_business_rule", "wrong_file",
-        "broke_existing_behavior", "incomplete", "other",
-    }
-    category = request.rejection_category
-    if category and category not in valid_categories:
-        category = "other"
-
-    db = _get_db()
-    conn = await db.connect()
-    await conn.execute(
-        """UPDATE patch_attempts
-           SET rejection_reason = ?, rejection_category = ?
-           WHERE id = ?""",
-        (request.rejection_reason[:1000], category, request.patch_attempt_id),
-    )
-    await conn.commit()
-
-    cursor = await conn.execute(
-        "SELECT id FROM patch_attempts WHERE id = ?", (request.patch_attempt_id,)
-    )
-    row = await cursor.fetchone()
-    if row is None:
-        return PatchRejectionResponse(
-            recorded=False,
-            patch_attempt_id=request.patch_attempt_id,
-        )
-
-    # Structured rejection handling — creates targeted learning artifacts
-    action_taken = None
-    memory_item_id = None
-    suggestion = None
-    if category and category != "other":
-        try:
-            from .rejection_handler import RejectionHandlerService
-            handler = RejectionHandlerService(config=_get_config(), db=db)
-            result = await handler.handle_rejection(
-                patch_attempt_id=request.patch_attempt_id,
-                category=category,
-                reason=request.rejection_reason[:1000],
-                workspace_root=request.workspace_root,
-            )
-            action_taken = result.action_taken
-            memory_item_id = result.memory_item_id
-            suggestion = result.suggestion
-        except Exception:
-            pass
-
-    return PatchRejectionResponse(
-        recorded=True,
-        patch_attempt_id=request.patch_attempt_id,
-        action_taken=action_taken,
-        memory_item_id=memory_item_id,
-        suggestion=suggestion,
-    )
-
-
 # ── Plan mode endpoints (Priority 1) ──────────────────────────────────────────
 
 class PlanStepRequest(BaseModel):
@@ -2942,98 +2453,6 @@ class PlanComplianceResponse(BaseModel):
     warnings: list[str]
 
 
-@app.post("/v1/plan/store", response_model=StorePlanResponse)
-async def store_plan(request: StorePlanRequest) -> StorePlanResponse:
-    """Store a plan as a confirmed decision memory item.
-
-    Plans are stored immediately as confirmed because the developer
-    deliberately triggered plan generation.
-    """
-    from .plan_service import PlanModeService, PlanStep
-
-    service = PlanModeService(config=_get_config(), db=_get_db())
-    result = await service.store_plan(
-        title=request.title,
-        steps=[
-            PlanStep(
-                step_number=s.step_number,
-                description=s.description,
-                target_file=s.target_file,
-                target_symbol=s.target_symbol,
-            )
-            for s in request.steps
-        ],
-        task_description=request.task_description,
-        task_run_id=request.task_run_id,
-        workspace_root=request.workspace_root,
-    )
-    return StorePlanResponse(
-        plan_id=result.plan_id,
-        memory_item_id=result.memory_item_id,
-        title=result.title,
-        steps=[
-            PlanStepResponse(
-                step_number=s.step_number,
-                description=s.description,
-                target_file=s.target_file,
-                target_symbol=s.target_symbol,
-            )
-            for s in result.steps
-        ],
-        raw_text=result.raw_text,
-        created_at=result.created_at,
-    )
-
-
-@app.post("/v1/plan/recall", response_model=RecallPlansResponse)
-async def recall_plans(request: RecallPlansRequest) -> RecallPlansResponse:
-    """Recall confirmed decision plans for context injection.
-
-    Returns plans relevant to the workspace/module for inclusion in
-    the patch context pack with elevated priority.
-    """
-    from .plan_service import PlanModeService
-
-    service = PlanModeService(config=_get_config(), db=_get_db())
-    plans = await service.recall_plans_for_context(
-        workspace_root=request.workspace_root,
-        module_path=request.module_path,
-        limit=request.limit,
-    )
-    return RecallPlansResponse(
-        plans=[
-            PlanRecallItemResponse(
-                memory_item_id=p.memory_item_id,
-                title=p.title,
-                body=p.body,
-                trust_level=p.trust_level,
-                created_at=p.created_at,
-            )
-            for p in plans
-        ]
-    )
-
-
-@app.post("/v1/plan/check-compliance", response_model=PlanComplianceResponse)
-async def check_plan_compliance(request: PlanComplianceRequest) -> PlanComplianceResponse:
-    """Check if a patch is consistent with its source plan.
-
-    Returns compliance warnings if the patch contradicts the plan
-    (e.g., modifies files not mentioned in plan steps).
-    """
-    from .plan_service import PlanModeService
-
-    service = PlanModeService(config=_get_config(), db=_get_db())
-    warnings = await service.check_plan_compliance(
-        plan_memory_id=request.plan_memory_id,
-        files_changed=request.files_changed,
-    )
-    return PlanComplianceResponse(
-        compliant=len(warnings) == 0,
-        warnings=warnings,
-    )
-
-
 # ── Autofix mode endpoints (Priority 2) ───────────────────────────────────────
 
 class DiagnosticItem(BaseModel):
@@ -3080,91 +2499,6 @@ class AutofixRunResponse(BaseModel):
     autofix_available: bool
 
 
-@app.post("/v1/autofix/classify", response_model=AutofixClassifyResponse)
-async def classify_for_autofix(request: AutofixClassifyRequest) -> AutofixClassifyResponse:
-    """Classify diagnostics into safe (autofix) and manual categories.
-
-    Safe diagnostics can be fixed automatically with cheap_cloud at LOW tier.
-    Manual diagnostics require normal Patch mode with human review.
-    """
-    from .autofix_classifier import classify_diagnostics
-
-    diagnostics = [
-        {"file_path": d.file_path, "line": d.line, "code": d.code, "message": d.message}
-        for d in request.diagnostics
-    ]
-    safe, manual = classify_diagnostics(diagnostics)
-
-    safe_descriptions = [f"{c.code}: {c.message} in {c.file_path}:{c.line}" for c in safe]
-    task_desc = f"Fix lint errors: {'; '.join(safe_descriptions[:5])}" if safe else ""
-
-    return AutofixClassifyResponse(
-        safe_candidates=[
-            AutofixCandidateResponse(
-                file_path=c.file_path, line=c.line, code=c.code,
-                message=c.message, safety=c.safety.value, category=c.category,
-            )
-            for c in safe
-        ],
-        manual_candidates=[
-            AutofixCandidateResponse(
-                file_path=c.file_path, line=c.line, code=c.code,
-                message=c.message, safety=c.safety.value, category=c.category,
-            )
-            for c in manual
-        ],
-        autofix_available=len(safe) > 0,
-        task_description=task_desc,
-    )
-
-
-@app.post("/v1/autofix/run", response_model=AutofixRunResponse)
-async def run_autofix(request: AutofixRunRequest) -> AutofixRunResponse:
-    """Run autofix for safe diagnostics.
-
-    Filters to safe-only patterns, generates a task description scoped to
-    the safe issues, and returns metadata for the extension to trigger
-    patch generation with cheap_cloud at LOW approval tier.
-    """
-    from .autofix_classifier import classify_diagnostics
-
-    diagnostics = [
-        {"file_path": d.file_path, "line": d.line, "code": d.code, "message": d.message}
-        for d in request.diagnostics
-    ]
-    safe, manual = classify_diagnostics(diagnostics)
-
-    files_to_fix = sorted({c.file_path for c in safe})
-    safe_descriptions = [f"{c.code}: {c.message} ({c.file_path}:{c.line})" for c in safe]
-    task_desc = f"Autofix lint errors: {'; '.join(safe_descriptions[:10])}" if safe else ""
-
-    # Record autofix task run if we have safe candidates
-    if safe and request.task_run_id is None:
-        db = _get_db()
-        conn = await db.connect()
-        task_run_id = uuid.uuid4().hex
-        now = datetime.now(UTC).isoformat()
-        await conn.execute(
-            """INSERT INTO task_runs
-               (id, user_request, task_type, status, mode, risk_level,
-                workspace_root, created_at, updated_at)
-               VALUES (?, ?, 'autofix', 'pending', 'autofix', 'low', ?, ?, ?)""",
-            (task_run_id, task_desc, request.workspace_root or "", now, now),
-        )
-        await conn.commit()
-
-    return AutofixRunResponse(
-        task_description=task_desc,
-        safe_count=len(safe),
-        manual_count=len(manual),
-        mode="autofix",
-        model="cheap_cloud",
-        approval_tier="LOW",
-        files_to_fix=files_to_fix,
-        autofix_available=len(safe) > 0,
-    )
-
-
 class TaskPatternsRequest(BaseModel):
     workspace_root: str
 
@@ -3192,55 +2526,6 @@ class SimilarTaskResponse(BaseModel):
 
 class SimilarTasksResponse(BaseModel):
     tasks: list[SimilarTaskResponse]
-
-
-@app.post("/v1/task/patterns", response_model=TaskPatternsResponse)
-async def detect_task_patterns(request: TaskPatternsRequest) -> TaskPatternsResponse:
-    from .task_pattern_detector import TaskPatternDetector
-
-    detector = TaskPatternDetector(config=_get_config(), db=_get_db())
-    patterns = await detector.detect_patterns(request.workspace_root)
-    return TaskPatternsResponse(
-        patterns=[
-            TaskPatternResponse(
-                pattern_type=pattern.pattern_type,
-                context_path=pattern.context_path,
-                details=pattern.details,
-                suggestion=pattern.suggestion,
-            )
-            for pattern in patterns
-        ]
-    )
-
-
-@app.get("/v1/task/similar", response_model=SimilarTasksResponse)
-async def find_similar_tasks(
-    context_path: str,
-    workspace_root: str,
-    limit: int = 3,
-) -> SimilarTasksResponse:
-    from .task_pattern_detector import TaskPatternDetector
-
-    detector = TaskPatternDetector(config=_get_config(), db=_get_db())
-    similar_tasks = await detector.find_similar_tasks(
-        context_path=context_path,
-        workspace_root=workspace_root,
-        limit=max(1, min(limit, 10)),
-    )
-    return SimilarTasksResponse(
-        tasks=[
-            SimilarTaskResponse(
-                task_id=task.task_id,
-                user_request=task.user_request,
-                status=task.status,
-                model_used=task.model_used,
-                cost_usd=task.cost_usd,
-                created_at=task.created_at,
-                rejection_reason=task.rejection_reason,
-            )
-            for task in similar_tasks
-        ]
-    )
 
 
 async def _resolve_memory_workspace_root(workspace_root: str | None) -> str | None:
@@ -3307,192 +2592,11 @@ async def memory_proposals_for_module(
     return MemoryItemsResponse(items=[_memory_item_response(item) for item in items])
 
 
-@app.post("/v1/model/route", response_model=ModelRouteResponse)
-async def route_model(request: ModelRouteRequest) -> ModelRouteResponse:
-    """Select optimal model based on context size, task type, privacy, and budget."""
-    config = _get_config()
-    db = _get_db()
-
-    cost_service = CostGuardService(config=config, db=db)
-    remaining_usd = 50.0
-    try:
-        budget_info = await cost_service.get_budget_status()
-        remaining_usd = budget_info.remaining_usd
-    except Exception:
-        pass
-
-    # Map privacy_level to budget_profile for model_router
-    privacy_to_profile = {
-        "local_only": "strict_local",
-        "local_preferred": "cost_saver",
-        "cloud_ok": "balanced",
-    }
-    router_config = dict(config.__dict__) if hasattr(config, "__dict__") else {}
-    router_config["budget_profile"] = privacy_to_profile.get(request.privacy_level, "cost_saver")
-
-    # Check host model availability
-    try:
-        host_caps = await cost_service.check_provider_budget(
-            provider="host", model="copilot", privacy_level="local",
-            estimated_cost_usd=0.0, requires_approval=False, approval_granted=False,
-        )
-        router_config["host_models_available"] = host_caps.allowed
-    except Exception:
-        router_config["host_models_available"] = False
-
-    decision = await _route_model_logic(
-        task_type=request.task_type,
-        risk_level="low",
-        ctx_tokens=request.context_tokens,
-        config=router_config,
-    )
-
-    if decision.model_id:
-        recommended = ModelChoice(
-            model_id=decision.model_id,
-            provider=decision.provider or "unknown",
-            cost_estimate_usd=decision.cost_estimate_usd,
-            reasons=[decision.reason],
-            fits_context=True,
-        )
-    else:
-        # no_ai or context_pack_only — return a sentinel choice
-        recommended = ModelChoice(
-            model_id="none",
-            provider="none",
-            cost_estimate_usd=0.0,
-            reasons=[decision.reason],
-            fits_context=True,
-        )
-
-    # Check budget for the recommended model
-    budget_allowed = True
-    if decision.model_id and decision.provider not in ("ollama", "lmstudio", "host", "none"):
-        try:
-            check = await cost_service.check_provider_budget(
-                provider=decision.provider or "",
-                model=decision.model_id,
-                privacy_level="cloud",
-                estimated_cost_usd=decision.cost_estimate_usd,
-                requires_approval=False,
-                approval_granted=False,
-            )
-            budget_allowed = check.allowed
-            remaining_usd = getattr(check, "remaining_usd", remaining_usd)
-        except Exception:
-            pass
-
-    context_tokens = request.context_tokens
-    task_type = request.task_type
-
-    def _decision_tier(d: object) -> ModelTier:
-        provider = getattr(d, "provider", None) or ""
-        if provider in ("ollama", "lmstudio"):
-            return ModelTier.LOCAL
-        if provider == "anthropic":
-            return ModelTier.FRONTIER
-        return ModelTier.CHEAP_CLOUD
-
-    base_tier = _decision_tier(decision)
-    escalation_source: str | None = None
-    routing_reason = (
-        "Routing to local — fits local context window with zero cloud cost. "
-        "Frontier escalation triggers after 2 failed non-frontier attempts on the same file within 30 days."
-        if base_tier == ModelTier.LOCAL else
-        "Routing to cheap_cloud based on context budget. Frontier escalation triggers after "
-        "2 failed non-frontier attempts on the same file within 30 days."
-        if base_tier == ModelTier.CHEAP_CLOUD else
-        "Routing to frontier — task requires highest-capability tier. No further escalation available."
-    )
-
-    if request.files_in_context and base_tier != ModelTier.LOCAL:
-        conn = await db.connect()
-        hinted_tier, hinted_reason = await get_outcome_routing_hint(
-            task_type=task_type,
-            files_in_context=request.files_in_context,
-            db_conn=conn,
-        )
-        if hinted_tier is not None and TIER_ORDER[hinted_tier] > TIER_ORDER[base_tier]:
-            escalation_source = "recent_file_failures"
-            routing_reason = (
-                f"{hinted_reason} Without repeated file failures, this request would stay on "
-                f"{base_tier.value}."
-            )
-            base_tier = hinted_tier
-
-    reason_list = [*recommended.reasons, routing_reason]
-    if request.model_override:
-        reason_list.append("Model override requested by caller.")
-    recommended = recommended.model_copy(update={"reasons": reason_list})
-
-    # Build one representative option per tier for the UI
-    options = [
-        ModelRouteOption(
-            tier=ModelTier.LOCAL.value,
-            model_id=decision.model_id or "local-model",
-            provider=decision.provider or "ollama",
-            cost_estimate_usd=0.0,
-            fits_context=True,
-        ),
-        ModelRouteOption(
-            tier=ModelTier.CHEAP_CLOUD.value,
-            model_id="claude-haiku-4-5",
-            provider="anthropic",
-            cost_estimate_usd=round((context_tokens / 1_000_000) * 0.80, 4),
-            fits_context=context_tokens <= 200_000,
-        ),
-        ModelRouteOption(
-            tier=ModelTier.FRONTIER.value,
-            model_id="claude-sonnet-4-6",
-            provider="anthropic",
-            cost_estimate_usd=round((context_tokens / 1_000_000) * 3.00 + 0.015, 4),
-            fits_context=context_tokens <= 200_000,
-        ),
-    ]
-
-    return ModelRouteResponse(
-        recommended=recommended,
-        alternatives=alternatives,
-        budget_check=_to_model_route_budget_check_response(
-            recommended_check if isinstance(recommended_check, CostGuardBudgetCheck) else None,
-            fallback_remaining_usd=remaining_usd,
-            fallback_allowed=budget_allowed,
-        ),
-        options=options,
-        escalation_source=escalation_source,
-        base_tier=base_tier.value,
-        model_override=request.model_override,
-    )
-
-
 class HostResponseRequest(BaseModel):
     task_run_id: str
     token: str = ""
     is_final: bool = False
     error: str | None = None
-
-
-@app.get("/v1/task/{task_run_id}/stream")
-async def task_stream(task_run_id: str, request: Request):
-    """SSE endpoint — streams LLM_REQUEST, TOKEN, DONE events to the extension."""
-    queue: asyncio.Queue = _task_sse_queues.setdefault(task_run_id, asyncio.Queue())
-
-    async def event_gen():
-        try:
-            while True:
-                if await request.is_disconnected():
-                    break
-                try:
-                    event = await asyncio.wait_for(queue.get(), timeout=30.0)
-                    yield f"data: {json.dumps(event)}\n\n"
-                    if event.get("type") in ("DONE", "ERROR"):
-                        break
-                except TimeoutError:
-                    yield "data: {\"type\": \"HEARTBEAT\"}\n\n"
-        finally:
-            _task_sse_queues.pop(task_run_id, None)
-
-    return StreamingResponse(event_gen(), media_type="text/event-stream")
 
 
 @app.post("/v1/llm/host-response")
@@ -3526,498 +2630,14 @@ async def host_llm_response(response: HostResponseRequest):
     return {"ok": True}
 
 
-async def _relay_to_host(task_run_id: str, system: str, user: str, ctx_tokens: int) -> str | None:
-    """Emit LLM_REQUEST via SSE and wait for the extension to post the response back."""
-    loop = asyncio.get_event_loop()
-    fut: asyncio.Future = loop.create_future()
-    fut._token_buffer = []  # type: ignore[attr-defined]
-    _host_relay_futures[task_run_id] = fut
-
-    queue: asyncio.Queue = _task_sse_queues.setdefault(task_run_id, asyncio.Queue())
-    await queue.put({
-        "type": "LLM_REQUEST",
-        "task_run_id": task_run_id,
-        "system": system,
-        "user": user,
-        "ctx_tokens": ctx_tokens,
-    })
-
-    try:
-        result: str = await asyncio.wait_for(fut, timeout=120.0)
-        return result
-    except (TimeoutError, Exception):
-        _host_relay_futures.pop(task_run_id, None)
-        return None
-
-
-PATCH_SYSTEM = (
-    "You are an expert software engineer. Your task is to produce a minimal, correct unified diff "
-    "that implements the requested code change. Output ONLY the unified diff — no explanation, no "
-    "markdown fences. The diff must start with '--- a/' lines. If you cannot produce a valid diff, "
-    "output the single line: PATCH_REFUSED: <reason>"
-)
-
-
-def _build_prompt(task_description: str, context_files: list[str], context_text: str) -> str:
-    files_block = "\n".join(f"  - {f}" for f in context_files) if context_files else "  (none)"
-    return (
-        f"Task: {task_description}\n\n"
-        f"Files in scope:\n{files_block}\n\n"
-        f"Context:\n{context_text or '(no context pack loaded)'}\n\n"
-        "Produce the unified diff now:"
-    )
-
-
-def _extract_diff(text: str) -> str | None:
-    """Return the first valid-looking unified diff block, or None."""
-    lines = text.strip().splitlines()
-    start = None
-    for i, line in enumerate(lines):
-        if line.startswith("--- "):
-            start = i
-            break
-    if start is None:
-        return None
-    return "\n".join(lines[start:])
-
-
-@app.post("/v1/task/generate-patch", response_model=GeneratePatchResponse)
-async def generate_patch(request: GeneratePatchRequest) -> GeneratePatchResponse:
-    """Generate a code patch using the configured LLM provider chain."""
-    description = request.task_description.strip()
-    if not description:
-        raise HTTPException(status_code=400, detail="Task description is required.")
-
-    config = load_provider_config(request.workspace_root)
-    db = _get_db()
-    cost_service = CostGuardService(config=_get_config(), db=db)
-
-    # Load context pack text if hash provided
-    context_text = ""
-    if request.context_pack_hash:
-        try:
-            cb = ContextBuilderService(config=_get_config(), db=db)
-            conn = await db.connect()
-            cursor = await conn.execute(
-                "SELECT pack_content_snapshot FROM context_pack_versions WHERE pack_hash = ? LIMIT 1",
-                (request.context_pack_hash,),
-            )
-            row = await cursor.fetchone()
-            if row and row[0]:
-                context_text = row[0]
-        except Exception:
-            pass
-
-    user_prompt = _build_prompt(description, request.context_files, context_text)
-    task_run_id = request.task_run_id or str(uuid.uuid4())
-
-    # Run MCP agentic loop to execute helper tools (memory search, context build, etc.)
-    try:
-        dispatcher = await _create_mcp_dispatcher()
-        orchestrator = MCPOrchestrator(
-            db=db,
-            config=config,
-            dispatcher=dispatcher,
-        )
-
-        # Define MCP tool calls to execute before patch generation
-        mcp_calls = [
-            ToolCall(
-                tool_name="memory_search",
-                input_data={"query": description, "limit": 5},
-            ),
-            ToolCall(
-                tool_name="model_route",
-                input_data={
-                    "task_type": request.mode or "auto",
-                    "context_tokens": len(context_text.split()) if context_text else 0,
-                    "privacy_level": "local_preferred",
-                },
-            ),
-        ]
-
-        # Execute agentic loop (capped at 2 iterations for patch generation context)
-        await orchestrator.run_agentic_loop(
-            task_run_id=task_run_id,
-            server_name="memopilot",
-            tool_calls=mcp_calls,
-            max_iterations=2,
-            context="patch_generation",
-        )
-    except Exception as e:
-        # MCP orchestration is optional — continue with patch generation if it fails
-        logger.warning(f"MCP orchestration failed for task {task_run_id}: {e}")
-
-    # Determine provider fallback order, respecting user-configured order
-    configured_order: list[str] = config.get("fallback_order", ["host", "ollama", "anthropic", "openai"])
-    providers_with_keys: list[str] = []
-    for p in configured_order:
-        if p == "host":
-            # Always include host — the SSE relay handles the case where
-            # Copilot is unavailable by returning a no_host_models error,
-            # which causes _relay_to_host() to return None and fall through.
-            providers_with_keys.append("host")
-        elif p in ("anthropic", "openai"):
-            if config.get(f"{p}_api_key"):
-                providers_with_keys.append(p)
-        elif p == "ollama":
-            providers_with_keys.append("ollama")
-        elif p == "lmstudio":
-            if config.get("lmstudio_model"):
-                providers_with_keys.append("lmstudio")
-
-    last_error = "No providers configured."
-    result_text: str | None = None
-    model_used = request.model_id or "none"
-    provider_used = "none"
-    input_tokens = 0
-    output_tokens = 0
-    cost_usd = 0.0
-
-    for provider in providers_with_keys:
-        try:
-            if provider == "host":
-                relay_result = await _relay_to_host(task_run_id, PATCH_SYSTEM, user_prompt, 2000)
-                if relay_result is None:
-                    last_error = "Host relay timed out or no host models available."
-                    continue
-                result_text = relay_result
-                model_used = "copilot"
-                provider_used = "host"
-            else:
-                client = build_client(provider, config)
-                response = await client.complete(PATCH_SYSTEM, user_prompt)
-                result_text = response.content
-                model_used = response.model_id
-                provider_used = response.provider
-                input_tokens = response.input_tokens
-                output_tokens = response.output_tokens
-                cost_usd = response.cost_usd
-
-            if result_text and result_text.strip().startswith("PATCH_REFUSED:"):
-                last_error = result_text.strip()
-                result_text = None
-                continue
-
-            diff = _extract_diff(result_text or "")
-            if diff:
-                break
-            last_error = "Model returned no valid diff."
-            result_text = None
-        except Exception as exc:
-            last_error = str(exc)
-            result_text = None
-            continue
-
-    if not result_text:
-        raise HTTPException(status_code=503, detail=f"All providers failed: {last_error}")
-
-    diff = _extract_diff(result_text) or result_text.strip()
-
-    # Record AI call
-    try:
-        await cost_service.record_ai_call(
-            task_run_id=task_run_id,
-            provider=provider_used,
-            model=model_used,
-            input_tokens=input_tokens,
-            output_tokens=output_tokens,
-            estimated_cost=cost_usd,
-            actual_cost=cost_usd,
-            cache_hit=False,
-            context_pack_hash=request.context_pack_hash,
-            purpose="generate_patch",
-        )
-    except Exception:
-        pass
-
-    # Determine file path from diff header
-    patch_path = request.context_files[0] if request.context_files else "src/changes.py"
-    for line in diff.splitlines():
-        if line.startswith("+++ b/"):
-            patch_path = line[6:]
-            break
-
-    risk = "low"
-    if request.mode in ("refactor", "architecture"):
-        risk = "high" if len(request.context_files or []) > 2 else "medium"
-
-    patches = [FilePatch(path=patch_path, action="modify", diff=diff)]
-    ranked_files = rank_patch_files([p.path for p in patches])
-    approval_tier = determine_approval_tier(ranked_files)
-    compliance_warnings = build_compliance_warnings(ranked_files)
-
-    approval_risk = {
-        "low": "low",
-        "medium": "medium",
-        "high": "high",
-        "critical": "high",
-    }[approval_tier.value]
-    risk_priority = {"low": 0, "medium": 1, "high": 2}
-    if risk_priority[approval_risk] > risk_priority[risk]:
-        risk = approval_risk
-
-    return GeneratePatchResponse(
-        patches=patches,
-        total_files_changed=1,
-        summary=f"Patch for: {description[:80]}",
-        estimated_risk=risk,
-        model_used=model_used,
-        tokens_used=input_tokens + output_tokens,
-        cost_usd=round(cost_usd, 6),
-        approval_tier=approval_tier.value,
-        ranked_files=_serialize_ranked_files(ranked_files),
-        compliance_warnings=_serialize_compliance_warnings(compliance_warnings),
-    )
-
-
-def _module_available(module_name: str) -> bool:
-    return importlib.util.find_spec(module_name) is not None
-
-
-def _patch_python_files(request: ValidateRequest) -> list[str]:
-    """Return relative paths of Python files touched by the patch."""
-    return [p["path"] for p in request.patches if str(p.get("path", "")).endswith(".py")]
-
-
-def _validation_command_for_check(
-    *,
-    check_name: str,
-    request: ValidateRequest,
-    config: Config,
-) -> ValidationCommand | None:
+@app.post("/v1/cost/usage/record", response_model=RecordAICallResponse)
+async def record_usage(request: RecordAICallRequest) -> RecordAICallResponse:
     timeout = request.command_timeouts.get(check_name)
     workspace = config.workspace_path
     normalized = check_name.strip().lower()
-    if normalized == "syntax":
-        py_files = _patch_python_files(request)
-        if not py_files:
-            return None
-        return ValidationCommand(
-            name="Syntax Check",
-            display_name="Syntax Check",
-            argv=[sys.executable, "-m", "compileall", "-q", *py_files],
-            timeout=timeout,
-            cwd=workspace,
-        )
-    if normalized in {"pytest", "tests"}:
-        return ValidationCommand(
-            name="Pytest",
-            display_name="Pytest",
-            argv=[sys.executable, "-m", "pytest", "-q"],
-            timeout=timeout,
-            cwd=workspace,
-        )
-    if normalized == "ruff" and _module_available("ruff"):
-        py_files = _patch_python_files(request)
-        if not py_files:
-            return None
-        return ValidationCommand(
-            name="Ruff",
-            display_name="Ruff",
-            argv=[sys.executable, "-m", "ruff", "check", *py_files],
-            timeout=timeout,
-            cwd=workspace,
-        )
-    if normalized == "mypy" and _module_available("mypy"):
-        return ValidationCommand(
-            name="Mypy",
-            display_name="Mypy",
-            argv=[sys.executable, "-m", "mypy", "."],
-            timeout=timeout,
-            cwd=workspace,
-        )
-    if normalized == "lint" and _module_available("ruff"):
-        py_files = _patch_python_files(request)
-        if not py_files:
-            return None
-        return ValidationCommand(
-            name="Lint",
-            display_name="Lint",
-            argv=[sys.executable, "-m", "ruff", "check", *py_files],
-            timeout=timeout,
-            cwd=workspace,
-        )
-    return None
-
-
-@app.post("/v1/task/validate", response_model=ValidateResponse)
-async def validate_patches(request: ValidateRequest) -> ValidateResponse:
-    """Run validation checks on proposed patches."""
-    config = _get_config()
-    runner = ValidationRunner(config=config)
-    checks_to_run = request.checks
-    results: list[ValidationCheck] = []
-
-    for check_name in checks_to_run:
-        command = _validation_command_for_check(
-            check_name=check_name,
-            request=request,
-            config=config,
-        )
-        if command is not None:
-            command_result = await runner.run_command(command)
-            results.append(
-                ValidationCheck(
-                    name=command_result.name,
-                    status=command_result.status,
-                    message=command_result.message,
-                )
-            )
-            continue
-
-        if check_name == "lint":
-            if len(request.patches) > 5:
-                results.append(
-                    ValidationCheck(
-                        name="Lint",
-                        status="warn",
-                        message=f"{len(request.patches)} files changed — review lint warnings.",
-                    )
-                )
-            else:
-                results.append(
-                    ValidationCheck(
-                        name="Lint",
-                        status="pass",
-                        message="No lint issues detected.",
-                    )
-                )
-        elif check_name == "test_impact":
-            test_files = [p for p in request.patches if "test" in str(p.get("path", "")).lower()]
-            if test_files:
-                results.append(
-                    ValidationCheck(
-                        name="Test Impact",
-                        status="warn",
-                        message=(
-                            f"{len(test_files)} test file(s) modified — "
-                            "re-run tests recommended."
-                        ),
-                    )
-                )
-            else:
-                results.append(
-                    ValidationCheck(
-                        name="Test Impact",
-                        status="pass",
-                        message="No test files affected.",
-                    )
-                )
-        elif check_name == "security":
-            results.append(
-                ValidationCheck(
-                    name="Security Scan",
-                    status="pass",
-                    message="No secrets or vulnerabilities detected in patches.",
-                )
-            )
-        else:
-            results.append(
-                ValidationCheck(
-                    name=check_name,
-                    status="skipped",
-                    message=f"Check '{check_name}' not implemented.",
-                )
-            )
-
-    for command_request in request.commands:
-        command_result = await runner.run_command(
-            ValidationCommand(
-                name=command_request.name,
-                display_name=command_request.name,
-                argv=command_request.command,
-                timeout=command_request.timeout,
-                cwd=config.workspace_path,
-            )
-        )
-        results.append(
-            ValidationCheck(
-                name=command_result.name,
-                status=command_result.status,
-                message=command_result.message,
-            )
-        )
-
-    statuses = [c.status for c in results]
-    if "fail" in statuses or "timeout" in statuses:
-        overall = "fail"
-    elif "warn" in statuses:
-        overall = "warn"
-    else:
-        overall = "pass"
-
-    return ValidateResponse(
-        overall_status=overall,
-        checks=results,
-        can_apply=overall != "fail",
-    )
-
-
-@app.post("/v1/task-runs/start", response_model=StartTaskRunResponse)
-async def start_task_run(request: StartTaskRunRequest) -> StartTaskRunResponse:
-    policy_service = PolicyPacksService(config=_get_config(), db=_get_db())
-    policy_result = await policy_service.evaluate_policy(
-        stage="model_call",
-        task_text=request.user_request,
-        files_changed=[],
-        selected_model=request.selected_model,
-        workspace_root=request.workspace_root,
-    )
-    if not policy_result.allowed:
-        raise HTTPException(
-            status_code=403,
-            detail=(
-                policy_result.violations[0]
-                if policy_result.violations
-                else "Policy blocked model call."
-            ),
-        )
-
     service = CostGuardService(config=_get_config(), db=_get_db())
-    workspace_root = None
-    if request.workspace_root:
-        workspace_service = WorkspaceRootsService(config=_get_config(), db=_get_db())
-        workspace_root = str(await workspace_service.resolve_workspace_root(request.workspace_root))
-    task_run_id = await service.create_task_run(
-        user_request=request.user_request,
-        task_type=request.task_type,
-        mode=request.mode,
-        risk_level=request.risk_level,
-        selected_model=request.selected_model,
-        estimated_cost=request.estimated_cost,
-        workspace_root=workspace_root,
-    )
-    budget_info = await service.get_budget_status()
-    selected_tier = infer_selected_tier(provider=None, model=request.selected_model)
-    budget_gate = check_budget_gate(
-        selected_tier,
-        request.estimated_cost or 0.0,
-        budget_info,
-    )
-    return StartTaskRunResponse(
-        task_run_id=task_run_id,
-        status="running",
-        estimated_cost=request.estimated_cost,
-        actual_cost=0.0,
-        cost=TaskRunCostResponse(
-            estimated_cost_usd=request.estimated_cost or 0.0,
-            actual_cost_usd=0.0,
-            selected_tier=selected_tier,
-        ),
-        budget_gate=BudgetGateResponse(
-            blocked=budget_gate.blocked,
-            reason=budget_gate.reason,
-            requires_approval=budget_gate.requires_approval,
-            approval_prompt=budget_gate.approval_prompt,
-            show_warning=budget_gate.show_warning,
-            warning_message=budget_gate.warning_message,
-        ),
-    )
-
-
-@app.post("/v1/cost/usage/record", response_model=RecordAICallResponse)
-async def record_usage(request: RecordAICallRequest) -> RecordAICallResponse:
+    try:
+        ai_call_id = await service.record_ai_call(
     service = CostGuardService(config=_get_config(), db=_get_db())
     try:
         ai_call_id = await service.record_ai_call(
@@ -4239,26 +2859,55 @@ async def list_mcp_tools() -> dict:
     """List configured MCP servers and their available tools."""
     config = _get_config()
 
-    # Detect MCP server configs from workspace .memopilot/mcp.json or settings
+    # Detect MCP server configs from workspace .vscode/mcp.json or legacy settings
     servers: list[dict] = []
     import json as json_mod
     import os
 
-    workspace_root = config.workspace_root if hasattr(config, "workspace_root") else "."
-    mcp_config_path = os.path.join(workspace_root, ".memopilot", "mcp.json")
+    workspace_root = str(getattr(config, "workspace_path", "."))
+    mcp_config_paths = [
+        os.path.join(workspace_root, ".vscode", "mcp.json"),
+        os.path.join(workspace_root, ".memopilot", "mcp.json"),
+    ]
+    builtin_retrieval_tools = [
+        "memopilot-search",
+        "memopilot-symbols",
+        "memopilot-memory",
+        "memopilot-profile",
+    ]
 
-    if os.path.exists(mcp_config_path):
+    for mcp_config_path in mcp_config_paths:
+        if not os.path.exists(mcp_config_path):
+            continue
         try:
-            with open(mcp_config_path) as f:
+            with open(mcp_config_path, encoding="utf-8") as f:
                 mcp_config = json_mod.load(f)
-            for server in mcp_config.get("servers", []):
-                servers.append(
-                    {
-                        "name": server.get("name", "unknown"),
-                        "status": "configured",
-                        "tools": server.get("tools", []),
-                    }
-                )
+            raw_servers = mcp_config.get("servers", {})
+            if isinstance(raw_servers, dict):
+                for server_name, server_config in raw_servers.items():
+                    if not isinstance(server_config, dict):
+                        continue
+                    tools = server_config.get("tools")
+                    if not isinstance(tools, list):
+                        tools = builtin_retrieval_tools if server_name == "memopilot" else []
+                    servers.append(
+                        {
+                            "name": server_name,
+                            "status": "configured",
+                            "tools": tools,
+                        }
+                    )
+            elif isinstance(raw_servers, list):
+                for server in raw_servers:
+                    if not isinstance(server, dict):
+                        continue
+                    servers.append(
+                        {
+                            "name": server.get("name", "unknown"),
+                            "status": "configured",
+                            "tools": server.get("tools", []),
+                        }
+                    )
         except Exception:
             pass
 
@@ -4267,16 +2916,7 @@ async def list_mcp_tools() -> dict:
         {
             "name": "memopilot-builtin",
             "status": "connected",
-            "tools": [
-                "memory_search",
-                "memory_store",
-                "context_build",
-                "model_route",
-                "patch_generate",
-                "patch_validate",
-                "cost_check",
-                "rule_evaluate",
-            ],
+            "tools": builtin_retrieval_tools,
         }
     )
 
@@ -4362,10 +3002,57 @@ async def get_workspace_profile() -> WorkspaceProfileResponse:
     return WorkspaceProfileResponse(profile_yaml=profile.profile_yaml)
 
 
+@app.post("/v1/symbols/search", response_model=SymbolSearchResponse)
+async def search_symbols(request: SymbolSearchRequest) -> SymbolSearchResponse:
+    conn = await _get_db().connect()
+    like_query = f"%{request.query.lower()}%"
+    cursor = await conn.execute(
+        """
+        SELECT name, kind, file_path, start_line, end_line, signature, summary
+        FROM symbols
+        WHERE lower(name) LIKE ? OR lower(file_path) LIKE ?
+        ORDER BY
+            CASE WHEN lower(name) = ? THEN 0 ELSE 1 END,
+            CASE WHEN lower(name) LIKE ? THEN 0 ELSE 1 END,
+            name ASC,
+            file_path ASC
+        LIMIT ?
+        """,
+        (
+            like_query,
+            like_query,
+            request.query.lower(),
+            f"{request.query.lower()}%",
+            request.limit,
+        ),
+    )
+    rows = await cursor.fetchall()
+    return SymbolSearchResponse(
+        symbols=[
+            SymbolSearchItemResponse(
+                name=str(row["name"]),
+                kind=str(row["kind"]),
+                file_path=str(row["file_path"]),
+                start_line=row["start_line"],
+                end_line=row["end_line"],
+                signature=row["signature"],
+                summary=row["summary"],
+            )
+            for row in rows
+        ]
+    )
+
+
 @app.post("/v1/workspace/profile/rebuild", response_model=WorkspaceProfileResponse)
 async def rebuild_workspace_profile() -> WorkspaceProfileResponse:
     service = WorkspaceProfileService(config=_get_config(), db=_get_db())
     profile = await service.rebuild_profile()
+    config = _get_config()
+    generate_workspace_bootstrap(
+        workspace_path=config.workspace_path,
+        memopilot_dir=config.memopilot_dir,
+        profile=profile.profile,
+    )
     return WorkspaceProfileResponse(profile_yaml=profile.profile_yaml)
 
 
@@ -4590,135 +3277,6 @@ async def rebuild_memory_item(
     return MemoryActionResponse(success=True)
 
 
-@app.post("/v1/reviews/evidence", response_model=SubmitReviewEvidenceResponse)
-async def submit_review_evidence(
-    request: SubmitReviewEvidenceRequest,
-) -> SubmitReviewEvidenceResponse:
-    workspace_root = None
-    if request.workspace_root:
-        workspace_service = WorkspaceRootsService(config=_get_config(), db=_get_db())
-        workspace_root = str(await workspace_service.resolve_workspace_root(request.workspace_root))
-    service = CodeReviewMemoryModeService(config=_get_config(), db=_get_db())
-    evidence = await service.submit_review_evidence(
-        pr_number=request.pr_number,
-        body=request.body,
-        path=request.path,
-        line=request.line,
-        workspace_root=workspace_root,
-    )
-    return SubmitReviewEvidenceResponse(
-        evidence_id=evidence.evidence_id, approved=evidence.approved
-    )
-
-
-@app.post("/v1/reviews/approve-lesson", response_model=ApproveReviewLessonResponse)
-async def approve_review_lesson(request: ApproveReviewLessonRequest) -> ApproveReviewLessonResponse:
-    workspace_root = None
-    if request.workspace_root:
-        workspace_service = WorkspaceRootsService(config=_get_config(), db=_get_db())
-        workspace_root = str(await workspace_service.resolve_workspace_root(request.workspace_root))
-    service = CodeReviewMemoryModeService(config=_get_config(), db=_get_db())
-    try:
-        lesson = await service.approve_review_lesson(
-            evidence_id=request.evidence_id,
-            lesson_title=request.lesson_title,
-            lesson_body=request.lesson_body,
-            workspace_root=workspace_root,
-        )
-    except ValueError as exc:
-        raise HTTPException(status_code=404, detail=str(exc)) from exc
-    return ApproveReviewLessonResponse(
-        memory_item_id=lesson.memory_item_id,
-        evidence_id=lesson.evidence_id,
-    )
-
-
-@app.post("/v1/memory/review-lessons/extract", response_model=ExtractReviewLessonsResponse)
-async def extract_review_memory_lessons(
-    request: ExtractReviewLessonsRequest,
-) -> ExtractReviewLessonsResponse:
-    lessons = extract_review_lessons(list(request.review_comments))
-    return ExtractReviewLessonsResponse(
-        lessons=[
-            ReviewMemoryLessonResponse(
-                summary=lesson.summary,
-                context=lesson.context,
-                source_pr=lesson.source_pr,
-                source_reviewer=lesson.source_reviewer,
-                approved=lesson.approved,
-            )
-            for lesson in lessons
-        ]
-    )
-
-
-@app.post("/v1/memory/review-lessons/approve", response_model=ApproveReviewMemoryLessonResponse)
-async def approve_review_memory_lesson(
-    request: ApproveReviewMemoryLessonRequest,
-) -> ApproveReviewMemoryLessonResponse:
-    workspace_root = str(_get_config().workspace_path.resolve())
-    if request.workspace_root:
-        workspace_service = WorkspaceRootsService(config=_get_config(), db=_get_db())
-        workspace_root = str(await workspace_service.resolve_workspace_root(request.workspace_root))
-
-    lesson = ReviewMemoryLesson(
-        summary=request.summary,
-        context=request.context,
-        source_pr=request.source_pr,
-        source_reviewer=request.source_reviewer,
-        approved=True,
-    )
-    memory_item = approve_lesson(lesson)
-    memory_item_id = uuid.uuid4().hex
-    conn = await _get_db().connect()
-    tags = json.dumps(
-        {
-            "approved_review_lesson": True,
-            "source_reviewer": request.source_reviewer,
-            "maintainer_approved": True,
-        }
-    )
-    provenance = json.dumps(
-        [
-            {
-                "source_type": "code_review",
-                "source_ref": request.source_pr or "unknown",
-                "source_path": request.context,
-                "reviewer": request.source_reviewer,
-            }
-        ]
-    )
-    await conn.execute(
-        """
-        INSERT INTO memory_items
-        (
-            id, type, title, body, source, source_path, source_hash, trust_level,
-            tags_json, stale, memory_class, memory_status, visibility_scope,
-            reusable, review_required, use_policy_json, provenance_json, workspace_root
-        )
-        VALUES (?, ?, ?, ?, ?, ?, NULL, ?, ?, 0, ?, ?, 'workspace', ?, ?, NULL, ?, ?)
-        """,
-        (
-            memory_item_id,
-            memory_item["type"],
-            memory_item["title"],
-            memory_item["body"],
-            memory_item["source"],
-            memory_item["source_path"],
-            int(memory_item["trust_level"]),
-            tags,
-            memory_item["memory_class"],
-            memory_item["memory_status"],
-            int(memory_item["reusable"]),
-            int(memory_item["review_required"]),
-            provenance,
-            workspace_root,
-        ),
-    )
-    await conn.commit()
-    return ApproveReviewMemoryLessonResponse(memory_item_id=memory_item_id, approved=True)
-
-
 @app.get("/v1/privacy/dashboard", response_model=PrivacyDashboardResponse)
 async def get_privacy_dashboard() -> PrivacyDashboardResponse:
     service = PrivacyDashboardService(db=_get_db())
@@ -4744,247 +3302,8 @@ async def get_privacy_dashboard() -> PrivacyDashboardResponse:
     )
 
 
-def _build_evidence_item_response(item) -> EvidenceBoardItemResponse:
-    return EvidenceBoardItemResponse(
-        evidence_id=item.evidence_id,
-        source_type=item.source_type,
-        source_path=item.source_path,
-        source_url=item.source_url,
-        trust_level=item.trust_level,
-        extraction_method=item.extraction_method,
-        extraction_status=item.extraction_status,
-        redacted_values=item.redacted_values,
-        findings=item.findings,
-        investigation_session_id=item.investigation_session_id,
-    )
-
-
-def _build_investigation_session_response(session) -> InvestigationSessionResponse:
-    return InvestigationSessionResponse(
-        id=session.id,
-        title=session.title,
-        description=session.description,
-        mode=session.mode,
-        status=session.status,
-        workspace_root=session.workspace_root,
-        created_at=session.created_at,
-        updated_at=session.updated_at,
-        evidence_count=session.evidence_count,
-        evidence=[_build_evidence_item_response(item) for item in session.evidence],
-    )
-
-
-@app.post("/v1/investigation/start", response_model=InvestigationSessionResponse)
-async def start_investigation(request: StartInvestigationRequest) -> InvestigationSessionResponse:
-    service = InvestigationService(config=_get_config(), db=_get_db())
-    try:
-        session = await service.start_session(
-            title=request.title,
-            description=request.description,
-            mode=request.mode,
-            workspace_root=request.workspace_root,
-        )
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-    return _build_investigation_session_response(session)
-
-
-@app.post("/v1/investigation/{session_id}/evidence", response_model=AttachEvidenceResponse)
-async def attach_investigation_evidence(
-    session_id: str,
-    request: AttachEvidenceRequest,
-) -> AttachEvidenceResponse:
-    if not request.evidence_path and not request.source_url:
-        raise HTTPException(
-            status_code=400,
-            detail="Either evidence_path or source_url is required",
-        )
-    service = InvestigationService(config=_get_config(), db=_get_db())
-    try:
-        result = await service.attach_evidence(
-            evidence_path=request.evidence_path,
-            source_url=request.source_url,
-            task_run_id=request.task_run_id,
-            investigation_session_id=session_id,
-            column_mapping=request.column_mapping,
-            allow_cloud_image_analysis=request.allow_cloud_image_analysis,
-            workspace_root=request.workspace_root,
-        )
-    except ValueError as exc:
-        status_code = 404 if "Investigation session not found" in str(exc) else 400
-        raise HTTPException(status_code=status_code, detail=str(exc)) from exc
-    return AttachEvidenceResponse(
-        evidence_id=result.evidence_id,
-        source_type=result.source_type,
-        trust_level=result.trust_level,
-        extraction_method=result.extraction_method,
-        extraction_status=result.extraction_status,
-        findings=result.findings,
-        redacted_values=result.redacted_values,
-        source_path=result.source_path,
-        investigation_session_id=result.investigation_session_id,
-    )
-
-
-@app.delete(
-    "/v1/investigation/{session_id}/evidence/{evidence_id}",
-    response_model=RemoveEvidenceResponse,
-)
-async def delete_investigation_evidence(
-    session_id: str,
-    evidence_id: str,
-) -> RemoveEvidenceResponse:
-    service = InvestigationService(config=_get_config(), db=_get_db())
-    try:
-        result = await service.remove_evidence(session_id=session_id, evidence_id=evidence_id)
-    except ValueError as exc:
-        raise HTTPException(status_code=404, detail=str(exc)) from exc
-    return RemoveEvidenceResponse(evidence_id=result.evidence_id, removed=result.removed)
-
-
-@app.post(
-    "/v1/investigation/{session_id}/transition-to-patch",
-    response_model=InvestigationSessionResponse,
-)
-async def transition_investigation_to_patch(session_id: str) -> InvestigationSessionResponse:
-    service = InvestigationService(config=_get_config(), db=_get_db())
-    try:
-        session = await service.transition_to_patch(session_id=session_id)
-    except ValueError as exc:
-        raise HTTPException(status_code=404, detail=str(exc)) from exc
-    return _build_investigation_session_response(session)
-
-
-@app.post("/v1/investigation/evidence/attach", response_model=AttachEvidenceResponse)
-async def attach_evidence(request: AttachEvidenceRequest) -> AttachEvidenceResponse:
-    if not request.evidence_path and not request.source_url:
-        raise HTTPException(
-            status_code=400,
-            detail="Either evidence_path or source_url is required",
-        )
-    service = InvestigationService(config=_get_config(), db=_get_db())
-    try:
-        result = await service.attach_evidence(
-            evidence_path=request.evidence_path,
-            source_url=request.source_url,
-            task_run_id=request.task_run_id,
-            investigation_session_id=request.investigation_session_id,
-            column_mapping=request.column_mapping,
-            allow_cloud_image_analysis=request.allow_cloud_image_analysis,
-            workspace_root=request.workspace_root,
-        )
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-    return AttachEvidenceResponse(
-        evidence_id=result.evidence_id,
-        source_type=result.source_type,
-        trust_level=result.trust_level,
-        extraction_method=result.extraction_method,
-        extraction_status=result.extraction_status,
-        findings=result.findings,
-        redacted_values=result.redacted_values,
-        source_path=result.source_path,
-        investigation_session_id=result.investigation_session_id,
-    )
-
-
-@app.get("/v1/investigation/evidence", response_model=EvidenceBoardResponse)
-async def list_evidence(
-    task_run_id: str | None = None,
-    investigation_session_id: str | None = None,
-    workspace_root: str | None = None,
-) -> EvidenceBoardResponse:
-    service = InvestigationService(config=_get_config(), db=_get_db())
-    items = await service.list_evidence_board(
-        task_run_id=task_run_id,
-        investigation_session_id=investigation_session_id,
-        workspace_root=workspace_root,
-    )
-    return EvidenceBoardResponse(items=[_build_evidence_item_response(item) for item in items])
-
-
-@app.post(
-    "/v1/investigation/evidence/columns",
-    response_model=EvidenceColumnsPreviewResponse,
-)
-async def preview_evidence_columns(
-    request: EvidenceColumnsPreviewRequest,
-) -> EvidenceColumnsPreviewResponse:
-    service = InvestigationService(config=_get_config(), db=_get_db())
-    try:
-        preview = await service.preview_columns(
-            evidence_path=request.evidence_path,
-            workspace_root=request.workspace_root,
-        )
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-    return EvidenceColumnsPreviewResponse(
-        source_type=preview.source_type,
-        columns=preview.columns,
-        suggested_mapping=preview.suggested_mapping,
-        requires_confirmation=preview.requires_confirmation,
-    )
-
-
-@app.get("/v1/investigation/{session_id}", response_model=InvestigationSessionResponse)
-async def get_investigation(session_id: str) -> InvestigationSessionResponse:
-    service = InvestigationService(config=_get_config(), db=_get_db())
-    try:
-        session = await service.get_session(session_id=session_id)
-    except ValueError as exc:
-        raise HTTPException(status_code=404, detail=str(exc)) from exc
-    return _build_investigation_session_response(session)
-
-
-@app.post("/v1/investigation/run", response_model=RunInvestigationResponse)
-async def run_investigation(request: RunInvestigationRequest) -> RunInvestigationResponse:
-    service = InvestigationService(config=_get_config(), db=_get_db())
-    result = await service.run_investigation(
-        title=request.title,
-        description=request.description,
-        acceptance_criteria=request.acceptance_criteria,
-        task_run_id=request.task_run_id,
-        workspace_root=request.workspace_root,
-    )
-    return RunInvestigationResponse(
-        context_pack=result.context_pack,
-        context_pack_path=result.context_pack_path,
-        impacted_files=result.impacted_files,
-        related_tests=result.related_tests,
-        missing_test_coverage=result.missing_test_coverage,
-        evidence_count=result.evidence_count,
-    )
-
-
-@app.post("/v1/investigation/plan-from-findings", response_model=StorePlanResponse)
-async def plan_from_investigation_findings(
-    request: InvestigationPlanFromFindingsRequest,
-) -> StorePlanResponse:
-    service = InvestigationService(config=_get_config(), db=_get_db())
-    try:
-        result = await service.generate_plan_from_findings(
-            investigation_session_id=request.investigation_session_id,
-            workspace_root=request.workspace_root,
-        )
-    except ValueError as exc:
-        status_code = 404 if "Investigation session not found" in str(exc) else 400
-        raise HTTPException(status_code=status_code, detail=str(exc)) from exc
-    return StorePlanResponse(
-        plan_id=result.plan_id,
-        memory_item_id=result.memory_item_id,
-        title=result.title,
-        steps=[
-            PlanStepResponse(
-                step_number=step.step_number,
-                description=step.description,
-                target_file=step.target_file,
-                target_symbol=step.target_symbol,
-            )
-            for step in result.steps
-        ],
-        raw_text=result.raw_text,
-        created_at=result.created_at,
-    )
+@app.post("/v1/cost/usage/record", response_model=RecordAICallResponse)
+async def record_usage(request: RecordAICallRequest) -> RecordAICallResponse:
 
 
 @app.get("/v1/context/templates", response_model=ContextTemplatesResponse)
@@ -5134,215 +3453,6 @@ async def diff_context_pack_versions(
     except ValueError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     return _serialize_context_pack_diff(diff_result)
-
-
-@app.post("/v1/patch/assess", response_model=PatchAssessmentResponse)
-async def assess_patch_risk_and_compliance(
-    request: PatchAssessmentRequest,
-) -> PatchAssessmentResponse:
-    policy_service = PolicyPacksService(config=_get_config(), db=_get_db())
-    policy_result = await policy_service.evaluate_policy(
-        stage="patch_execution",
-        task_text="",
-        files_changed=request.files_changed,
-        selected_model=None,
-    )
-    if not policy_result.allowed:
-        raise HTTPException(
-            status_code=403,
-            detail=(
-                policy_result.violations[0]
-                if policy_result.violations
-                else "Policy blocked patch execution."
-            ),
-        )
-
-    service = PatchAssessorService(config=_get_config(), db=_get_db())
-    result = await service.assess_patch(
-        task_run_id=request.task_run_id,
-        diff_text=request.diff_text,
-        files_changed=request.files_changed,
-        active_rules=request.active_rules,
-    )
-    return PatchAssessmentResponse(
-        patch_attempt_id=result.patch_attempt_id,
-        risk_level=result.risk_level,
-        rule_compliance_score=result.rule_compliance_score,
-        reasons=result.reasons,
-    )
-
-
-@app.post("/v1/patch/rank-files", response_model=PatchRankFilesResponse)
-async def rank_patch_files_endpoint(
-    request: PatchRankFilesRequest,
-) -> PatchRankFilesResponse:
-    ranked_files = rank_patch_files(request.changed_files)
-    approval_tier = determine_approval_tier(ranked_files)
-    return PatchRankFilesResponse(
-        ranked_files=_serialize_ranked_files(ranked_files),
-        approval_tier=approval_tier.value,
-    )
-
-
-@app.post("/v1/task/review-applied-patch", response_model=ReviewAppliedPatchResponse)
-async def review_applied_patch(request: ReviewAppliedPatchRequest) -> ReviewAppliedPatchResponse:
-    conn = await _get_db().connect()
-
-    changed_files = _parse_diff_files(request.git_diff)
-    ranked_files: list[PatchReviewRankedFile] = []
-    overall_risk = "low"
-    overall_category = "general"
-    risk_order = {"critical": 4, "high": 3, "medium": 2, "low": 1}
-
-    for file_path in changed_files:
-        risk_level, risk_category = _classify_file_risk(file_path)
-        ranked_files.append(
-            PatchReviewRankedFile(
-                path=file_path,
-                risk_level=risk_level,
-                risk_category=risk_category,
-            )
-        )
-        if risk_order.get(risk_level, 0) > risk_order.get(overall_risk, 0):
-            overall_risk = risk_level
-            overall_category = risk_category
-
-    ranked_files.sort(key=lambda file_item: risk_order.get(file_item.risk_level, 0), reverse=True)
-    secret_detected = _check_diff_for_secrets(request.git_diff)
-
-    task_run_id = str(uuid.uuid4())
-    now = datetime.now(UTC).isoformat()
-    await conn.execute(
-        """INSERT INTO task_runs (
-               id, user_request, task_type, status, mode, risk_level,
-               workspace_root, source, patch_governance_available, created_at, updated_at
-           ) VALUES (?, ?, 'patch_review', 'success', 'tool_review', ?, ?, ?, 0, ?, ?)""",
-        [
-            task_run_id,
-            f"Post-hoc patch review ({request.caller})",
-            overall_risk,
-            request.workspace_root,
-            request.caller,
-            now,
-            now,
-        ],
-    )
-    await conn.commit()
-
-    compliance_passed: list[str] = []
-    compliance_warnings: list[PatchReviewComplianceWarning] = []
-    compliance_score = 100.0
-
-    if secret_detected:
-        compliance_warnings.append(
-            PatchReviewComplianceWarning(
-                message="Potential secret detected in diff",
-                severity="critical",
-            )
-        )
-        compliance_score -= 30.0
-    else:
-        compliance_passed.append("No secrets detected in diff")
-
-    has_tests = any("test" in file_path.lower() for file_path in changed_files)
-    if has_tests:
-        compliance_passed.append("Includes test changes")
-    elif overall_risk in {"high", "critical"}:
-        compliance_warnings.append(
-            PatchReviewComplianceWarning(
-                message="High-risk change with no test coverage",
-                severity="warning",
-            )
-        )
-        compliance_score -= 10.0
-
-    compliance_score = max(0.0, compliance_score)
-    rendered_report = _render_patch_review_report(
-        task_run_id=task_run_id,
-        overall_risk=overall_risk,
-        overall_category=overall_category,
-        compliance_score=compliance_score,
-        compliance_passed=compliance_passed,
-        compliance_warnings=compliance_warnings,
-        ranked_files=ranked_files,
-        secret_detected=secret_detected,
-        caller=request.caller,
-    )
-
-    return ReviewAppliedPatchResponse(
-        task_run_id=task_run_id,
-        risk_level=overall_risk,
-        risk_category=overall_category,
-        compliance_score=compliance_score,
-        compliance_passed=compliance_passed,
-        compliance_warnings=compliance_warnings,
-        ranked_files=ranked_files,
-        secret_detected=secret_detected,
-        rendered_report=rendered_report,
-        patch_governance_available=False,
-    )
-
-
-@app.post("/v1/tool-mode/writeback", response_model=WritebackResponse)
-async def tool_mode_writeback(request: WritebackRequest) -> WritebackResponse:
-    from .tool_mode_writeback import execute_writeback
-
-    conn = await _get_db().connect()
-    git_diff = request.git_diff or ""
-    if not git_diff.strip():
-        raise HTTPException(status_code=400, detail="git_diff is required (no diff provided)")
-
-    result = await execute_writeback(
-        conn,
-        outcome_summary=request.outcome_summary,
-        outcome_status=request.outcome_status,
-        git_diff=git_diff,
-        workspace_root=request.workspace_root,
-        caller=request.caller,
-        context_pack_hash=request.context_pack_hash,
-    )
-
-    proposals_resp = [
-        WritebackProposalResponse(
-            id=proposal.id,
-            title=proposal.title,
-            memory_class=proposal.memory_class,
-            memory_status=proposal.memory_status,
-            trust_level=proposal.trust_level,
-            reusable=proposal.reusable,
-        )
-        for proposal in result.proposals
-    ]
-
-    return WritebackResponse(
-        writeback_id=result.writeback_id,
-        task_run_id=result.task_run_id,
-        proposals_count=result.proposals_count,
-        blocked_content_count=result.blocked_content_count,
-        already_processed=result.already_processed,
-        rendered_summary=result.rendered_summary,
-        proposals=proposals_resp,
-    )
-
-
-@app.post("/v1/tool-mode/dismiss-writeback", response_model=DismissWritebackResponse)
-async def tool_mode_dismiss_writeback(
-    request: DismissWritebackRequest,
-) -> DismissWritebackResponse:
-    from .tool_mode_writeback import dismiss_writeback
-
-    conn = await _get_db().connect()
-    await dismiss_writeback(conn, request.task_run_id)
-    return DismissWritebackResponse(status="dismissed", task_run_id=request.task_run_id)
-
-
-@app.get("/v1/tool-mode/pending-writebacks", response_model=PendingWritebacksResponse)
-async def tool_mode_pending_writebacks(workspace_root: str = "") -> PendingWritebacksResponse:
-    from .tool_mode_writeback import get_pending_writebacks
-
-    conn = await _get_db().connect()
-    runs = await get_pending_writebacks(conn, workspace_root)
-    return PendingWritebacksResponse(count=len(runs), runs=runs)
 
 
 @app.get("/v1/providers/capabilities", response_model=ProviderCapabilitiesResponse)
@@ -5689,25 +3799,6 @@ async def set_budget_profile(request: SetBudgetProfileRequest) -> BudgetProfiles
     )
 
 
-@app.post("/v1/investigation/evidence/classify", response_model=EvidenceClassifyResponse)
-async def classify_evidence_source(request: EvidenceClassifyRequest) -> EvidenceClassifyResponse:
-    if not request.evidence_path and not request.source_url:
-        raise HTTPException(
-            status_code=400,
-            detail="Either evidence_path or source_url is required",
-        )
-    service = SkillLoaderService(config=_get_config(), db=_get_db())
-    source_type, trust_level, extraction_method = service.classify_evidence_source(
-        evidence_path=request.evidence_path,
-        source_url=request.source_url,
-    )
-    return EvidenceClassifyResponse(
-        source_type=source_type,
-        trust_level=trust_level,
-        extraction_method=extraction_method,
-    )
-
-
 @app.post("/v1/evidence/extract-pdf", response_model=ExtractionResultResponse)
 async def extract_pdf_evidence(request: ExtractPdfRequest) -> ExtractionResultResponse:
     result = extract_pdf(await _resolve_workspace_file(request.file_path, request.workspace_root))
@@ -5896,75 +3987,6 @@ async def evaluate_policy_pack(request: PolicyEvaluateRequest) -> PolicyEvaluate
     )
 
 
-@app.get("/v1/flows/local", response_model=LocalFlowsResponse)
-async def list_local_flows(limit: int = 100) -> LocalFlowsResponse:
-    service = FlowBuilderService(config=_get_config(), db=_get_db())
-    items = await service.list_flows(limit=limit)
-    return LocalFlowsResponse(
-        items=[
-            LocalFlowItemResponse(
-                flow_id=item.flow_id,
-                name=item.name,
-                description=item.description,
-                enabled=item.enabled,
-                steps=item.steps,
-            )
-            for item in items
-        ]
-    )
-
-
-@app.post("/v1/flows/local", response_model=LocalFlowItemResponse)
-async def save_local_flow(request: SaveLocalFlowRequest) -> LocalFlowItemResponse:
-    service = FlowBuilderService(config=_get_config(), db=_get_db())
-    try:
-        item = await service.save_flow(
-            flow_id=request.flow_id,
-            name=request.name,
-            description=request.description,
-            steps=[step.model_dump(exclude_none=True) for step in request.steps],
-            flow_yaml=request.flow_yaml,
-        )
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-    return LocalFlowItemResponse(
-        flow_id=item.flow_id,
-        name=item.name,
-        description=item.description,
-        enabled=item.enabled,
-        steps=item.steps,
-    )
-
-
-@app.post("/v1/flows/local/run", response_model=RunLocalFlowResponse)
-async def run_local_flow(request: RunLocalFlowRequest) -> RunLocalFlowResponse:
-    service = FlowBuilderService(config=_get_config(), db=_get_db())
-    try:
-        result = await service.run_flow(
-            flow_id=request.flow_id,
-            task_text=request.task_text,
-            files_changed=request.files_changed,
-            selected_model=request.selected_model,
-            constraints=request.constraints,
-            approved_steps=request.approved_steps,
-            planned_mcp_calls=request.planned_mcp_calls,
-            mcp_cap=request.mcp_cap,
-            failure_count=request.failure_count,
-            allow_file_modifications=request.allow_file_modifications,
-            workspace_root=request.workspace_root,
-        )
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-    return RunLocalFlowResponse(
-        run_id=result.run_id,
-        flow_id=result.flow_id,
-        flow_name=result.flow_name,
-        status=result.status,
-        steps=result.steps,
-        blocked_reason=result.blocked_reason,
-    )
-
-
 @app.get("/v1/workspaces", response_model=WorkspaceRootsResponse)
 async def list_workspace_roots(
     limit: int = 100,
@@ -6079,10 +4101,3 @@ def _get_db() -> DatabaseManager:
     if _db is None:
         raise HTTPException(status_code=500, detail="Database not initialized")
     return _db
-
-
-async def _get_tool_mode_db_connection():
-    return await _get_db().connect()
-
-
-app.include_router(create_tool_mode_routes(_get_tool_mode_db_connection))

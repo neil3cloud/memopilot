@@ -88,9 +88,8 @@ export class MemoPilotPanel extends MemoPilotPanelBase {
     private handleNavigation(viewId: string): void {
         // Views that open their own panels/commands instead of inline content
         const externalViews: Record<string, string> = {
-            'task-entry': 'memopilot.analyzeTask',
             'cost-dashboard': 'memopilot.showCostReport',
-            'provider-matrix': 'memopilot.showProviderCapabilities',
+            'configure-providers': 'memopilot.configureProviders',
             'rules-skills': 'memopilot.openRules',
         };
 
@@ -108,7 +107,6 @@ export class MemoPilotPanel extends MemoPilotPanelBase {
             'memory-manager': 'memopilot-memory',
             'workspace-profile': 'memopilot-profile',
             'privacy-boundary': 'memopilot-privacy',
-            'evidence-board': 'memopilot-evidence',
             'mcp-tools': 'memopilot-mcp',
         };
 
@@ -250,16 +248,10 @@ export class MemoPilotPanel extends MemoPilotPanelBase {
                 return this.getInfoHtml('Local App Memory', 'The Memory Manager sidebar shows indexed symbols, file summaries, and learned patterns. Click items to approve, edit, or filter.', 'memopilot-memory');
             case 'rules-skills':
                 return this.getInfoHtml('Rules & Skills', 'Active global rules, project rules, and detected skills are shown in the sidebar tree. Refresh to reload from backend.', 'memopilot-rules');
-            case 'task-entry':
-                return this.getInfoHtml('New Task', 'Opening the Task Entry panel where you can enter a natural language task with constraints and mode selection.', undefined);
             case 'context-pack':
                 return this.getInfoHtml('Context Pack', 'The Context Pack sidebar shows files, tokens, and cost that will be sent to the AI model. It populates after task analysis.', 'memopilot-context');
             case 'model-routing':
                 return this.getInfoHtml('Model Routing', 'The Cost Guard sidebar shows budget usage. Model routing selects the optimal model based on context size, task type, and privacy.', 'memopilot-cost');
-            case 'patch-preview':
-                return this.getInfoHtml('Diff Preview', 'After patch generation, a dedicated Diff Preview panel opens showing colored diffs with approve/reject buttons.', undefined);
-            case 'approval-gate':
-                return this.getInfoHtml('Approval Gate', 'No patches are applied without explicit approval. The Approve/Reject controls appear in the Diff Preview panel.', undefined);
             case 'validation':
                 return this.getInfoHtml('Validation', 'After approval, syntax, lint, test impact, and security checks run automatically. Results appear inline in the Diff Preview.', undefined);
             case 'task-history':
@@ -272,10 +264,6 @@ export class MemoPilotPanel extends MemoPilotPanelBase {
                 return this.getInfoHtml('Workspace Profile', 'The Workspace Profile sidebar shows detected frameworks, dependencies, and configuration.', 'memopilot-profile');
             case 'privacy-boundary':
                 return this.getInfoHtml('Privacy Dashboard', 'The Privacy Dashboard sidebar shows data classification: what stays local vs. what may leave.', 'memopilot-privacy');
-            case 'provider-matrix':
-                return this.getInfoHtml('Provider Matrix', 'Opening the Provider Matrix panel showing model capabilities, costs, and privacy levels.', undefined);
-            case 'evidence-board':
-                return this.getInfoHtml('Evidence Board', 'Attached evidence sources with trust classification are shown in the Evidence Board sidebar.', 'memopilot-evidence');
             case 'mcp-tools':
                 return this.getInfoHtml('MCP & Tools', 'Connected MCP servers and available tools are shown in the MCP Tools sidebar tree.', 'memopilot-mcp');
             default:
@@ -357,11 +345,11 @@ export class MemoPilotPanel extends MemoPilotPanelBase {
                 return;
             }
             if (e.target.closest('.mp-setup-ollama-btn')) {
-                postMsg('navigate', { viewId: 'provider-matrix' });
+                postMsg('navigate', { viewId: 'configure-providers' });
                 return;
             }
             if (e.target.closest('.mp-setup-copilot-btn')) {
-                postMsg('navigate', { viewId: 'provider-matrix' });
+                postMsg('navigate', { viewId: 'configure-providers' });
                 return;
             }
         });

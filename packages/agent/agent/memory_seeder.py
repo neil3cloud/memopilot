@@ -101,7 +101,9 @@ class MemorySeederService:
                     "[]", workspace_root,
                 ),
             )
-            count += 1
+            changes = await conn.execute("SELECT changes() AS changes")
+            change_row = await changes.fetchone()
+            count += int(change_row["changes"] or 0) if change_row else 0
         return count
 
     # ------------------------------------------------------------------
@@ -139,7 +141,9 @@ class MemorySeederService:
                     "[]", workspace_root,
                 ),
             )
-            count += 1
+            changes = await conn.execute("SELECT changes() AS changes")
+            change_row = await changes.fetchone()
+            count += int(change_row["changes"] or 0) if change_row else 0
         return count
 
     # ------------------------------------------------------------------
@@ -152,7 +156,7 @@ class MemorySeederService:
             SELECT file_path FROM file_index
             WHERE (file_path LIKE '%/test_%' OR file_path LIKE '%_test.py'
                    OR file_path LIKE '%\\test_%' OR file_path LIKE '%\\_test.py')
-              AND (workspace_root = ? OR workspace_root IS NULL)
+                            AND workspace_root = ?
             ORDER BY file_path LIMIT 20
             """,
             (workspace_root,),

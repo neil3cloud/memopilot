@@ -6,16 +6,12 @@
 import * as vscode from 'vscode';
 import { BackendClient } from '../BackendClient';
 import {
-    ContextPackToolResponse,
     MemoPilotContextInput,
     MemoPilotMemorySearchInput,
-    MemoPilotPatchReviewInput,
-    MemoPilotWritebackInput,
+    MemoPilotSymbolsInput,
     MemorySearchResponse,
-    PatchReviewResponse,
-    RulesResponse,
+    SymbolSearchResponse,
     WorkspaceProfileResponse,
-    WritebackResponse,
 } from './types';
 
 /**
@@ -35,7 +31,7 @@ export function registerLanguageModelTools(
 
     const disposables: vscode.Disposable[] = [];
 
-    disposables.push(lm.registerTool('memopilot_context', {
+    disposables.push(lm.registerTool('memopilot-search', {
         async invoke(
             options: { input: MemoPilotContextInput },
             token: vscode.CancellationToken,
@@ -50,13 +46,12 @@ export function registerLanguageModelTools(
             }
 
             const workspaceRoot = getWorkspaceRoot();
-            const response = await client.post<ContextPackToolResponse>('/v1/context-pack/generate', {
+            const response = await client.assembleContext({
                 task_description: options.input.task_description,
-                suggested_files: options.input.files_in_focus ?? [],
-                task_type: options.input.task_type_hint ?? 'general',
+                files_in_focus: options.input.files_in_focus ?? [],
+                task_type_hint: options.input.task_type_hint ?? 'general',
                 workspace_root: workspaceRoot,
                 caller: 'copilot_lm_tool',
-                output_format: 'markdown_for_llm',
                 max_output_tokens: 8000,
             });
 
@@ -64,30 +59,51 @@ export function registerLanguageModelTools(
         },
     }));
 
-    disposables.push(lm.registerTool('memopilot_rules', {
+    disposables.push(lm.registerTool('memopilot-symbols', {
         async invoke(
-            _options: { input: Record<string, never> },
+            options: { input: MemoPilotSymbolsInput },
             token: vscode.CancellationToken,
         ) {
             if (token.isCancellationRequested) {
-                return createToolResult('## MemoPilot Rules Cancelled');
+                return createToolResult('## MemoPilot Symbols Cancelled');
             }
 
             const client = getBackendClient();
             if (!client) {
-                return createToolResult('## MemoPilot Rules Unavailable\n\nBackend not running.');
+                return createToolResult('## MemoPilot Symbols Unavailable\n\nBackend not running.');
             }
 
-            const workspaceRoot = getWorkspaceRoot();
-            const response = await client.get<RulesResponse>(
-                `/v1/rules/active?workspace_root=${encodeURIComponent(workspaceRoot)}&caller=copilot_lm_tool`,
-            );
+            const response = await client.post<SymbolSearchResponse>('/v1/symbols/search', {
+                query: options.input.query,
+                limit: options.input.limit ?? 10,
+            });
 
-            return createToolResult(response.rendered_markdown ?? 'No rules found.');
+            if (!response.symbols || response.symbols.length === 0) {
+                return createToolResult(`## MemoPilot Symbols\n\nNo symbols found for: "${options.input.query}"`);
+            }
+
+            const lines: string[] = [
+                `## MemoPilot Symbols — "${options.input.query}"`,
+                `_${response.symbols.length} result(s)_`,
+                '',
+            ];
+            for (const symbol of response.symbols) {
+                lines.push(`### ${symbol.name} [${symbol.kind}]`);
+                lines.push(`- Location: ${symbol.file_path}:${symbol.start_line ?? '?'}`);
+                if (symbol.signature) {
+                    lines.push(`- Signature: \`${symbol.signature}\``);
+                }
+                if (symbol.summary) {
+                    lines.push(`- Summary: ${symbol.summary}`);
+                }
+                lines.push('');
+            }
+
+            return createToolResult(lines.join('\n').trim());
         },
     }));
 
-    disposables.push(lm.registerTool('memopilot_memory_search', {
+    disposables.push(lm.registerTool('memopilot-memory', {
         async invoke(
             options: { input: MemoPilotMemorySearchInput },
             token: vscode.CancellationToken,
@@ -114,7 +130,7 @@ export function registerLanguageModelTools(
         },
     }));
 
-    disposables.push(lm.registerTool('memopilot_workspace_profile', {
+    disposables.push(lm.registerTool('memopilot-profile', {
         async invoke(
             _options: { input: Record<string, never> },
             token: vscode.CancellationToken,
@@ -134,69 +150,6 @@ export function registerLanguageModelTools(
             );
 
             return createToolResult(response.rendered_markdown ?? 'Profile unavailable.');
-        },
-    }));
-
-    disposables.push(lm.registerTool('memopilot_patch_review', {
-        async invoke(
-            options: { input: MemoPilotPatchReviewInput },
-            token: vscode.CancellationToken,
-        ) {
-            if (token.isCancellationRequested) {
-                return createToolResult('## MemoPilot Patch Review Cancelled');
-            }
-
-            const client = getBackendClient();
-            if (!client) {
-                return createToolResult('## Patch Review Unavailable\n\nBackend not running.');
-            }
-
-            const workspaceRoot = getWorkspaceRoot();
-            let gitDiff = options.input.git_diff;
-            if (!gitDiff) {
-                gitDiff = await getGitDiff(workspaceRoot);
-            }
-            if (!gitDiff || !gitDiff.trim()) {
-                return createToolResult('## MemoPilot Patch Review\n\nNo uncommitted changes detected. Apply a patch first.');
-            }
-
-            const response = await client.post<PatchReviewResponse>('/v1/task/review-applied-patch', {
-                git_diff: gitDiff,
-                workspace_root: workspaceRoot,
-                caller: 'copilot_lm_tool',
-            });
-
-            return createToolResult(response.rendered_report ?? 'No report available.');
-        },
-    }));
-
-    disposables.push(lm.registerTool('memopilot_writeback', {
-        async invoke(
-            options: { input: MemoPilotWritebackInput },
-            token: vscode.CancellationToken,
-        ) {
-            if (token.isCancellationRequested) {
-                return createToolResult('## MemoPilot Writeback Cancelled');
-            }
-
-            const client = getBackendClient();
-            if (!client) {
-                return createToolResult('## Writeback Unavailable\n\nBackend not running.');
-            }
-
-            const workspaceRoot = getWorkspaceRoot();
-            const response = await client.post<WritebackResponse>('/v1/tool-mode/writeback', {
-                outcome_summary: options.input.outcome_summary,
-                outcome_status: options.input.outcome_status,
-                context_pack_hash: options.input.context_pack_hash ?? null,
-                git_diff: options.input.git_diff ?? null,
-                workspace_root: workspaceRoot,
-                caller: 'copilot_lm_tool',
-            });
-
-            void vscode.commands.executeCommand('memopilot.refreshMemoryReviewQueue');
-
-            return createToolResult(response.rendered_summary ?? 'Writeback completed.');
         },
     }));
 
@@ -224,19 +177,3 @@ function getWorkspaceRoot(): string {
     return '';
 }
 
-async function getGitDiff(workspaceRoot: string): Promise<string> {
-    if (!workspaceRoot) {
-        return '';
-    }
-
-    try {
-        const { exec } = require('child_process') as typeof import('child_process');
-        return new Promise<string>((resolve) => {
-            exec('git diff HEAD', { cwd: workspaceRoot, maxBuffer: 1024 * 1024 }, (error: Error | null, stdout: string) => {
-                resolve(error ? '' : stdout);
-            });
-        });
-    } catch {
-        return '';
-    }
-}

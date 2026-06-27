@@ -1,7 +1,7 @@
 # MemoPilot E2E Copilot Verification Checklist
 
 > For QA/verification before releasing to marketplace
-> Last updated: 2026-06-17
+> Last updated: 2026-06-27
 
 ## Pre-Flight Checks
 
@@ -28,7 +28,7 @@
 
 ---
 
-## Core Pipeline Test (Happy Path)
+## Retrieval-First Verification (Happy Path)
 
 ### 1. Open a Real Workspace
 
@@ -42,127 +42,99 @@ code .
 - [ ] Profile shows detected language (Python, TypeScript, etc.)
 - [ ] File index appears in Context Pack view (sample files listed)
 
-### 2. Create a Task via UI
+### 2. Verify Bootstrap Artifacts
 
-In TaskEntryPanel (MemoPilot → New Task button or Command Palette):
+- [ ] `.vscode/mcp.json` exists in the opened workspace
+- [ ] `.github/copilot-instructions.md` exists in the opened workspace
+- [ ] `.cursor/rules/memopilot.mdc` exists in the opened workspace
+- [ ] `.vscode/mcp.json` contains a `memopilot` stdio server entry
+- [ ] Copilot instructions mention `memopilot_context`
+- [ ] Cursor rule mentions `memopilot-search`
+
+### 3. Verify Tool Discovery
+
+Use MemoPilot's backend or MCP tools view to confirm discovery:
+
+- [ ] `GET /v1/mcp/tools` returns a configured `memopilot` server
+- [ ] Configured `memopilot` server advertises exactly:
+  - `memopilot-search`
+  - `memopilot-symbols`
+  - `memopilot-memory`
+  - `memopilot-profile`
+- [ ] Built-in MemoPilot MCP listing also shows the same retrieval-first tool set
+
+### 4. Retrieval-First UI Command
+
+Run **MemoPilot: Search Project Context** from the Command Palette.
+
+- [ ] Input box appears asking for a code path, symbol, or behavior
+- [ ] Entering a query opens a Markdown preview rather than the legacy task-flow panel
+- [ ] Rendered output includes:
+  - `MemoPilot Context`
+  - relevant code snippets
+  - rules or skills when present
+  - context quality or repo/history sections when available
+- [ ] No patch approval UI appears in the default path
+
+### 5. Copilot Tool-Call Verification
+
+Ask Copilot Chat a repository question such as:
 
 ```
-Task: Add error handling to the login function
-Evidence files: (optional, skip for now)
+Explain the billing validation flow and point me to the main symbols involved.
 ```
 
-- [ ] Task entry form appears with title input
-- [ ] Tab switches work: Analyze → Context → Route → Generate → Approve → Validate → Apply
-- [ ] "Next Step" button shows on Analyze tab
+- [ ] Copilot discovers MemoPilot tools without manual setup beyond the generated files
+- [ ] Copilot calls `memopilot_context` before answering the repository question
+- [ ] If needed, Copilot also calls `memopilot_memory_search` or `memopilot_workspace_profile`
+- [ ] Copilot's final answer references retrieved code rather than broad guessing
+- [ ] No legacy patch generation or apply flow is triggered for a read-only question
 
-### 3. Analyze Stage ✅
+### 6. Symbol and Memory Retrieval Verification
 
-Click "Next Step":
+Verify the dedicated retrieval tools with targeted queries:
 
-- [ ] **Analyze tab shows:**
-  - Task description echoed
-  - Suggested files populated (keyword matches: "login", "auth", etc.)
-  - Task type detected (likely "feature" or "fix")
-  - Signals shown (file matches, keyword strength, etc.)
-- [ ] No errors in backend logs
+- [ ] `memopilot-symbols` returns exact or partial symbol matches with file locations
+- [ ] `memopilot-memory` returns durable project facts when memory exists
+- [ ] `memopilot-profile` returns workspace-level language/framework information
+- [ ] Responses are bounded and readable in Copilot/Cursor chat
 
-### 4. Context Stage ✅
+### 7. Legacy Mode Boundary
 
-Click "Next Step":
+With `memopilot.legacyAgentMode` left at the default `false`:
 
-- [ ] **Context tab shows:**
-  - File list with relevance scores
-  - Token count estimate (should be <8000 by default)
-  - Cost estimate in dollars (tiny, like $0.001)
-  - Rules applied (if any rules in workspace)
-  - Approval status before proceeding (usually auto-approve for <8000 tokens)
-- [ ] **Copilot detected** in Rules/Providers tab
-  - Blue "copilot" badge visible in Provider Matrix
-  - Cost estimate shows $0.00 for Copilot (no cost if using Microsoft account)
+- [ ] Running **MemoPilot: Search Project Context** opens retrieval preview, not TaskEntryPanel
+- [ ] Running legacy commands from internal bindings shows a message that legacy mode must be enabled
+- [ ] Command Palette does not surface legacy patch review / investigation / local agent flow commands by default
 
-### 5. Route Stage ✅
+### 8. Optional Legacy Check
 
-Click "Next Step":
+Set `memopilot.legacyAgentMode` to `true` and reload the window.
 
-- [ ] **Route tab shows:**
-  - Selected model: "GitHub Copilot" (or "Ollama: mistral" if Copilot unavailable)
-  - Fallback chain visible: Host → Ollama → Anthropic → OpenAI
-  - Confidence score displayed
-- [ ] **Status updates:** "Routing task to [model name]..." briefly appears
-
-### 6. Generate Patch Stage ✅✨ (The Main Event)
-
-Click "Next Step":
-
-- [ ] **Generation starts:**
-  - Status shows "Generating patch with [model]..."
-  - Loading spinner appears (placeholder for streaming tokens in v2)
-  - **In Provider Matrix view:** Token count increments live as generation progresses
-- [ ] **Generation completes (10-30s typical with Copilot/Ollama):**
-  - Spinner stops
-  - Patch preview appears in new panel: "Patch Preview"
-  - Diff view shows: `- old code` (red) / `+ new code` (green)
-  - File path and line numbers displayed
-- [ ] **No errors in backend logs** — look for "error" or "exception" keywords
-
-### 7. Approve Patch Stage ✅
-
-In Patch Preview:
-
-- [ ] Patch diff is syntactically correct (no garbled output)
-- [ ] Files modified match suggested files from Analyze stage
-- [ ] Changes are logical for the task ("add error handling" → shows try/except or if/error blocks)
-- [ ] **Cost Dashboard tab shows:**
-  - Call recorded with model, tokens, cost
-  - Total spend updated
-  - Budget still plenty (green)
-
-Click "Approve" button:
-
-- [ ] Task moves to Validate stage
-- [ ] Patch content freezes (no more editing)
-
-### 8. Validate Stage ✅
-
-Click "Next Step":
-
-- [ ] **Validation runs:**
-  - For Python: `compileall` + `ruff check`
-  - For TypeScript: `npx tsc --noEmit` + linter
-  - Status shows "Running tests..." then validation results
-  - Results show PASS/FAIL for each validator
-- [ ] **All validators pass** (no syntax errors introduced):
-  - Green checkmarks for each validator
-  - No blocking errors
-
-### 9. Apply Stage ✅
-
-Click "Apply" button:
-
-- [ ] **Files written to disk:**
-  - Task status shows "Files applied successfully"
-  - Modified files appear in VS Code file explorer with white dot (unsaved marker)
-- [ ] **Verify in editor:**
-  - Open the modified file
-  - Changes are present (the generated code is there)
-  - Syntax highlighting works (file recognized correctly)
-- [ ] **Cost Guard records the complete cycle:**
-  - Task shown in Cost Dashboard with all stages (analyze, generate, validate, apply)
-  - Total cost calculated correctly
-
-### 10. Memory & History
-
-- [ ] Task appears in **Memory view → Recent Tasks**
-- [ ] Memory view shows: task description, files modified, model used, cost
-- [ ] Can "Recall" the task (click on it) to see full details
-- [ ] **Privacy Dashboard shows:**
-  - 1 Local call (Ollama if used)
-  - 1 Host call (Copilot)
-  - OR correct counts based on fallback path used
+- [ ] Legacy commands reappear in the Command Palette
+- [ ] **MemoPilot: Search Project Context** may still be used, but task-flow UI is again reachable
+- [ ] Patch review / investigation / local agent flow commands work only in this mode
 
 ---
 
-## Provider Fallback Test (Important for Reliability)
+## Automated Verification Anchors
+
+These checks should remain green in CI or focused local runs:
+
+- [ ] `tests/test_workspace_init.py` verifies generated `.vscode/mcp.json`, `.github/copilot-instructions.md`, and `.cursor/rules/memopilot.mdc`
+- [ ] `tests/test_mcp_tools.py` verifies `/v1/mcp/tools` sees the configured `memopilot` server from generated workspace bootstrap
+- [ ] `tests/test_context_build.py` verifies `/v1/context/assemble` returns rendered MemoPilot context
+- [ ] `tests/test_mcp_server.py` verifies retrieval-first MCP dispatch stays stable
+
+---
+
+## Legacy Patch Pipeline
+
+The legacy patch pipeline can still be regression-tested separately, but it is no longer the primary release gate for MemoPilot's default surface.
+
+---
+
+## Provider Fallback Test (Legacy / Secondary)
 
 ### Test Ollama Fallback
 
@@ -206,11 +178,10 @@ Click "Apply" button:
   - Workspace Map: Shows file tree
 
 - [ ] **Buttons and interactions work**
-  - "New Task" button opens TaskEntryPanel
-  - "Next Step" advances through stages
-  - "Approve"/"Reject" buttons toggle appropriately
-  - "Apply" writes files without prompts
-  - Diff view colors are visible (red/green)
+  - "Search Project Context" opens retrieval-first context preview
+  - Workspace Profile and Memory commands populate without errors
+  - Legacy task-flow controls appear only when `memopilot.legacyAgentMode` is enabled
+  - No patch approval controls appear in the default retrieval-first path
 
 ---
 

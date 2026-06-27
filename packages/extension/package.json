@@ -1,7 +1,7 @@
 {
   "name": "memopilot",
   "displayName": "MemoPilot",
-  "description": "Rule-Aware, Local-Memory, Cost-Governed AI Development Agent",
+  "description": "Local memory bank and context assembler for VS Code Copilot and Cursor",
   "version": "1.0.1",
   "publisher": "memopilot",
   "license": "MIT",
@@ -61,10 +61,6 @@
           "name": "Privacy Dashboard"
         },
         {
-          "id": "memopilot-evidence",
-          "name": "Evidence Board"
-        },
-        {
           "id": "memopilot-history",
           "name": "Task History"
         },
@@ -81,7 +77,7 @@
       },
       {
         "command": "memopilot.analyzeTask",
-        "title": "MemoPilot: Analyze Current Task"
+        "title": "MemoPilot: Search Project Context"
       },
       {
         "command": "memopilot.generateContextPack",
@@ -124,8 +120,8 @@
         "title": "MemoPilot: Show Privacy Dashboard"
       },
       {
-        "command": "memopilot.showProviderCapabilities",
-        "title": "MemoPilot: Show Provider Capabilities"
+        "command": "memopilot.configureProviders",
+        "title": "MemoPilot: Configure Providers"
       },
       {
         "command": "memopilot.replayAICall",
@@ -152,37 +148,16 @@
         "title": "MemoPilot: Select Budget Profile"
       },
       {
-        "command": "memopilot.classifyEvidenceSource",
-        "title": "MemoPilot: Classify Evidence Source"
-      },
-      {
         "command": "memopilot.managePolicyPacks",
         "title": "MemoPilot: Manage Policy Packs"
-      },
-      {
-        "command": "memopilot.runLocalAgentFlow",
-        "title": "MemoPilot: Run Local Agent Flow"
       },
       {
         "command": "memopilot.manageWorkspaces",
         "title": "MemoPilot: Manage Workspaces"
       },
       {
-        "command": "memopilot.attachEvidence",
-        "title": "MemoPilot: Attach Evidence"
-      },
-      {
-        "command": "memopilot.runInvestigation",
-        "title": "MemoPilot: Run Investigation"
-      },
-      {
         "command": "memopilot.showPanel",
         "title": "MemoPilot: Open Panel"
-      },
-      {
-        "command": "memopilot.reviewAppliedPatch",
-        "title": "MemoPilot: Review Applied Patch",
-        "icon": "$(shield)"
       },
       {
         "command": "memopilot.refreshMemoryReviewQueue",
@@ -194,11 +169,14 @@
         "title": "MemoPilot: Restart Backend"
       }
     ],
+    "menus": {
+      "commandPalette": []
+    },
     "languageModelTools": [
       {
-        "name": "memopilot_context",
-        "displayName": "MemoPilot Context",
-        "modelDescription": "Retrieves governed, rule-aware, secret-redacted context from MemoPilot local project memory. Call before generating a patch.",
+        "name": "memopilot-search",
+        "displayName": "MemoPilot Search",
+        "modelDescription": "Retrieves governed, rule-aware, secret-redacted project context for the current coding task.",
         "inputSchema": {
           "type": "object",
           "properties": {
@@ -210,14 +188,21 @@
         }
       },
       {
-        "name": "memopilot_rules",
-        "displayName": "MemoPilot Rules",
-        "modelDescription": "Returns active project rules and skills for the current workspace.",
-        "inputSchema": { "type": "object", "properties": {} }
+        "name": "memopilot-symbols",
+        "displayName": "MemoPilot Symbols",
+        "modelDescription": "Looks up exact or partial symbol matches in indexed workspace code.",
+        "inputSchema": {
+          "type": "object",
+          "properties": {
+            "query": { "type": "string", "description": "Symbol name or partial symbol pattern to find." },
+            "limit": { "type": "integer", "minimum": 1, "maximum": 50, "default": 10 }
+          },
+          "required": ["query"]
+        }
       },
       {
-        "name": "memopilot_memory_search",
-        "displayName": "MemoPilot Memory Search",
+        "name": "memopilot-memory",
+        "displayName": "MemoPilot Memory",
         "modelDescription": "Searches MemoPilot local memory. Use when encountering an unfamiliar symbol or concept.",
         "inputSchema": {
           "type": "object",
@@ -229,36 +214,10 @@
         }
       },
       {
-        "name": "memopilot_workspace_profile",
-        "displayName": "MemoPilot Workspace Profile",
+        "name": "memopilot-profile",
+        "displayName": "MemoPilot Profile",
         "modelDescription": "Returns workspace profile: language, frameworks, test commands, memory health.",
         "inputSchema": { "type": "object", "properties": {} }
-      },
-      {
-        "name": "memopilot_patch_review",
-        "displayName": "MemoPilot Patch Review",
-        "modelDescription": "Reviews an applied patch against project rules. Call after applying changes to check compliance and risk.",
-        "inputSchema": {
-          "type": "object",
-          "properties": {
-            "git_diff": { "type": "string", "description": "Optional diff text. If omitted, reads current git diff." }
-          }
-        }
-      },
-      {
-        "name": "memopilot_writeback",
-        "displayName": "MemoPilot Writeback",
-        "modelDescription": "IMPORTANT: Call after applying a patch that used memopilot_context. Records what changed in project memory.",
-        "inputSchema": {
-          "type": "object",
-          "properties": {
-            "outcome_summary": { "type": "string", "description": "What was accomplished." },
-            "outcome_status": { "type": "string", "enum": ["success", "partial", "reverted"] },
-            "context_pack_hash": { "type": "string", "description": "Optional hash from preceding memopilot_context call." },
-            "git_diff": { "type": "string", "description": "Optional diff text." }
-          },
-          "required": ["outcome_summary", "outcome_status"]
-        }
       }
     ],
     "configuration": {
@@ -279,6 +238,22 @@
           ],
           "default": "info",
           "description": "Log level for the Python backend."
+        },
+        "memopilot.ollamaUrl": {
+          "type": "string",
+          "default": "http://localhost:11434",
+          "description": "URL of the local Ollama server."
+        },
+        "memopilot.preferredProvider": {
+          "type": "string",
+          "enum": [
+            "auto",
+            "ollama",
+            "openai",
+            "anthropic"
+          ],
+          "default": "auto",
+          "description": "Preferred LLM provider. 'auto' uses the cheapest available provider."
         }
       }
     }

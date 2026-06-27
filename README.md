@@ -1,23 +1,31 @@
 # MemoPilot
 
-**Rule-Aware, Local-Memory, Cost-Governed AI Development Agent Extension for VS Code/Cursor**
+**Local memory bank and context assembler for VS Code Copilot and Cursor**
 
-MemoPilot is a production-ready AI coding governance extension that combines local project memory, rule and skill enforcement, context-pack generation, cost-aware model routing, patch approval, and validation — helping developers use AI accurately and economically inside VS Code/Cursor.
+MemoPilot is a local-first context system for the workspace currently loaded in VS Code or Cursor. It indexes code, stores governed project memory, assembles bounded retrieval context, and exposes that context to Copilot Chat and Cursor before cloud LLM calls are made.
+
+MemoPilot's default product surface is now retrieval-first: search project context, inspect workspace memory, inspect the workspace profile, and supply higher-quality context to native editor agents. The older task-flow pipeline for patch generation and approval still exists, but it is a legacy mode and is no longer the default experience.
 
 ## Core Concept
 
-Before MemoPilot sends a single token to AI, it has already:
+Before MemoPilot sends a single token of project context to an external model, it has already:
 
 1. Indexed the project and built local memory from source code
 2. Loaded and resolved all global and project rules
-3. Identified applicable skills for the current task
+3. Identified applicable skills and workspace constraints
 4. Selected only relevant files, symbols, and memory items
-5. Classified the task type and risk level without an LLM call
-6. Estimated the token cost and selected the cheapest capable model
-7. Redacted all detected secrets from the context
-8. Presented the developer with a complete, inspectable context pack
+5. Assembled a bounded, inspectable context block
+6. Redacted detected secrets from the context
+7. Tracked cost, privacy, and tool-call provenance
 
-After AI generates a response, MemoPilot requires approval before applying any patch, runs validation tools, and proposes memory updates held at low trust until developer approval.
+In default mode, MemoPilot does not apply patches or act as a standalone coding agent. It improves the context available to Copilot and Cursor. Legacy patch-generation and approval flows remain available behind the extension setting `memopilot.legacyAgentMode`.
+
+## Current Default Surface
+
+- Retrieval-first MCP tools: `memopilot-search`, `memopilot-symbols`, `memopilot-memory`, `memopilot-profile`
+- VS Code command default: `MemoPilot: Search Project Context`
+- Status bar default: opens retrieval-first context search
+- Legacy task flow: opt-in only via `memopilot.legacyAgentMode`
 
 ## Architecture
 

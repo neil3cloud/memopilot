@@ -105,23 +105,6 @@ export interface TaskModesResponse {
     modes: string[];
 }
 
-export interface TaskAnalyzeRequest {
-    description: string;
-    constraints?: string[];
-    mode?: string | null;
-    notes?: string | null;
-}
-
-export interface TaskAnalyzeResponse {
-    intent_summary: string;
-    suggested_files: string[];
-    applicable_rules: string[];
-    estimated_complexity: string;
-    suggested_mode: string;
-    task_type: string;
-    risk: string;
-}
-
 export interface ContextBuildRequest {
     task_description: string;
     suggested_files?: string[];
@@ -158,71 +141,22 @@ export interface ContextBuildResponse {
     commit_history?: string;
 }
 
-export interface ModelRouteRequest {
-    context_tokens: number;
-    task_type?: string;
-    privacy_level?: string;
-    preferred_model?: string;
-}
-
-export interface ModelChoice {
-    model_id: string;
-    provider: string;
-    cost_estimate_usd: number;
-    reasons: string[];
-    fits_context: boolean;
-}
-
-export interface ModelRouteResponse {
-    recommended: ModelChoice;
-    alternatives: ModelChoice[];
-    budget_check: { allowed: boolean; remaining_usd: number };
-}
-
-export interface GeneratePatchRequest {
+export interface ContextAssembleRequest {
     task_description: string;
-    context_files?: string[];
-    mode?: string;
-    model_id?: string;
-    dry_run?: boolean;
-    task_run_id?: string;
-    context_pack_hash?: string;
+    files_in_focus?: string[];
+    task_type_hint?: string;
     workspace_root?: string;
+    caller?: string;
+    max_output_tokens?: number;
 }
 
-export interface FilePatch {
-    path: string;
-    action: 'modify' | 'create' | 'delete';
-    original_content: string | null;
-    new_content: string | null;
-    diff: string;
-}
-
-export interface GeneratePatchResponse {
-    patches: FilePatch[];
-    total_files_changed: number;
-    summary: string;
-    estimated_risk: string;
-    model_used: string;
-    tokens_used: number;
-    cost_usd: number;
-}
-
-export interface ValidateRequest {
-    patches: Array<{ path: string; action: string; diff: string }>;
-    checks?: string[];
-}
-
-export interface ValidationCheck {
-    name: string;
-    status: 'pass' | 'fail' | 'warn' | 'skipped';
-    message: string;
-}
-
-export interface ValidateResponse {
-    overall_status: 'pass' | 'fail' | 'warn';
-    checks: ValidationCheck[];
-    can_apply: boolean;
+export interface ContextAssembleResponse {
+    rendered_markdown: string;
+    context_pack_hash: string;
+    total_tokens: number;
+    stale_exclusion_count: number;
+    redacted_values_count: number;
+    quality_verdict?: string;
 }
 
 export interface TaskHistoryEntry {
@@ -269,49 +203,6 @@ export interface McpServer {
 
 export interface McpToolsResponse {
     servers: McpServer[];
-}
-
-export interface AttachEvidenceResponse {
-    evidence_id: string;
-    source_type: string;
-    trust_level: number;
-    extraction_method: string;
-    extraction_status: string;
-    findings: string[];
-    redacted_values: number;
-    source_path: string | null;
-}
-
-export interface EvidenceColumnsPreviewResponse {
-    source_type: string;
-    columns: string[];
-    suggested_mapping: Record<string, string>;
-    requires_confirmation: boolean;
-}
-
-export interface EvidenceBoardItemResponse {
-    evidence_id: string;
-    source_type: string;
-    source_path: string | null;
-    source_url: string | null;
-    trust_level: number;
-    extraction_method: string;
-    extraction_status: string;
-    redacted_values: number;
-    findings: string[];
-}
-
-export interface EvidenceBoardResponse {
-    items: EvidenceBoardItemResponse[];
-}
-
-export interface RunInvestigationResponse {
-    context_pack: string;
-    context_pack_path: string;
-    impacted_files: string[];
-    related_tests: string[];
-    missing_test_coverage: string[];
-    evidence_count: number;
 }
 
 export interface ContextTemplateItemResponse {
@@ -466,12 +357,6 @@ export interface BudgetStatusResponse {
     remaining_usd: number;
 }
 
-export interface EvidenceClassifyResponse {
-    source_type: string;
-    trust_level: number;
-    extraction_method: string;
-}
-
 export interface PolicyPackItemResponse {
     pack_id: string;
     name: string;
@@ -494,35 +379,6 @@ export interface PolicyEvaluateResponse {
     active_pack_name: string | null;
     violations: string[];
     applied_policies: string[];
-}
-
-export interface LocalFlowStep {
-    id?: string;
-    title?: string;
-    action: string;
-    stage?: string;
-    available_tools?: string[];
-}
-
-export interface LocalFlowItemResponse {
-    flow_id: string;
-    name: string;
-    description: string;
-    enabled: boolean;
-    steps: Record<string, string | string[] | boolean>[];
-}
-
-export interface LocalFlowsResponse {
-    items: LocalFlowItemResponse[];
-}
-
-export interface RunLocalFlowResponse {
-    run_id: string;
-    flow_id: string;
-    flow_name: string;
-    status: string;
-    steps: Record<string, string | boolean | string[]>[];
-    blocked_reason: string | null;
 }
 
 export interface WorkspaceRootItemResponse {
@@ -657,84 +513,14 @@ export class BackendClient {
         return result as TaskModesResponse;
     }
 
-    async analyzeTask(request: TaskAnalyzeRequest): Promise<TaskAnalyzeResponse> {
-        const result = await this.manager.request('POST', '/v1/task/analyze', request);
-        return result as TaskAnalyzeResponse;
-    }
-
     async buildContextPack(request: ContextBuildRequest): Promise<ContextBuildResponse> {
         const result = await this.manager.request('POST', '/v1/context/build', request);
         return result as ContextBuildResponse;
     }
 
-    async routeModel(request: ModelRouteRequest): Promise<ModelRouteResponse> {
-        const result = await this.manager.request('POST', '/v1/model/route', request);
-        return result as ModelRouteResponse;
-    }
-
-    async generatePatch(request: GeneratePatchRequest): Promise<GeneratePatchResponse> {
-        const result = await this.manager.request('POST', '/v1/task/generate-patch', request);
-        return result as GeneratePatchResponse;
-    }
-
-    /**
-     * Open an SSE stream for a task run and call onToken for each TOKEN event.
-     * Returns a dispose function that cancels the stream.
-     */
-    openTokenStream(taskRunId: string, onToken: (token: string) => void): () => void {
-        // eslint-disable-next-line @typescript-eslint/no-require-imports
-        const http = require('http') as typeof import('http');
-        const url = new URL(`/v1/task/${encodeURIComponent(taskRunId)}/stream`, this.manager.baseUrl);
-        let req: import('http').ClientRequest | undefined;
-        let cancelled = false;
-
-        const connect = () => {
-            if (cancelled) { return; }
-            req = http.request(
-                {
-                    hostname: '127.0.0.1',
-                    port: parseInt(url.port || '80', 10),
-                    path: url.pathname + url.search,
-                    headers: {
-                        'X-Agent-Token': this.manager.authToken,
-                        'Accept': 'text/event-stream',
-                        'Cache-Control': 'no-cache',
-                    },
-                },
-                (res) => {
-                    let buffer = '';
-                    res.on('data', (chunk: Buffer) => {
-                        buffer += chunk.toString('utf8');
-                        const lines = buffer.split('\n');
-                        buffer = lines.pop() ?? '';
-                        for (const line of lines) {
-                            if (line.startsWith('data: ')) {
-                                try {
-                                    const event = JSON.parse(line.slice(6)) as { type: string; token?: string };
-                                    if (event.type === 'TOKEN' && event.token) {
-                                        onToken(event.token);
-                                    }
-                                } catch { /* skip malformed */ }
-                            }
-                        }
-                    });
-                },
-            );
-            req.on('error', () => { /* backend ended */ });
-            req.end();
-        };
-
-        connect();
-
-        return () => {
-            cancelled = true;
-            req?.destroy();
-        };
-    }
-
-    async validatePatches(request: ValidateRequest): Promise<ValidateResponse> {
-        const result = await this.manager.request('POST', '/v1/task/validate', request);
-        return result as ValidateResponse;
+    async assembleContext(request: ContextAssembleRequest): Promise<ContextAssembleResponse> {
+        const result = await this.manager.request('POST', '/v1/context/assemble', request);
+        return result as ContextAssembleResponse;
     }
 
     async getTaskHistory(limit = 20): Promise<TaskHistoryResponse> {
@@ -750,45 +536,6 @@ export class BackendClient {
     async listMcpTools(): Promise<McpToolsResponse> {
         const result = await this.manager.request('GET', '/v1/mcp/tools');
         return result as McpToolsResponse;
-    }
-
-    async previewEvidenceColumns(evidencePath: string): Promise<EvidenceColumnsPreviewResponse> {
-        const result = await this.manager.request('POST', '/v1/investigation/evidence/columns', {
-            evidence_path: evidencePath,
-        });
-        return result as EvidenceColumnsPreviewResponse;
-    }
-
-    async attachEvidence(
-        evidencePath: string,
-        columnMapping?: Record<string, string>,
-    ): Promise<AttachEvidenceResponse> {
-        const result = await this.manager.request('POST', '/v1/investigation/evidence/attach', {
-            evidence_path: evidencePath,
-            column_mapping: columnMapping,
-        });
-        return result as AttachEvidenceResponse;
-    }
-
-    async getEvidenceBoard(taskRunId?: string): Promise<EvidenceBoardResponse> {
-        const suffix = taskRunId ? `?task_run_id=${encodeURIComponent(taskRunId)}` : '';
-        const result = await this.manager.request('GET', `/v1/investigation/evidence${suffix}`);
-        return result as EvidenceBoardResponse;
-    }
-
-    async runInvestigation(
-        title: string,
-        description: string,
-        acceptanceCriteria: string[],
-        taskRunId?: string,
-    ): Promise<RunInvestigationResponse> {
-        const result = await this.manager.request('POST', '/v1/investigation/run', {
-            title,
-            description,
-            acceptance_criteria: acceptanceCriteria,
-            task_run_id: taskRunId,
-        });
-        return result as RunInvestigationResponse;
     }
 
     async listContextTemplates(): Promise<ContextTemplatesResponse> {
@@ -932,17 +679,6 @@ export class BackendClient {
         return result as BudgetProfilesResponse;
     }
 
-    async classifyEvidenceSource(
-        evidencePath?: string,
-        sourceUrl?: string,
-    ): Promise<EvidenceClassifyResponse> {
-        const result = await this.manager.request('POST', '/v1/investigation/evidence/classify', {
-            evidence_path: evidencePath,
-            source_url: sourceUrl,
-        });
-        return result as EvidenceClassifyResponse;
-    }
-
     async listPolicyPacks(): Promise<PolicyPacksResponse> {
         const result = await this.manager.request('GET', '/v1/policies/packs');
         return result as PolicyPacksResponse;
@@ -980,39 +716,6 @@ export class BackendClient {
             selected_model: selectedModel,
         });
         return result as PolicyEvaluateResponse;
-    }
-
-    async listLocalFlows(): Promise<LocalFlowsResponse> {
-        const result = await this.manager.request('GET', '/v1/flows/local');
-        return result as LocalFlowsResponse;
-    }
-
-    async saveLocalFlow(
-        name: string,
-        description: string,
-        steps: LocalFlowStep[],
-    ): Promise<LocalFlowItemResponse> {
-        const result = await this.manager.request('POST', '/v1/flows/local', {
-            name,
-            description,
-            steps,
-        });
-        return result as LocalFlowItemResponse;
-    }
-
-    async runLocalFlow(
-        flowId: string,
-        taskText: string,
-        filesChanged: string[],
-        selectedModel?: string,
-    ): Promise<RunLocalFlowResponse> {
-        const result = await this.manager.request('POST', '/v1/flows/local/run', {
-            flow_id: flowId,
-            task_text: taskText,
-            files_changed: filesChanged,
-            selected_model: selectedModel,
-        });
-        return result as RunLocalFlowResponse;
     }
 
     async listWorkspaceRoots(): Promise<WorkspaceRootsResponse> {

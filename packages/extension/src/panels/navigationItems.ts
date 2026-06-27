@@ -27,13 +27,6 @@ export const NAVIGATION_ITEMS: NavigationItemDTO[] = [
         description: 'Active rules (global + project) and detected skills/frameworks.',
     },
     {
-        id: 'task-entry',
-        label: 'New Task',
-        icon: '$(edit)',
-        enabled: true,
-        description: 'Enter a natural language task with constraints and mode selection.',
-    },
-    {
         id: 'context-pack',
         label: 'Context Pack',
         icon: '$(package)',
@@ -46,20 +39,6 @@ export const NAVIGATION_ITEMS: NavigationItemDTO[] = [
         icon: '$(server)',
         enabled: true,
         description: 'See which model was selected, why, and available alternatives.',
-    },
-    {
-        id: 'patch-preview',
-        label: 'Diff Preview',
-        icon: '$(diff)',
-        enabled: true,
-        description: 'Review AI-generated code changes as a unified diff.',
-    },
-    {
-        id: 'approval-gate',
-        label: 'Approval Gate',
-        icon: '$(check)',
-        enabled: true,
-        description: 'Approve or reject patches before they are written to disk.',
     },
     {
         id: 'validation',
@@ -102,20 +81,6 @@ export const NAVIGATION_ITEMS: NavigationItemDTO[] = [
         icon: '$(shield)',
         enabled: true,
         description: 'Data classification: what stays local vs. what may leave.',
-    },
-    {
-        id: 'provider-matrix',
-        label: 'Provider Matrix',
-        icon: '$(table)',
-        enabled: true,
-        description: 'AI provider capabilities, costs, and privacy levels.',
-    },
-    {
-        id: 'evidence-board',
-        label: 'Evidence Board',
-        icon: '$(search)',
-        enabled: true,
-        description: 'Attached evidence sources with trust classification.',
     },
     {
         id: 'mcp-tools',

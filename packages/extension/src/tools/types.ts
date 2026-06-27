@@ -8,6 +8,11 @@ export interface MemoPilotContextInput {
     task_type_hint?: string;
 }
 
+export interface MemoPilotSymbolsInput {
+    query: string;
+    limit?: number;
+}
+
 export interface MemoPilotMemorySearchInput {
     query: string;
     limit?: number;
@@ -62,4 +67,18 @@ export interface WorkspaceProfileResponse {
 export interface MemorySearchResponse {
     rendered_markdown: string;
     items: unknown[];
+}
+
+export interface SymbolSearchResultItem {
+    name: string;
+    kind: string;
+    file_path: string;
+    start_line?: number | null;
+    end_line?: number | null;
+    signature?: string | null;
+    summary?: string | null;
+}
+
+export interface SymbolSearchResponse {
+    symbols: SymbolSearchResultItem[];
 }

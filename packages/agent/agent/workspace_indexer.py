@@ -163,7 +163,13 @@ class WorkspaceIndexer:
 
     async def _fetch_existing_hashes(self, conn: aiosqlite.Connection) -> dict[str, str]:
         cursor = await conn.execute(
-            "SELECT file_path, content_hash FROM file_index WHERE language = 'python'"
+            """
+            SELECT file_path, content_hash
+            FROM file_index
+            WHERE language = 'python'
+              AND workspace_root = ?
+            """,
+            (str(self._config.workspace_path),),
         )
         rows = await cursor.fetchall()
         return {row["file_path"]: row["content_hash"] for row in rows}
@@ -173,15 +179,16 @@ class WorkspaceIndexer:
     ) -> None:
         await conn.execute(
             """
-            INSERT INTO file_index (file_path, language, content_hash, stale)
-            VALUES (?, ?, ?, 0)
+            INSERT INTO file_index (file_path, language, content_hash, stale, workspace_root)
+            VALUES (?, ?, ?, 0, ?)
             ON CONFLICT(file_path) DO UPDATE SET
                 language=excluded.language,
                 content_hash=excluded.content_hash,
                 stale=0,
+                workspace_root=excluded.workspace_root,
                 last_indexed_at=datetime('now')
             """,
-            (file_path, language, content_hash),
+            (file_path, language, content_hash, str(self._config.workspace_path)),
         )
 
     def _read_text(self, file_path: Path) -> str:

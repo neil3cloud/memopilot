@@ -1,10 +1,17 @@
 # MemoPilot Implementation Status
 
-> Last updated: 2026-06-17 | Schema v22 | Extension v1.0.1
+> Last updated: 2026-06-27 | Schema v22 | Extension v1.0.1
 
 ## Overview
 
-MemoPilot's architecture is fully scaffolded end-to-end and **end-to-end LLM integration is now live**. The full task pipeline — analyze → context → route → patch → approve → validate → apply — runs successfully and has been verified producing real patches via GitHub Copilot. All seven pipeline stages complete without mocking.
+MemoPilot's broad platform architecture remains intact, but the default product surface has now shifted to **retrieval-first context assembly** for Copilot Chat and Cursor. The extension defaults to search-and-assemble project context, while the older task pipeline — analyze → context → route → patch → approve → validate → apply — remains available only as a legacy mode.
+
+As of this update:
+
+- Retrieval-first MCP tools are live: `memopilot-search`, `memopilot-symbols`, `memopilot-memory`, `memopilot-profile`
+- A dedicated assembled-context API is live at `/v1/context/assemble`
+- The default extension command now opens context search rather than the task-flow UI
+- Legacy patch/task flow remains implemented behind `memopilot.legacyAgentMode`
 
 ---
 
@@ -12,12 +19,14 @@ MemoPilot's architecture is fully scaffolded end-to-end and **end-to-end LLM int
 
 | Layer | Component | Status | Details |
 |-------|-----------|--------|---------|
-| **UI — Extension** | TaskEntryPanel (New Task webview) | ✅ Implemented | Card-based, stepper, step-aware buttons, approval flow |
+| **UI — Extension** | Retrieval-first default command | ✅ Implemented | `MemoPilot: Search Project Context` is now the primary entry point |
+| **UI — Extension** | TaskEntryPanel (Legacy task webview) | ✅ Implemented | Card-based task-flow UI preserved behind `memopilot.legacyAgentMode` |
 | **UI — Extension** | Sidebar views (Memory, Rules, Context Pack, etc.) | ✅ Implemented | TreeView providers for all sidebar items |
 | **UI — Extension** | Diff Preview panel | ✅ Implemented | Shows patch diffs before approval |
 | **UI — Extension** | Cost Dashboard | ✅ Implemented | Reads from backend cost tracking |
 | **Backend — API** | Task Analysis (`/v1/task/analyze`) | ⚠️ Heuristic only | Keyword-based intent detection, no LLM |
 | **Backend — API** | Context Build (`/v1/context/build`) | ✅ Implemented | Reads workspace files, counts tokens, applies rules |
+| **Backend — API** | Context Assemble (`/v1/context/assemble`) | ✅ Implemented | Returns bounded rendered markdown for retrieval-first callers |
 | **Backend — API** | Model Routing (`/v1/model/route`) | ⚠️ Mock routing | Selects model from static pool based on token count; never calls it |
 | **Backend — API** | Patch Generation (`/v1/task/generate-patch`) | ✅ Live | Real LLM via Copilot relay + provider fallback chain (host→ollama→anthropic→openai) |
 | **Backend — API** | Validation (`/v1/task/validate`) | ✅ Implemented | Runs real commands (compileall, ruff, pytest) |
@@ -47,17 +56,17 @@ MemoPilot's architecture is fully scaffolded end-to-end and **end-to-end LLM int
 
 ---
 
-## What Works End-to-End (Verified 2026-06-17)
+## What Works End-to-End (Verified 2026-06-27)
 
-1. **Full task pipeline** — user enters a task; full analyze→context→route→patch→approve→validate→apply cycle completes
-2. **Real LLM patch generation** — `generate_patch()` calls GitHub Copilot (via `HostModelClient` SSE relay), Ollama, Anthropic, or OpenAI in configured fallback order
-3. **GitHub Copilot integration** — authenticated Copilot models discovered via `vscode.lm.selectChatModels`; tokens streamed back over SSE; shown in Provider Matrix with blue `copilot` badge
+1. **Retrieval-first context assembly** — user can request project context and receive bounded rendered markdown via `/v1/context/assemble`
+2. **Retrieval-first MCP contract** — stdio MCP now exposes `memopilot-search`, `memopilot-symbols`, `memopilot-memory`, and `memopilot-profile`
+3. **GitHub Copilot integration** — authenticated Copilot models discovered via `vscode.lm.selectChatModels`; tool integration remains active in VS Code
 4. **Local workspace analysis** — file indexing, rules, memory, skill loading
-5. **Context packing** — collects relevant files, counts tokens, estimates cost
-6. **Model routing** — config-driven fallback order; `host` always tried first; falls through gracefully if unavailable
-7. **Validation** — runs real linters/compilers on workspace
-8. **Cost tracking** — records per-call costs, enforces budgets
-9. **Approval gate** — requires explicit user action before applying patches
+5. **Context packing and rendering** — collects relevant files, counts tokens, estimates cost, and renders bounded markdown
+6. **Legacy full task pipeline** — analyze→context→route→patch→approve→validate→apply still completes when legacy mode is enabled
+7. **Real LLM patch generation** — `generate_patch()` still calls GitHub Copilot (via `HostModelClient` SSE relay), Ollama, Anthropic, or OpenAI in configured fallback order
+8. **Validation** — runs real linters/compilers on workspace
+9. **Cost tracking** — records per-call costs, enforces budgets
 10. **Patch apply with rollback** — snapshots files before write; rolls back on failure; preserves root error
 
 ---
