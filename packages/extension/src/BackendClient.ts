@@ -590,21 +590,6 @@ export class BackendClient {
         return result as ContextPackDiffResponse;
     }
 
-    async assessPatchRiskAndCompliance(
-        taskRunId: string,
-        diffText: string,
-        filesChanged: string[],
-        activeRules: string[],
-    ): Promise<PatchAssessmentResponse> {
-        const result = await this.manager.request('POST', '/v1/patch/assess', {
-            task_run_id: taskRunId,
-            diff_text: diffText,
-            files_changed: filesChanged,
-            active_rules: activeRules,
-        });
-        return result as PatchAssessmentResponse;
-    }
-
     async listProviderCapabilities(): Promise<ProviderCapabilitiesResponse> {
         const result = await this.manager.request('GET', '/v1/providers/capabilities');
         return result as ProviderCapabilitiesResponse;

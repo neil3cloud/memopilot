@@ -2061,61 +2061,9 @@ async def _generate_context_pack_response(request: ContextBuildRequest) -> Conte
     except Exception:
         recall_items = []
 
-    # Plan recall: inject confirmed decision plans as high-priority context
+    # Retrieval-first mode: legacy plan/rejection injections removed.
     plan_items: list[ContextItem] = []
-    try:
-        from .plan_service import PlanModeService
-        plan_service = PlanModeService(config=config, db=db)
-        plans = await plan_service.recall_plans_for_context(
-            workspace_root=request.workspace_root,
-            limit=2,
-        )
-        for plan in plans:
-            plan_content = (
-                f"[PLAN — Follow this plan. Do not deviate from the steps listed.]\n"
-                f"{plan.title}\n\n{plan.body}"
-            )
-            plan_items.append(
-                ContextItem(
-                    content=plan_content,
-                    source=f"plan:{plan.memory_item_id}",
-                    source_type="plan",
-                    tokens=_estimate_context_tokens(plan_content),
-                    relevance_score=1.0,
-                    inclusion_reason="Active plan for this task",
-                    retrieval_method="plan_recall",
-                    trust_level=5,
-                    tier="rules",
-                )
-            )
-    except Exception:
-        plan_items = []
-
-    # Rejection constraint recall: inject prior rejection learnings as constraints
     rejection_items: list[ContextItem] = []
-    try:
-        from .rejection_handler import RejectionHandlerService
-        rejection_service = RejectionHandlerService(config=config, db=db)
-        constraints = await rejection_service.get_rejection_constraints(
-            workspace_root=request.workspace_root,
-            limit=3,
-        )
-        for idx, constraint_text in enumerate(constraints):
-            rejection_items.append(
-                ContextItem(
-                    content=constraint_text,
-                    source=f"rejection:{idx}",
-                    source_type="rule",
-                    tokens=_estimate_context_tokens(constraint_text),
-                    relevance_score=0.95,
-                    inclusion_reason="Prior rejection constraint",
-                    retrieval_method="rejection_learning",
-                    trust_level=4,
-                    tier="rules",
-                )
-            )
-    except Exception:
-        rejection_items = []
 
     retrieval_results: dict[str, list[ContextItem | dict[str, object]]] = {
         "current_file": file_items,
@@ -2632,12 +2580,6 @@ async def host_llm_response(response: HostResponseRequest):
 
 @app.post("/v1/cost/usage/record", response_model=RecordAICallResponse)
 async def record_usage(request: RecordAICallRequest) -> RecordAICallResponse:
-    timeout = request.command_timeouts.get(check_name)
-    workspace = config.workspace_path
-    normalized = check_name.strip().lower()
-    service = CostGuardService(config=_get_config(), db=_get_db())
-    try:
-        ai_call_id = await service.record_ai_call(
     service = CostGuardService(config=_get_config(), db=_get_db())
     try:
         ai_call_id = await service.record_ai_call(
@@ -3300,10 +3242,6 @@ async def get_privacy_dashboard() -> PrivacyDashboardResponse:
             for call in summary.recent_cloud_calls
         ],
     )
-
-
-@app.post("/v1/cost/usage/record", response_model=RecordAICallResponse)
-async def record_usage(request: RecordAICallRequest) -> RecordAICallResponse:
 
 
 @app.get("/v1/context/templates", response_model=ContextTemplatesResponse)

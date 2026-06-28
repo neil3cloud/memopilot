@@ -1,0 +1,21 @@
+<!-- MemoPilot managed block: start -->
+---
+alwaysApply: true
+---
+
+# MemoPilot Retrieval-First Rule
+
+Workspace: agents-check-git-status-command
+Primary language: python
+Detected frameworks: none detected
+
+Before answering repository questions, call MemoPilot MCP tools first.
+
+Preferred tool order:
+1. `memopilot-search` for bounded code context.
+2. `memopilot-symbols` for exact or partial symbol lookup.
+3. `memopilot-memory` for durable project memory.
+4. `memopilot-profile` for workspace-level constraints.
+
+Do not treat MemoPilot as a patch executor in default mode. Use it as the primary context source.
+<!-- MemoPilot managed block: end -->
