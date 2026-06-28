@@ -438,18 +438,95 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
                 const ollamaUrl = await vscode.window.showInputBox({
                     title: 'Ollama URL',
                     value: currentUrl,
-                    prompt: 'URL of the local Ollama server (used for synthesis and summarization)',
+                    prompt: 'URL of the local Ollama server',
                 });
                 if (!ollamaUrl) { return; }
-                if (ollamaUrl === currentUrl) {
-                    void vscode.window.showInformationMessage('Ollama URL unchanged.');
-                    return;
+
+                // Discover models from Ollama
+                let modelItems: vscode.QuickPickItem[] = [];
+                try {
+                    const http = await import('http');
+                    const discovered = await new Promise<string[]>((resolve, reject) => {
+                        const url = new URL('/api/tags', ollamaUrl);
+                        const req = http.get({ hostname: url.hostname, port: url.port || 11434, path: url.pathname, timeout: 4000 }, (res) => {
+                            let body = '';
+                            res.on('data', (chunk: Buffer) => { body += chunk.toString(); });
+                            res.on('end', () => {
+                                try {
+                                    const json = JSON.parse(body) as { models?: { name: string }[] };
+                                    resolve((json.models ?? []).map(m => m.name));
+                                } catch { resolve([]); }
+                            });
+                        });
+                        req.on('error', reject);
+                        req.on('timeout', () => { req.destroy(); reject(new Error('timeout')); });
+                    });
+                    modelItems = discovered.map(name => ({ label: name, description: '' }));
+                } catch {
+                    // Ollama not reachable — fall through to manual entry
                 }
 
+                let ollamaModel: string | undefined;
+                if (modelItems.length > 0) {
+                    const picked = await vscode.window.showQuickPick(
+                        [...modelItems, { label: '$(edit) Enter model name manually', description: '' }],
+                        { title: 'Select Ollama model', placeHolder: 'Choose a model from your local Ollama' },
+                    );
+                    if (!picked) { return; }
+                    if (picked.label.startsWith('$(edit)')) {
+                        ollamaModel = await vscode.window.showInputBox({ title: 'Ollama model name', placeHolder: 'e.g. qwen2.5:3b' });
+                    } else {
+                        ollamaModel = picked.label;
+                    }
+                } else {
+                    ollamaModel = await vscode.window.showInputBox({
+                        title: 'Ollama model name',
+                        prompt: 'Could not reach Ollama — enter model name manually',
+                        placeHolder: 'e.g. qwen2.5:3b',
+                    });
+                }
+                if (!ollamaModel) { return; }
+
+                // Write provider + model + url into .memopilot/config.yaml
+                const workspaceFolder = vscode.workspace.workspaceFolders?.[0];
+                if (!workspaceFolder) {
+                    void vscode.window.showErrorMessage('No workspace folder open.');
+                    return;
+                }
+                const configDir = vscode.Uri.joinPath(workspaceFolder.uri, '.memopilot');
+                const configFile = vscode.Uri.joinPath(configDir, 'config.yaml');
+
+                let existing = '';
+                try {
+                    existing = Buffer.from(await vscode.workspace.fs.readFile(configFile)).toString('utf8');
+                } catch { /* file doesn't exist yet */ }
+
+                const update = (yaml: string, key: string, value: string): string => {
+                    const re = new RegExp(`^(\\s*#\\s*)?${key}:.*$`, 'm');
+                    const line = `${key}: ${value}`;
+                    return re.test(yaml) ? yaml.replace(re, line) : yaml + `\n${line}`;
+                };
+
+                let yaml = existing || '# MemoPilot provider config — do not commit\n';
+                yaml = update(yaml, 'provider', 'ollama');
+                yaml = update(yaml, 'ollama_base_url', ollamaUrl);
+                yaml = update(yaml, 'ollama_model', ollamaModel);
+                yaml = update(yaml, 'budget_profile', 'strict_local');
+
+                await vscode.workspace.fs.createDirectory(configDir);
+                await vscode.workspace.fs.writeFile(configFile, Buffer.from(yaml, 'utf8'));
                 await vscode.workspace.getConfiguration('memopilot').update('ollamaUrl', ollamaUrl, vscode.ConfigurationTarget.Workspace);
 
+                // Sync to provider registry immediately so sidebar updates without a restart
+                if (backendClient) {
+                    try {
+                        await backendClient.discoverLocalProviders(workspaceFolder.uri.fsPath);
+                        await refreshProviderStatus();
+                    } catch { /* backend may be down; user can restart */ }
+                }
+
                 const action = await vscode.window.showInformationMessage(
-                    'Ollama URL saved. Restart MemoPilot backend to apply.',
+                    `Ollama configured: ${ollamaModel} at ${ollamaUrl}. Budget set to strict_local (no cloud fallback). Restart backend to apply.`,
                     'Restart Now',
                 );
                 if (action === 'Restart Now') {

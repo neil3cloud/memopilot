@@ -18,3 +18,21 @@ Behavioral rules:
 - Do not assume MemoPilot applies patches or owns file mutation in default mode.
 - If MemoPilot context is insufficient, say what is missing instead of inventing details.
 <!-- MemoPilot managed block: end -->
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

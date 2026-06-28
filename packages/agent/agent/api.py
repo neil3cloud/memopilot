@@ -51,7 +51,7 @@ from .endpoint_registry import ENDPOINT_STATUS
 from .git_history_indexer import GitHistoryIndexer
 from .graph_retriever import GraphRetriever
 from .image_analysis import ImageAnalysisResult, analyze_image
-from .llm_client import build_client
+from .llm_client import BaseLLMClient, build_client
 from .local_model_discovery import discover_all_local
 from .mcp_orchestrator import MCPDispatcher, MCPOrchestrator, ToolCall
 from .memory_manager_service import MemoryManagerService
@@ -68,6 +68,8 @@ from .retention import enforce_retention
 from .security_policy import CredentialRedactor, DatabaseWriteBlocker
 from .skill_loader import SkillLoaderService
 from .vector_backfill_service import VectorBackfillService
+from .context_synthesizer import ContextSynthesizer
+from .symbol_summarizer import SymbolSummarizer
 from .workspace_indexer import WorkspaceIndexer
 from .workspace_init import ensure_global_config, generate_workspace_bootstrap
 from .workspace_profile_service import WorkspaceProfileService
@@ -83,6 +85,9 @@ _db: DatabaseManager | None = None
 _expected_token: str | None = None
 _retention_task: asyncio.Task[None] | None = None
 _RETENTION_INTERVAL_SECONDS = 6 * 60 * 60
+_synthesizer: ContextSynthesizer | None = None
+_writeback_client: BaseLLMClient | None = None
+_symbol_summarizer: SymbolSummarizer | None = None
 
 # Host model relay state — extension acts as LLM proxy for VS Code Copilot
 _task_sse_queues: dict[str, asyncio.Queue] = {}
@@ -1316,13 +1321,57 @@ async def _retention_loop() -> None:
 
 @app.on_event("startup")
 async def startup_event() -> None:
-    global _retention_task
+    global _retention_task, _synthesizer, _writeback_client, _symbol_summarizer
     try:
         await _run_retention_pass()
     except Exception:
         logger.exception("Startup retention enforcement failed")
     if _retention_task is None or _retention_task.done():
         _retention_task = asyncio.create_task(_retention_loop())
+    try:
+        await _seed_local_providers()
+    except Exception:
+        logger.exception("Startup local provider seeding failed")
+    try:
+        cfg = load_provider_config(str(_get_config().workspace_path))
+        _llm_client = build_client(cfg.get("provider", "host"), cfg)
+        _synthesizer = ContextSynthesizer(_llm_client)
+        _writeback_client = _llm_client
+        _symbol_summarizer = SymbolSummarizer(_llm_client)
+    except (ValueError, KeyError):
+        _synthesizer = None
+        _writeback_client = None
+        _symbol_summarizer = None
+
+
+async def _seed_local_providers() -> None:
+    """Discover running local models and register them in the provider registry."""
+    from .local_model_discovery import discover_all_local
+    from .provider_registry import ProviderCapabilityRecord, ProviderRegistryService
+
+    config = _get_config()
+    models = await discover_all_local({"ollama_base_url": config.ollama_url})
+    if not models:
+        return
+
+    service = ProviderRegistryService(config=config, db=_get_db())
+    for m in models:
+        await service.upsert_provider_capability(
+            ProviderCapabilityRecord(
+                model_id=m.model_id,
+                source=m.source,
+                max_context_tokens=m.max_context_tokens,
+                supports_tool_calling=m.supports_tools,
+                supports_json_mode=False,
+                estimated_cost_per_1m_input=0.0,
+                estimated_cost_per_1m_output=0.0,
+                privacy_level="local",
+                allowed_task_types=[],
+                denied_task_types=[],
+                requires_approval=False,
+            )
+        )
+    logger.info("Seeded %d local model(s) into provider registry", len(models))
 
 
 @app.on_event("shutdown")
@@ -1469,8 +1518,10 @@ async def index_workspace(request: WorkspaceIndexRequest | None = None) -> Works
     db = _get_db()
     seed_memory = request.seed_memory if request is not None else True
 
-    indexer = WorkspaceIndexer(config=config, db=db)
+    indexer = WorkspaceIndexer(config=config, db=db, summarizer=_symbol_summarizer)
     result = await indexer.index_workspace()
+    if _symbol_summarizer is not None and result.indexed_files > 0:
+        asyncio.create_task(indexer._summarize_pending_symbols())
     profile_service = WorkspaceProfileService(config=config, db=db)
     await profile_service.ensure_profile()
     memory_items_seeded = 0
@@ -2264,7 +2315,25 @@ async def assemble_context(request: ContextAssembleRequest) -> ContextAssembleRe
             max_output_tokens=request.max_output_tokens,
         )
     )
-    return _render_assembled_context(request=request, context_pack=context_pack)
+    response = _render_assembled_context(request=request, context_pack=context_pack)
+
+    if (
+        _synthesizer is not None
+        and request.caller == "copilot_lm_tool"
+        and response.total_tokens > 1000
+    ):
+        try:
+            synthesized = await _synthesizer.synthesize(
+                task=request.task_description,
+                raw_markdown=response.rendered_markdown,
+                max_tokens=request.max_output_tokens or 4000,
+            )
+            response.rendered_markdown = synthesized
+            response.total_tokens = len(synthesized) // 4
+        except Exception:
+            pass  # fall back to unsynthesized context on any error
+
+    return response
 
 
 @app.post("/v1/context/build", response_model=ContextBuildResponse, deprecated=True)
@@ -2882,7 +2951,7 @@ async def run_agentic_mcp(request: AgenticRunRequest) -> AgenticRunResponse:
     except ValueError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
 
-    return AgenticRunResponse(
+    agentic_response = AgenticRunResponse(
         requested_iterations=result.requested_iterations,
         executed_iterations=result.executed_iterations,
         capped_at=result.capped_at,
@@ -2899,6 +2968,26 @@ async def run_agentic_mcp(request: AgenticRunRequest) -> AgenticRunResponse:
             for call in result.calls
         ],
     )
+
+    if result.calls and _writeback_client is not None:
+        outcome = result.calls[-1].result_summary
+        captured_client = _writeback_client
+        seeder = MemorySeederService(config=_get_config(), db=_get_db())
+
+        async def _writeback_task() -> None:
+            try:
+                count = await seeder.writeback_from_task(
+                    client=captured_client,
+                    task_description=request.context,
+                    outcome=outcome,
+                )
+                logger.debug("Task writeback: %d fact(s) stored", count)
+            except Exception as exc:
+                logger.debug("Task writeback failed (non-fatal): %s", exc)
+
+        asyncio.create_task(_writeback_task())
+
+    return agentic_response
 
 
 @app.post("/v1/provider/test-call", response_model=ProviderTestResponse)

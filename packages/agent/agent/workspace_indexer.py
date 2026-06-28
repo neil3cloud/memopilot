@@ -14,6 +14,9 @@ from .db import DatabaseManager
 from .graph_retriever import GraphRetriever
 from .project_scanner import WorkspaceScanner
 from .symbol_extractor import SymbolExtractor
+from .symbol_summarizer import SymbolSummarizer
+
+_SUMMARY_CAP_PER_RUN = 50
 
 
 @dataclass(frozen=True)
@@ -38,11 +41,13 @@ class WorkspaceIndexer:
         db: DatabaseManager,
         scanner: WorkspaceScanner | None = None,
         symbol_extractor: SymbolExtractor | None = None,
+        summarizer: SymbolSummarizer | None = None,
     ) -> None:
         self._config = config
         self._db = db
         self._scanner = scanner or WorkspaceScanner(config.workspace_path)
         self._symbol_extractor = symbol_extractor or SymbolExtractor()
+        self._summarizer = summarizer
 
     async def index_workspace(self) -> WorkspaceIndexResult:
         started_at = time.perf_counter()
@@ -152,8 +157,51 @@ class WorkspaceIndexer:
             duration_ms=duration_ms,
         )
 
+    async def _summarize_pending_symbols(self) -> None:
+        """Background task: fill NULL summaries for function/class symbols.
+
+        Reads each symbol's own source lines from disk (not the full file),
+        so the LLM sees only the relevant code. Runs up to _SUMMARY_CAP_PER_RUN
+        summarizations per call and commits each result immediately so partial
+        progress is preserved if cancelled.
+        """
+        if self._summarizer is None:
+            return
+        conn = await self._db.connect()
+        cursor = await conn.execute(
+            """
+            SELECT s.id, s.file_path, s.name, s.kind, s.signature, s.start_line, s.end_line
+            FROM symbols s
+            JOIN file_index fi ON fi.file_path = s.file_path
+            WHERE s.summary IS NULL
+              AND s.kind IN ('function', 'class')
+              AND fi.stale = 0
+            LIMIT ?
+            """,
+            (_SUMMARY_CAP_PER_RUN,),
+        )
+        rows = await cursor.fetchall()
+        for row in rows:
+            try:
+                lines = self._read_text(
+                    self._config.workspace_path / row["file_path"]
+                ).splitlines()
+                symbol_source = "\n".join(lines[row["start_line"] - 1 : row["end_line"]])
+                summary = await self._summarizer.summarize(
+                    name=row["name"],
+                    kind=row["kind"],
+                    signature=row["signature"] or "",
+                    source=symbol_source,
+                )
+                await conn.execute(
+                    "UPDATE symbols SET summary = ? WHERE id = ?",
+                    (summary, row["id"]),
+                )
+                await conn.commit()
+            except Exception:
+                pass  # never fail due to LLM error
+
     async def rebuild_memory(self) -> WorkspaceIndexResult:
-        """Rebuild indexed file/symbol memory from source files."""
         conn = await self._db.connect()
         await conn.execute("DELETE FROM symbols")
         await conn.execute("DELETE FROM file_index")
