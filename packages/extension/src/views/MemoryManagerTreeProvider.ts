@@ -59,6 +59,10 @@ export class MemoryManagerTreeProvider implements vscode.TreeDataProvider<vscode
         return this.items;
     }
 
+    getPendingItems(): MemoryItemResponse[] {
+        return this.items.filter((item) => this.isPending(item));
+    }
+
     async refresh(): Promise<void> {
         if (!this.client) {
             this.items = [];
@@ -149,10 +153,15 @@ export class MemoryManagerTreeProvider implements vscode.TreeDataProvider<vscode
             ...items.slice(0, 50).map((item) => {
                 const trustEmoji = this.trustEmoji(item.trust_level);
                 const staleLabel = item.stale ? 'stale' : 'fresh';
-                const pending = this.isPending(item) ? 'pending' : 'active';
+                const isPending = this.isPending(item);
+                const pendingLabel = isPending ? 'pending' : 'active';
                 const treeItem = new vscode.TreeItem(`${trustEmoji} ${item.title}`);
-                treeItem.description = `${item.type} • trust ${item.trust_level} • ${pending} • ${staleLabel}`;
+                treeItem.description = `${item.type} • trust ${item.trust_level} • ${pendingLabel} • ${staleLabel}`;
                 treeItem.tooltip = `${item.body}\n\nid=${item.id}`;
+                // contextValue drives inline approve/reject buttons via package.json menus
+                treeItem.contextValue = isPending ? 'pending' : 'confirmed';
+                // Store item id so command handlers can retrieve it
+                (treeItem as vscode.TreeItem & { memopilotItemId?: string }).memopilotItemId = item.id;
                 return treeItem;
             }),
         ];

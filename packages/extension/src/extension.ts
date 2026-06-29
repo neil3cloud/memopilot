@@ -514,6 +514,61 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         }
     };
 
+    const approveMemoryItem = async (treeItem: vscode.TreeItem & { memopilotItemId?: string }) => {
+        const client = ensureBackendClient();
+        if (!client) { return; }
+        const id = treeItem?.memopilotItemId;
+        if (!id) { return; }
+        try {
+            await client.approveMemoryItem(id);
+            await memoryProvider.refresh();
+        } catch (err: unknown) {
+            const msg = err instanceof Error ? err.message : String(err);
+            void vscode.window.showErrorMessage(`MemoPilot approve failed: ${msg}`);
+        }
+    };
+
+    const rejectMemoryItem = async (treeItem: vscode.TreeItem & { memopilotItemId?: string }) => {
+        const client = ensureBackendClient();
+        if (!client) { return; }
+        const id = treeItem?.memopilotItemId;
+        if (!id) { return; }
+        try {
+            await client.rejectMemoryItem(id);
+            await memoryProvider.refresh();
+        } catch (err: unknown) {
+            const msg = err instanceof Error ? err.message : String(err);
+            void vscode.window.showErrorMessage(`MemoPilot reject failed: ${msg}`);
+        }
+    };
+
+    const bulkApproveMemory = async () => {
+        const client = ensureBackendClient();
+        if (!client) { return; }
+        await memoryProvider.refresh();
+        const pending = memoryProvider.getPendingItems();
+        if (pending.length === 0) {
+            void vscode.window.showInformationMessage('MemoPilot: No pending memory items to approve.');
+            return;
+        }
+        const confirm = await vscode.window.showWarningMessage(
+            `Approve all ${pending.length} pending memory item${pending.length === 1 ? '' : 's'}?`,
+            { modal: true },
+            'Approve All',
+        );
+        if (confirm !== 'Approve All') { return; }
+        try {
+            await Promise.all(pending.map((item) => client.approveMemoryItem(item.id)));
+            await memoryProvider.refresh();
+            void vscode.window.showInformationMessage(
+                `MemoPilot: Approved ${pending.length} memory item${pending.length === 1 ? '' : 's'}.`,
+            );
+        } catch (err: unknown) {
+            const msg = err instanceof Error ? err.message : String(err);
+            void vscode.window.showErrorMessage(`MemoPilot bulk approve failed: ${msg}`);
+        }
+    };
+
     const showPrivacyDashboard = async () => {
         const client = ensureBackendClient();
         if (!client) { return; }
@@ -1057,6 +1112,9 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         vscode.commands.registerCommand('memopilot.validateWorkspaceProfile', validateWorkspaceProfile),
         vscode.commands.registerCommand('memopilot.exportWorkspaceProfile', exportWorkspaceProfile),
         vscode.commands.registerCommand('memopilot.reviewMemory', reviewMemory),
+        vscode.commands.registerCommand('memopilot.approveMemoryItem', approveMemoryItem),
+        vscode.commands.registerCommand('memopilot.rejectMemoryItem', rejectMemoryItem),
+        vscode.commands.registerCommand('memopilot.bulkApproveMemory', bulkApproveMemory),
         vscode.commands.registerCommand('memopilot.refreshMemoryReviewQueue', async () => {
             await memoryProvider.refresh();
         }),
