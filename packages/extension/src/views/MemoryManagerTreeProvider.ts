@@ -22,9 +22,29 @@ export class MemoryManagerTreeProvider implements vscode.TreeDataProvider<vscode
     private items: MemoryItemResponse[] = [];
     private treeItems: vscode.TreeItem[] = [new vscode.TreeItem('Memory Manager not loaded yet.')];
     private _pollTimer: ReturnType<typeof setInterval> | undefined;
+    private _reindexing = false;
 
     setClient(client: BackendClient | undefined): void {
         this.client = client;
+    }
+
+    setReindexing(flag: boolean): void {
+        this._reindexing = flag;
+        if (flag) {
+            this.items = [];
+            this.treeItems = this._reindexingTreeItems();
+            this._onDidChangeTreeData.fire(undefined);
+            this._startPolling();
+        } else {
+            this._stopPolling();
+        }
+    }
+
+    private _reindexingTreeItems(): vscode.TreeItem[] {
+        const spinner = new vscode.TreeItem('Re-indexing workspace...');
+        spinner.iconPath = new vscode.ThemeIcon('sync~spin');
+        spinner.description = 'Memory items will appear after summarization.';
+        return [spinner];
     }
 
     setFilter(filter: MemoryFilter): void {
@@ -43,6 +63,14 @@ export class MemoryManagerTreeProvider implements vscode.TreeDataProvider<vscode
         if (!this.client) {
             this.items = [];
             this.treeItems = [new vscode.TreeItem('Backend not connected.')];
+            this._onDidChangeTreeData.fire(undefined);
+            return;
+        }
+
+        // While a full reindex is in flight, keep showing the reindexing spinner
+        // rather than fetching stale data from the backend mid-operation.
+        if (this._reindexing) {
+            this.treeItems = this._reindexingTreeItems();
             this._onDidChangeTreeData.fire(undefined);
             return;
         }

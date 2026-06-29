@@ -245,7 +245,7 @@ AI coding assistants are powerful — but uncontrolled. They send too much conte
 |---------|---------|-------------|
 | `memopilot.pythonPath` | `""` (auto-detect) | Path to Python interpreter for the backend |
 | `memopilot.backendLogLevel` | `"info"` | Log level: `debug`, `info`, `warning`, `error` |
-| `memopilot.summarizationBatchSize` | `25` | Symbols per LLM request during summarization: `25`, `50`, `75`, or `100`. Higher values are faster but may hit rate limits |
+| `memopilot.summarizationBatchSize` | `25` | Symbols per LLM request during summarization: `25`, `50`, or `75`. Higher values are faster but may hit rate limits |
 
 ### Workspace Settings (`.memopilot/settings.yaml`)
 

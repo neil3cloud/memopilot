@@ -166,6 +166,10 @@ class SymbolExtractor:
                 rel_id = make_relationship_id(
                     from_sym.id, callee_name, "calls", None
                 )
+                # Position Jedi at the last char of the callable expression so
+                # goto() resolves the method/function, not the receiver object.
+                func_end_line = getattr(node.func, "end_lineno", node.lineno)
+                func_end_col = max(0, getattr(node.func, "end_col_offset", node.col_offset) - 1)
                 relationships.append(
                     SymbolRelationshipRecord(
                         id=rel_id,
@@ -176,6 +180,8 @@ class SymbolExtractor:
                         to_file_path=None,
                         relation_type="calls",
                         workspace_root=workspace_root,
+                        call_line=func_end_line,
+                        call_col=func_end_col,
                     )
                 )
 
