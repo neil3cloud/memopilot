@@ -280,12 +280,11 @@
         },
         "memopilot.summarizationBatchSize": {
           "type": "number",
-          "enum": [25, 50, 75, 100],
+          "enum": [25, 50, 75],
           "enumDescriptions": [
             "25 symbols per request (recommended, lowest rate-limit risk)",
             "50 symbols per request",
-            "75 symbols per request",
-            "100 symbols per request (fastest, highest rate-limit risk)"
+            "75 symbols per request"
           ],
           "default": 25,
           "description": "Number of symbols sent in a single LLM request during summarization. Higher values are faster but may hit rate limits."

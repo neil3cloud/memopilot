@@ -36,6 +36,9 @@ class SymbolRelationshipRecord:
     to_file_path: str | None
     relation_type: str
     workspace_root: str
+    # Position of the call site in source — used by JediResolver, never stored in SQLite
+    call_line: int | None = None
+    call_col: int | None = None
 
 
 def make_relationship_id(

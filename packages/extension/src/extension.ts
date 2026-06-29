@@ -212,6 +212,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 
         try {
             workspaceIndexingInFlight = true;
+            memoryProvider.setReindexing(true);
             await vscode.window.withProgress(
                 {
                     location: vscode.ProgressLocation.Notification,
@@ -223,7 +224,6 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
                     vscode.window.showInformationMessage(
                         `MemoPilot: ${result.symbols_extracted} symbols extracted. Summarization running in background.`,
                     );
-                    await memoryProvider.refresh();
                 },
             );
         } catch (err: unknown) {
@@ -231,6 +231,8 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
             void vscode.window.showErrorMessage(`MemoPilot reindex failed: ${msg}`);
         } finally {
             workspaceIndexingInFlight = false;
+            memoryProvider.setReindexing(false);
+            await memoryProvider.refresh();
         }
     };
 

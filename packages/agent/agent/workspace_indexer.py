@@ -12,7 +12,8 @@ import aiosqlite
 
 from .config import Config
 from .db import DatabaseManager
-from .graph_retriever import GraphRetriever
+from .graph_retriever import GraphRetriever, SymbolRelationshipRecord
+from .jedi_resolver import JediResolver
 from .project_scanner import WorkspaceScanner
 from .symbol_extractor import SymbolExtractor
 from .symbol_summarizer import SymbolSummarizer
@@ -52,6 +53,7 @@ class WorkspaceIndexer:
         self._scanner = scanner or WorkspaceScanner(config.workspace_path)
         self._symbol_extractor = symbol_extractor or SymbolExtractor()
         self._summarizer = summarizer
+        self._jedi_resolver = JediResolver(str(config.workspace_path))
 
     async def index_workspace(self) -> WorkspaceIndexResult:
         started_at = time.perf_counter()
@@ -131,6 +133,12 @@ class WorkspaceIndexer:
                 symbols=list(symbols),
                 workspace_root=str(self._config.workspace_path),
             )
+            relationships = await self._resolve_cross_module_calls(
+                conn=conn,
+                source=content,
+                abs_file_path=str(self._config.workspace_path / rel_path),
+                relationships=relationships,
+            )
             graph = GraphRetriever(db=self._db)
             await graph.store_relationships(conn, relationships)
 
@@ -172,6 +180,95 @@ class WorkspaceIndexer:
             symbols_extracted=symbols_extracted,
             duration_ms=duration_ms,
         )
+
+    async def _resolve_cross_module_calls(
+        self,
+        *,
+        conn: aiosqlite.Connection,
+        source: str,
+        abs_file_path: str,
+        relationships: list[SymbolRelationshipRecord],
+    ) -> list[SymbolRelationshipRecord]:
+        """Enrich to_symbol_id for cross-module call relationships using Jedi.
+
+        Only runs when jedi is installed. Falls back silently to the unchanged
+        relationship list if Jedi is unavailable or resolves nothing.
+        """
+        if not self._jedi_resolver.available:
+            return relationships
+
+        unresolved = [
+            (r.call_line, r.call_col, r.id)
+            for r in relationships
+            if r.relation_type == "calls"
+            and r.to_symbol_id is None
+            and r.call_line is not None
+            and r.call_col is not None
+        ]
+        if not unresolved:
+            return relationships
+
+        resolved = self._jedi_resolver.resolve(
+            source=source,
+            abs_file_path=abs_file_path,
+            call_sites=unresolved,
+        )
+        if not resolved:
+            return relationships
+
+        # Build lookup: rel_id → (relative_file_path, bare_name)
+        workspace_root = str(self._config.workspace_path)
+        resolution_map: dict[str, tuple[str, str]] = {}
+        for rc in resolved:
+            try:
+                rel = Path(rc.module_path).relative_to(workspace_root)
+                resolution_map[rc.rel_id] = (rel.as_posix(), rc.bare_name)
+            except ValueError:
+                pass
+
+        if not resolution_map:
+            return relationships
+
+        enriched: list[SymbolRelationshipRecord] = []
+        for rel in relationships:
+            if rel.id not in resolution_map:
+                enriched.append(rel)
+                continue
+
+            target_file, bare_name = resolution_map[rel.id]
+            # Find the symbol in the target file — methods are stored as
+            # "ClassName.method_name", top-level functions as "method_name".
+            cursor = await conn.execute(
+                """
+                SELECT id FROM symbols
+                WHERE file_path = ?
+                  AND (name = ? OR name LIKE ?)
+                LIMIT 1
+                """,
+                (target_file, bare_name, f"%.{bare_name}"),
+            )
+            row = await cursor.fetchone()
+            if row:
+                enriched.append(SymbolRelationshipRecord(
+                    id=rel.id,
+                    from_symbol_id=rel.from_symbol_id,
+                    to_symbol_id=row["id"],
+                    to_symbol_name=rel.to_symbol_name,
+                    to_file_path=target_file,
+                    relation_type=rel.relation_type,
+                    workspace_root=rel.workspace_root,
+                ))
+            else:
+                enriched.append(rel)
+
+        resolved_count = sum(1 for r in enriched if r.to_symbol_id is not None
+                             and r.id in resolution_map)
+        if resolved_count:
+            logger.debug(
+                "_resolve_cross_module_calls: resolved %d/%d cross-module calls in %s",
+                resolved_count, len(unresolved), abs_file_path,
+            )
+        return enriched
 
     async def _summarize_pending_symbols(self, batch_size: int = _DEFAULT_BATCH_SIZE) -> None:
         """Background task: fill NULL summaries for function/class symbols.
