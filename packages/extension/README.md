@@ -1,8 +1,8 @@
 # MemoPilot for VS Code
 
-> **Rule-Aware, Local-Memory, Cost-Governed AI Development Agent**
+> **Retrieval-First Context System for VS Code Copilot and Cursor**
 
-MemoPilot is a VS Code extension that gives you full governance over AI-assisted coding. It builds local project memory, enforces your team's rules, controls model costs, and never applies code without your approval.
+MemoPilot is a VS Code/Cursor extension that indexes your workspace, builds local project memory, and supplies governed, rule-aware context to Copilot Chat and Cursor before cloud LLM calls are made. It uses **GitHub Copilot** (via the VS Code Language Model API) as its primary LLM — no API key required. Local model (Ollama/LM Studio) and cloud API modes are also supported and switchable at any time.
 
 ---
 
@@ -12,11 +12,11 @@ AI coding assistants are powerful — but uncontrolled. They send too much conte
 
 | Problem | How MemoPilot Solves It |
 |---------|------------------------|
+| Copilot lacks project context | Indexes workspace symbols and assembles a bounded, relevant context block before each chat |
 | AI ignores your project conventions | Loads and enforces global + workspace rules before every task |
-| No visibility into what AI receives | Shows a complete, inspectable **Context Pack** before any AI call |
-| Expensive frontier model usage | Routes tasks to the cheapest capable model; enforces monthly budgets |
-| AI modifies code without permission | **Approval gate** — no patch is applied without explicit developer consent |
-| No memory between sessions | Builds persistent local memory from your source code, decisions, and validations |
+| No memory between sessions | Builds persistent local memory from source code, decisions, and session activity |
+| Copilot answers feel generic | Symbol summaries, call graph, and git history give Copilot accurate project-specific context |
+| Hard to know what AI is using | Shows a complete, inspectable **Context Pack** before any AI call |
 | Secrets leak into AI context | Redacts credentials from context packs using `detect-secrets` |
 | Can't investigate bugs with evidence | Investigation mode ingests logs, PDFs, screenshots, and work items as structured evidence |
 
@@ -61,15 +61,13 @@ AI coding assistants are powerful — but uncontrolled. They send too much conte
 - Context pack diffing shows what changed between versions
 - **Context quality score** — 6-factor weighted score with verdict (good/acceptable/poor/rebuild) visible in sidebar before patching
 
-### 🤖 Cost-Aware Model Routing
-- Routes tasks: **GitHub Copilot (host)** → local model → cheap cloud → frontier (only when needed)
-- **GitHub Copilot first** — if you're authenticated, Copilot is used with no API key required; tokens streamed via the VS Code Language Model API
-- **Outcome-based escalation** — if a module fails 2+ times with cheaper models, automatically routes to frontier
-- Per-model cost comparison shown before every AI call (all tiers side by side)
-- Inline model override — switch models without restarting the task
-- Routing reason explains both the decision and what would trigger escalation
-- Monthly budget enforcement with graduated response (80% warning → 90% frontier approval → 100% block)
-- Budget profiles: `balanced`, `cost_saver`, `strict_local`, `enterprise_privacy`
+### 🤖 LLM Mode Toggle
+- **Three modes:** Copilot (default), Local (Ollama/LM Studio), Cloud (OpenAI/Anthropic)
+- Switch mode any time via **MemoPilot: Switch LLM Mode** — no restart needed
+- **Copilot mode** uses `vscode.lm` — GitHub Copilot subscription handles all tokens; no API key, no token cost
+- **Local mode** — Ollama or LM Studio at a configurable URL; fully offline
+- **Cloud mode** — direct API call to OpenAI or Anthropic with your own key
+- Current mode shown in the Status sidebar
 - Provider capability matrix shows Copilot, Ollama, LM Studio, and cloud models in a single view
 
 ### 🔒 Patch Safety & Approval
@@ -99,11 +97,13 @@ AI coding assistants are powerful — but uncontrolled. They send too much conte
 - Write-back safety filter blocks secrets, raw transcripts, and oversized diffs
 
 ### 📊 Memory Manager
+- **Run Summarization** button — sends pending symbols to LLM in configurable batches (25/50/75/100) without wiping existing summaries
+- Shows spinner while summarization is active; shows warning badge when symbols are pending but summarization is not running
+- **Auto session synthesis** — after 5 minutes of Copilot Chat inactivity, MemoPilot distills the session's queries into 1–5 memory facts and writes them as `learned` items
 - **Bulk actions** — multi-select approve, reject, or delete (confirmation for 6+ items)
 - **Usage signals** — every memory item shows recall count, last used date, and days since use
 - "Unused (30+ days)" filter identifies candidates for cleanup
 - **Ranked suggestions** — post-task memory updates scored by 5 factors (file change, class, frequency, validation, contradiction)
-- "Approve High Priority Only" and "Dismiss All Low Priority" batch buttons
 - **Decay detection** — pending review items older than 14 days with changed source flagged as DECAYED
 - Keyboard shortcuts: `A` approve, `R` reject, `E` edit, `D` delete, `Space` preview
 
@@ -151,7 +151,7 @@ AI coding assistants are powerful — but uncontrolled. They send too much conte
 ┌───────────────────────▼──────────────────────────────────────────┐
 │  Python Backend (FastAPI, 127.0.0.1, OS-assigned port)            │
 │    Indexer · Rules · Memory · Context · Router · Patcher          │
-│    Validation · Investigation · MCP · Cost Guard                  │
+│    Validation · Investigation · MCP · Usage Stats                  │
 └───────────────────────┬──────────────────────────────────────────┘
                         │
 ┌───────────────────────▼──────────────────────────────────────────┐
@@ -183,20 +183,24 @@ AI coding assistants are powerful — but uncontrolled. They send too much conte
 
 ### Installation
 
-1. Install from the VS Code Marketplace, or:
-   ```
+1. Install from the VS Code Marketplace, or for a local VSIX:
+   ```bash
+   # VS Code
    code --install-extension memopilot-1.0.1.vsix
+   # Cursor
+   cursor --install-extension memopilot-1.0.1.vsix
    ```
+   Close your editor completely before installing to avoid file-lock errors.
 2. Open a workspace. MemoPilot activates automatically.
 3. The backend starts, creates `.memopilot/`, and indexes your workspace.
 
 ### First Run
 
 1. Open the **MemoPilot** sidebar (brain icon in activity bar)
-2. Run **MemoPilot: Index Workspace Memory** — builds initial memory
-3. Run **MemoPilot: Analyze Current Task** — classifies and builds context
-4. Review the context pack in the **Context Pack** view
-5. Approve or iterate
+2. Sign in to **GitHub Copilot** in VS Code/Cursor if you haven't already — Copilot mode requires no API key
+3. Click **Reindex & Summarize** (↺ button in the Status panel) — scans files and sends symbols to Copilot for summarization
+4. Wait for the Memory Manager to show a green spinner, then completion. Use **Run Summarization** (▶ button in Memory Manager) to resume if interrupted
+5. Open Copilot Chat and type `@memopilot` — MemoPilot will now supply context for your queries
 
 ---
 
@@ -241,6 +245,7 @@ AI coding assistants are powerful — but uncontrolled. They send too much conte
 |---------|---------|-------------|
 | `memopilot.pythonPath` | `""` (auto-detect) | Path to Python interpreter for the backend |
 | `memopilot.backendLogLevel` | `"info"` | Log level: `debug`, `info`, `warning`, `error` |
+| `memopilot.summarizationBatchSize` | `25` | Symbols per LLM request during summarization: `25`, `50`, `75`, or `100`. Higher values are faster but may hit rate limits |
 
 ### Workspace Settings (`.memopilot/settings.yaml`)
 
@@ -321,6 +326,9 @@ fallback_order:
 
 | Command | Description |
 |---------|-------------|
+| **Reindex & Summarize** | Full workspace re-index then LLM summarization (clears stale entries) |
+| **Run Summarization** | Summarize pending symbols without wiping the index — use after interruption |
+| **Switch LLM Mode** | Toggle between Copilot, Local (Ollama/LM Studio), and Cloud (OpenAI/Anthropic) modes |
 | **Index Workspace Memory** | Scan workspace and build/update memory |
 | **Rebuild Memory** | Full re-index (clears stale entries) |
 | **Analyze Current Task** | Classify task, estimate risk, select model |
@@ -329,8 +337,6 @@ fallback_order:
 | **Run Investigation** | Start evidence-aware bug investigation |
 | **Open Rules** | View and manage active rules |
 | **Manage Skill Store** | View skills, detect conflicts, import YAML |
-| **Show Cost Report** | View spending, savings, and model usage |
-| **Select Budget Profile** | Switch budget enforcement modes |
 | **Show Privacy Dashboard** | View what data goes where |
 | **Show Provider Capabilities** | Compare model features and costs |
 | **Replay AI Call** | Re-run a past task with exact same context |
@@ -354,7 +360,7 @@ fallback_order:
 | **Memory Manager** | Browse, filter, approve/reject memory items |
 | **Rules & Skills** | Active rules by source, skills with match criteria |
 | **Context Pack** | Files, tokens, rules, cost, **quality score** (verdict + missing signals + callers not in context) |
-| **Cost Guard** | Budget bar with graduated states (green/orange/red), savings vs frontier baseline, per-task cost feedback |
+| **Usage Stats** | Symbols indexed/summarized (%), memory items (total + learned from sessions), queries this session |
 | **Privacy Dashboard** | Local-only vs. sent-to-provider data |
 | **Evidence Board** | Attached evidence with classification + trust |
 | **Task History** | Past tasks with status, model, cost, duration |
@@ -395,7 +401,10 @@ Docs-only tasks (`.md`, `.txt`, `.rst`) skip test validation messaging.
 | Backend won't start | Run **Restart Backend**. Verify Python 3.11+ on PATH. |
 | "Version conflict" warning | Schema mismatch — restart backend to re-migrate. |
 | FTS search returns nothing | Run **Rebuild Memory** to re-index and rebuild FTS. |
-| Budget exceeded | Switch to `strict_local` or increase `monthly_budget_usd`. |
+| VSIX install fails (EBUSY) | Close VS Code/Cursor completely before running the install command. |
+| Summarization stalls mid-run | Click **Run Summarization** (▶ in Memory Manager) to resume from where it stopped. |
+| Memory Manager shows warning badge | Symbols are pending but not being summarized. Click **Run Summarization** to continue. |
+| No `@memopilot` suggestions | Ensure LLM mode is set to Copilot and GitHub Copilot is signed in. |
 | Policy blocks action | Contact team admin to update `.memopilot-policy/` rules. |
 
 **Logs:** `.memopilot/logs/` — set `memopilot.backendLogLevel` to `debug` for verbose output.
