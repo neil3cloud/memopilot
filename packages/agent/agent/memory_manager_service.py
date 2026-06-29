@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import sqlite3
 import uuid
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -840,10 +841,23 @@ class MemoryManagerService:
             raise RuntimeError("config is required to persist blocked memory artifacts")
 
         artifact_id = uuid.uuid4().hex
+        redactor = CredentialRedactor()
+        redacted_title = title
+        redacted_body = body
+        redacted_count = 0
+        try:
+            title_redaction = redactor.redact(title)
+            body_redaction = redactor.redact(body)
+            redacted_title = title_redaction.redacted_text
+            redacted_body = body_redaction.redacted_text
+            redacted_count = title_redaction.redacted_count + body_redaction.redacted_count
+        except Exception:
+            pass
+
         content = json.dumps(
             {
-                "title": title,
-                "body": body,
+                "title": redacted_title,
+                "body": redacted_body,
                 "blocked_reason": blocked_reason,
                 "created_at": datetime.now(UTC).isoformat(),
             },
@@ -868,7 +882,7 @@ class MemoryManagerService:
                 id, task_run_id, artifact_type, artifact_path, artifact_hash,
                 size_bytes, blocked_reason, redacted
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, 0)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 artifact_id,
@@ -878,6 +892,7 @@ class MemoryManagerService:
                 artifact_hash,
                 len(content.encode("utf-8")),
                 blocked_reason,
+                1 if redacted_count > 0 else 0,
             ),
         )
         return artifact_id
@@ -938,26 +953,62 @@ class MemoryManagerService:
         blocked_reason: str,
         workspace_root: str | None,
     ) -> str:
-        task_run_id = uuid.uuid4().hex
+        # Older/partial schemas may have task_runs.investigation_session_id
+        # without the referenced table present.
         await conn.execute(
             """
-            INSERT INTO task_runs
-            (
-                id, user_request, task_type, mode, risk_level,
-                selected_model, estimated_cost, actual_cost, status,
-                workspace_root
+            CREATE TABLE IF NOT EXISTS investigation_sessions (
+                id TEXT PRIMARY KEY,
+                title TEXT NOT NULL,
+                description TEXT,
+                mode TEXT NOT NULL DEFAULT 'investigation',
+                status TEXT NOT NULL DEFAULT 'open',
+                workspace_root TEXT NOT NULL,
+                created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                updated_at TEXT NOT NULL DEFAULT (datetime('now'))
             )
-            VALUES (
-                ?, ?, 'memory_writeback', 'safety_filter', 'medium', NULL,
-                NULL, NULL, 'success', ?
-            )
-            """,
-            (
-                task_run_id,
-                f"Blocked memory write-back for '{title}': {blocked_reason}",
-                workspace_root,
-            ),
+            """
         )
+        task_run_id = uuid.uuid4().hex
+        try:
+            await conn.execute(
+                """
+                INSERT INTO task_runs
+                (
+                    id, user_request, task_type, mode, risk_level,
+                    selected_model, estimated_cost, actual_cost, status,
+                    workspace_root
+                )
+                VALUES (
+                    ?, ?, 'memory_writeback', 'safety_filter', 'medium', NULL,
+                    NULL, NULL, 'success', ?
+                )
+                """,
+                (
+                    task_run_id,
+                    f"Blocked memory write-back for '{title}': {blocked_reason}",
+                    workspace_root,
+                ),
+            )
+        except sqlite3.OperationalError:
+            # Fallback for schema variants that omit newer task_runs columns.
+            await conn.execute(
+                """
+                INSERT INTO task_runs
+                (
+                    id, user_request, task_type, mode, risk_level,
+                    selected_model, estimated_cost, actual_cost, status
+                )
+                VALUES (
+                    ?, ?, 'memory_writeback', 'safety_filter', 'medium', NULL,
+                    NULL, NULL, 'success'
+                )
+                """,
+                (
+                    task_run_id,
+                    f"Blocked memory write-back for '{title}': {blocked_reason}",
+                ),
+            )
         return task_run_id
 
     # ------------------------------------------------------------------

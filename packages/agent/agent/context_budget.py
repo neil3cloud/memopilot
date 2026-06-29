@@ -80,6 +80,7 @@ class ContextItem:
     retrieval_method: str
     trust_level: int
     tier: str
+    reference_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -88,6 +89,7 @@ class ExcludedItem:
     source_type: str
     exclusion_reason: ExclusionReason
     tokens_would_have_used: int
+    reference_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -170,6 +172,7 @@ def build_budget_aware_context_pack(
                 excluded_items.append(
                     ExcludedItem(
                         source=item.source,
+                        reference_id=item.reference_id,
                         source_type=item.source_type,
                         exclusion_reason=exclusion_reason,
                         tokens_would_have_used=item.tokens,
@@ -183,6 +186,7 @@ def build_budget_aware_context_pack(
                 excluded_items.append(
                     ExcludedItem(
                         source=item.source,
+                        reference_id=item.reference_id,
                         source_type=item.source_type,
                         exclusion_reason=ExclusionReason.BUDGET_EXCEEDED,
                         tokens_would_have_used=item.tokens,
@@ -282,6 +286,8 @@ def _coerce_candidate(
     payload = dict(raw_item)
     content = str(payload.get("content", ""))
     source = str(payload.get("source", ""))
+    reference_id_value = payload.get("reference_id")
+    reference_id = str(reference_id_value) if reference_id_value else None
     source_type = str(payload.get("source_type", "unknown"))
     tokens = int(payload.get("tokens") or _estimate_tokens(content))
     relevance_score = float(payload.get("relevance_score") or 0.0)
@@ -292,6 +298,7 @@ def _coerce_candidate(
     item = ContextItem(
         content=content,
         source=source,
+        reference_id=reference_id,
         source_type=source_type,
         tokens=max(1, tokens),
         relevance_score=relevance_score,

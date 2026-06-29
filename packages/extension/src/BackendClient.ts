@@ -37,6 +37,8 @@ export interface IndexStatusResponse {
     symbols_count: number;
     last_indexed_at: string | null;
     never_indexed: boolean;
+    symbols_pending_summary?: number;
+    summarizing?: boolean;
 }
 
 export interface RebuildMemoryResponse {
@@ -424,8 +426,17 @@ export class BackendClient {
         return result as WorkspaceIndexResponse;
     }
 
-    async rebuildMemory(): Promise<RebuildMemoryResponse> {
-        const result = await this.manager.request('POST', '/v1/workspace/rebuild-memory');
+    async rebuildMemory(summarizationBatchSize = 25): Promise<RebuildMemoryResponse> {
+        const result = await this.manager.request('POST', '/v1/workspace/rebuild-memory', {
+            summarization_batch_size: summarizationBatchSize,
+        });
+        return result as RebuildMemoryResponse;
+    }
+
+    async summarizePending(summarizationBatchSize = 25): Promise<RebuildMemoryResponse> {
+        const result = await this.manager.request('POST', '/v1/workspace/summarize', {
+            summarization_batch_size: summarizationBatchSize,
+        });
         return result as RebuildMemoryResponse;
     }
 
@@ -595,6 +606,16 @@ export class BackendClient {
         return result as ProviderCapabilitiesResponse;
     }
 
+    async getLLMMode(): Promise<{ mode: string; model_id: string; copilot_available: boolean; cloud_available: boolean; local_available: boolean }> {
+        const result = await this.manager.request('GET', '/v1/config/llm-mode');
+        return result as { mode: string; model_id: string; copilot_available: boolean; cloud_available: boolean; local_available: boolean };
+    }
+
+    async setLLMMode(mode: string): Promise<{ ok: boolean; mode: string }> {
+        const result = await this.manager.request('POST', '/v1/config/llm-mode', { mode });
+        return result as { ok: boolean; mode: string };
+    }
+
     async discoverLocalProviders(workspaceRoot?: string): Promise<LocalDiscoverResponse> {
         const qs = workspaceRoot ? `?workspace_root=${encodeURIComponent(workspaceRoot)}` : '';
         const result = await this.manager.request('GET', `/v1/providers/local-discover${qs}`);
@@ -647,6 +668,23 @@ export class BackendClient {
             available_tools: availableTools,
         });
         return result as ToolSkillOptimizeResponse;
+    }
+
+    async getUsageStats(): Promise<{
+        symbols_indexed: number;
+        symbols_summarized: number;
+        memory_items_total: number;
+        memory_items_learned: number;
+        session_queries: number;
+    }> {
+        const result = await this.manager.request('GET', '/v1/usage/stats');
+        return result as {
+            symbols_indexed: number;
+            symbols_summarized: number;
+            memory_items_total: number;
+            memory_items_learned: number;
+            session_queries: number;
+        };
     }
 
     async getBudgetProfiles(): Promise<BudgetProfilesResponse> {

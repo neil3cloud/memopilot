@@ -11,6 +11,24 @@ SYSTEM = (
 )
 
 
+def build_synthesis_user_prompt(task: str, raw_markdown: str, max_chars: int = 6000) -> str:
+    """Build a bounded synthesis prompt while preserving both head and tail context."""
+    if max_chars <= 0:
+        return f"Task: {task}\n\n"
+
+    if len(raw_markdown) <= max_chars:
+        bounded = raw_markdown
+    else:
+        head = max_chars // 2
+        tail = max_chars - head
+        bounded = (
+            f"{raw_markdown[:head]}\n\n"
+            "[... middle content omitted for synthesis budget ...]\n\n"
+            f"{raw_markdown[-tail:]}"
+        )
+    return f"Task: {task}\n\n{bounded}"
+
+
 class ContextSynthesizer:
     def __init__(self, client: BaseLLMClient) -> None:
         self._client = client
@@ -22,8 +40,7 @@ class ContextSynthesizer:
         raw_markdown: str,
         max_tokens: int = 4000,
     ) -> str:
-        # Cap at 6000 chars (~1500 tokens) so input + output fits within a 4096-token local model.
-        # Larger models or cloud providers can handle bigger inputs.
-        user = f"Task: {task}\n\n{raw_markdown[:6000]}"
+        # Cap synthesis payload while preserving both top and tail sections.
+        user = build_synthesis_user_prompt(task=task, raw_markdown=raw_markdown, max_chars=6000)
         response = await self._client.complete(SYSTEM, user, max_tokens=min(max_tokens, 1000))
         return response.content.strip()

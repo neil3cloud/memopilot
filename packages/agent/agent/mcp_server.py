@@ -71,25 +71,31 @@ class MCPServer:
         self._renderer = ContextPackRenderer()
 
     async def run(self) -> None:
-        reader = asyncio.StreamReader()
-        protocol = asyncio.StreamReaderProtocol(reader)
         loop = asyncio.get_event_loop()
+        queue: asyncio.Queue[str | None] = asyncio.Queue()
 
-        await loop.connect_read_pipe(lambda: protocol, sys.stdin)
-        _, writer = await loop.connect_write_pipe(
-            lambda: asyncio.BaseProtocol(), sys.stdout
-        )
+        def _read_stdin() -> None:
+            try:
+                for line in sys.stdin:
+                    loop.call_soon_threadsafe(queue.put_nowait, line)
+            except Exception:
+                pass
+            finally:
+                loop.call_soon_threadsafe(queue.put_nowait, None)
+
+        import threading
+        threading.Thread(target=_read_stdin, daemon=True).start()
 
         while True:
             try:
-                line = await reader.readline()
-                if not line:
+                line = await queue.get()
+                if line is None:
                     break
-                request = json.loads(line.decode("utf-8"))
+                request = json.loads(line)
                 response = await self._handle(request)
                 if response is not None:
-                    writer.write((json.dumps(response) + "\n").encode("utf-8"))
-                    await asyncio.sleep(0)  # yield to event loop
+                    sys.stdout.write(json.dumps(response) + "\n")
+                    sys.stdout.flush()
             except (json.JSONDecodeError, EOFError):
                 break
 

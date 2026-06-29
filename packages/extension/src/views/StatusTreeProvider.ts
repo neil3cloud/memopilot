@@ -11,6 +11,9 @@ export class StatusTreeProvider implements vscode.TreeDataProvider<vscode.TreeIt
     private message = 'Starting backend...';
     private indexStatus: IndexStatusResponse | undefined;
     private providerCapabilities: ProviderCapabilityItemResponse[] = [];
+    private llmMode: string = 'local';
+    private llmModeModelId: string = '';
+    private copilotAvailable: boolean = false;
 
     setStatus(status: BackendStatus, message: string): void {
         this.status = status;
@@ -28,6 +31,13 @@ export class StatusTreeProvider implements vscode.TreeDataProvider<vscode.TreeIt
 
     updateProviderStatus(items: ProviderCapabilityItemResponse[]): void {
         this.providerCapabilities = items;
+        this._onDidChangeTreeData.fire(undefined);
+    }
+
+    updateLLMMode(mode: string, modelId: string, copilotAvailable: boolean): void {
+        this.llmMode = mode;
+        this.llmModeModelId = modelId;
+        this.copilotAvailable = copilotAvailable;
         this._onDidChangeTreeData.fire(undefined);
     }
 
@@ -63,7 +73,16 @@ export class StatusTreeProvider implements vscode.TreeDataProvider<vscode.TreeIt
             title: 'Configure Providers',
         };
 
-        return [backendItem, indexItem, providerItem];
+        const modeItem = new vscode.TreeItem(this.buildLLMModeLabel());
+        modeItem.contextValue = 'llm-mode';
+        modeItem.iconPath = new vscode.ThemeIcon(this.llmModeIcon());
+        modeItem.tooltip = 'Click to switch LLM mode (copilot / cloud / local)';
+        modeItem.command = {
+            command: 'memopilot.switchLLMMode',
+            title: 'Switch LLM Mode',
+        };
+
+        return [backendItem, indexItem, providerItem, modeItem];
     }
 
     private buildIndexLabel(): string {
@@ -105,6 +124,24 @@ export class StatusTreeProvider implements vscode.TreeDataProvider<vscode.TreeIt
         }
         const deltaDays = Math.floor(deltaHours / 24);
         return `${deltaDays} day${deltaDays === 1 ? '' : 's'} ago`;
+    }
+
+    private buildLLMModeLabel(): string {
+        const labels: Record<string, string> = {
+            copilot: `LLM Mode: Copilot (${this.llmModeModelId || 'probing...'})`,
+            cloud: 'LLM Mode: Cloud provider',
+            local: 'LLM Mode: Local (LM Studio / Ollama)',
+        };
+        return labels[this.llmMode] ?? `LLM Mode: ${this.llmMode}`;
+    }
+
+    private llmModeIcon(): string {
+        const icons: Record<string, string> = {
+            copilot: 'copilot',
+            cloud: 'cloud',
+            local: 'server',
+        };
+        return icons[this.llmMode] ?? 'symbol-misc';
     }
 
     private buildProviderLabel(): string {

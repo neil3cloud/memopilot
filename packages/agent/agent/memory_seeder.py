@@ -203,6 +203,70 @@ class MemorySeederService:
     # Task writeback — extract project facts from completed agentic tasks
     # ------------------------------------------------------------------
 
+    async def synthesize_session(
+        self,
+        calls: list[dict],
+        *,
+        client: "BaseLLMClient",
+    ) -> int:
+        """Synthesize memory items from a session's accumulated tool calls.
+
+        Args:
+            calls: list of {task_description, files_in_focus, ts} dicts
+            client: LLM client to use for synthesis
+
+        Returns:
+            count of memory items written
+        """
+        if not calls:
+            return 0
+
+        # Deduplicate task descriptions (keep unique, preserve order)
+        seen: set[str] = set()
+        unique_descriptions: list[str] = []
+        all_files: set[str] = set()
+        for call in calls:
+            desc = call.get("task_description", "").strip()
+            if desc and desc not in seen:
+                seen.add(desc)
+                unique_descriptions.append(desc)
+            all_files.update(call.get("files_in_focus") or [])
+
+        lines = "\n".join(f"- {d}" for d in unique_descriptions)
+        files_hint = ", ".join(sorted(all_files)[:10]) if all_files else "unknown"
+        prompt = (
+            f"Files touched: {files_hint}\n\n"
+            f"Topics the developer searched for during this session:\n{lines}"
+        )
+
+        try:
+            response = await client.complete(SESSION_SYNTHESIS_SYSTEM, prompt, max_tokens=300)
+            data = json.loads(response.content)
+            facts: list[str] = data.get("facts", [])[:5]
+        except Exception:
+            return 0
+
+        conn = await self._db.connect()
+        count = 0
+        for fact in facts:
+            if not fact.strip():
+                continue
+            await conn.execute(
+                """INSERT OR IGNORE INTO memory_items
+                   (id, type, title, body, source, memory_class, memory_status,
+                    trust_level, tags_json, stale, reusable, review_required,
+                    workspace_root, created_at, updated_at)
+                   VALUES (?,?,?,?,?,?,?,?,?,0,1,1,?,datetime('now'),datetime('now'))""",
+                (
+                    _uid(), "learned", fact[:80], fact, "session_synthesis",
+                    "fact", "pending_review", 3, "[]",
+                    str(self._config.workspace_path),
+                ),
+            )
+            count += 1
+        await conn.commit()
+        return count
+
     async def writeback_from_task(
         self,
         *,
@@ -243,6 +307,16 @@ class MemorySeederService:
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+SESSION_SYNTHESIS_SYSTEM = (
+    "You extract reusable project facts from a developer's coding session. "
+    "You are given the topics they searched for and files they touched. "
+    "Extract facts that would help future developers understand this codebase — "
+    "architectural decisions, known gotchas, patterns, constraints. "
+    "Ignore generic topics. Focus on project-specific knowledge. "
+    'Respond ONLY with valid JSON: {"facts": ["fact1", "fact2"]}. '
+    "Each fact is one sentence, max 25 words. Return 1-5 facts or an empty list."
+)
 
 WRITEBACK_SYSTEM = (
     "You extract project facts from completed coding tasks. "

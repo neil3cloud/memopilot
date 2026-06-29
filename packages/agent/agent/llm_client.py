@@ -14,6 +14,7 @@ import json
 from abc import ABC, abstractmethod
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
+from typing import Any
 
 import httpx
 
@@ -298,6 +299,38 @@ class LMStudioClient(OpenAIClient):
     def provider_name(self) -> str:
         return "lmstudio"
 
+
+# ---------------------------------------------------------------------------
+# Local (any OpenAI-compatible server — Ollama, LM Studio, vLLM, OpenVINO, etc.)
+# ---------------------------------------------------------------------------
+
+class LocalClient(OpenAIClient):
+    """Generic OpenAI-compatible client for any locally hosted model server.
+
+    Works with any server that implements POST /v1/chat/completions:
+    Ollama, LM Studio, vLLM, llama.cpp, OpenVINO GenAI, LocalAI, etc.
+    No API key required.
+    """
+
+    def __init__(self, model: str, base_url: str = "http://localhost:1234") -> None:
+        # Strip /v1 suffix if user pasted the full base URL — we always append /v1/chat/completions
+        normalized = base_url.rstrip("/")
+        if normalized.endswith("/v1"):
+            normalized = normalized[:-3]
+        super().__init__(
+            api_key="local",
+            model=model,
+            base_url=f"{normalized}/v1/chat/completions",
+        )
+
+    @property
+    def provider_name(self) -> str:
+        return "local"
+
+    def _headers(self) -> dict:
+        # No Authorization header — local servers don't require it
+        return {"Content-Type": "application/json"}
+
     def _cost(self, input_tokens: int, output_tokens: int) -> float:
         return 0.0
 
@@ -332,4 +365,40 @@ def build_client(provider: str, config: dict) -> BaseLLMClient:
             raise ValueError("lmstudio_model not set in config")
         return LMStudioClient(model, config.get("lmstudio_base_url", "http://localhost:1234"))
 
+    if provider == "local":
+        model = config.get("local_model", "")
+        if not model:
+            raise ValueError("local_model not set in config")
+        return LocalClient(model, config.get("local_url", "http://localhost:1234"))
+
     raise ValueError(f"Unknown provider: {provider}")
+
+
+class RelayLLMClient(BaseLLMClient):
+    """LLM client that routes requests through the extension SSE relay (copilot mode)."""
+
+    def __init__(self, relay_fn: Any, request_type: str = "generic") -> None:
+        self._relay_fn = relay_fn
+        self._request_type = request_type
+
+    @property
+    def model_id(self) -> str:
+        return "copilot-relay"
+
+    @property
+    def provider_name(self) -> str:
+        return "copilot"
+
+    async def complete(self, system: str, user: str, max_tokens: int = 4096) -> "LLMResponse":
+        content = await self._relay_fn(
+            request_type=self._request_type,
+            system=system,
+            user=user,
+        )
+        return LLMResponse(content=content, input_tokens=0, output_tokens=0, cost_usd=0.0, model_id="copilot-relay", provider="copilot")
+
+    async def stream(self, system: str, user: str, max_tokens: int = 4096) -> "AsyncIterator[StreamChunk]":
+        content = await self.complete(system, user, max_tokens)
+        async def _gen():
+            yield StreamChunk(delta=content.content, finish_reason="stop")
+        return _gen()

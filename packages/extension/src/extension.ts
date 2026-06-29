@@ -8,15 +8,16 @@ import { WorkspaceProfileTreeProvider } from './views/WorkspaceProfileTreeProvid
 import { MemoryManagerTreeProvider, MEMORY_FILTERS, MemoryFilter } from './views/MemoryManagerTreeProvider';
 import { PrivacyDashboardTreeProvider } from './views/PrivacyDashboardTreeProvider';
 import { RulesSkillsTreeProvider } from './views/RulesSkillsTreeProvider';
-import { CostGuardTreeProvider } from './views/CostGuardTreeProvider';
+import { UsageStatsTreeProvider } from './views/UsageStatsTreeProvider';
 import { ContextPackTreeProvider } from './views/ContextPackTreeProvider';
 import { TaskHistoryTreeProvider } from './views/TaskHistoryTreeProvider';
 import { McpToolsTreeProvider } from './views/McpToolsTreeProvider';
 import { MemoPilotPanel } from './panels/MemoPilotPanel';
-import { CostDashboardPanel } from './panels/CostDashboardPanel';
+import { SynthesisHostClient } from './SynthesisHostClient';
 
 let backendManager: BackendManager | undefined;
 let backendClient: BackendClient | undefined;
+let synthesisHostClient: SynthesisHostClient | undefined;
 let statusBarItem: vscode.StatusBarItem;
 let workspaceIndexingInFlight = false;
 let extensionContext: vscode.ExtensionContext | undefined;
@@ -61,7 +62,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     const memoryProvider = new MemoryManagerTreeProvider();
     const rulesProvider = new RulesSkillsTreeProvider();
     const contextProvider = new ContextPackTreeProvider();
-    const costProvider = new CostGuardTreeProvider();
+    const costProvider = new UsageStatsTreeProvider();
     const privacyProvider = new PrivacyDashboardTreeProvider();
     const historyProvider = new TaskHistoryTreeProvider();
     const mcpProvider = new McpToolsTreeProvider();
@@ -135,6 +136,142 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         }
     };
 
+    const switchLLMMode = async () => {
+        if (!backendClient) {
+            void vscode.window.showWarningMessage('MemoPilot backend is not connected.');
+            return;
+        }
+        try {
+            const modeInfo = await backendClient.getLLMMode();
+            const options: vscode.QuickPickItem[] = [];
+
+            if (modeInfo.copilot_available) {
+                options.push({
+                    label: '$(copilot) Copilot',
+                    description: modeInfo.model_id || 'vscode.lm non-frontier',
+                    detail: modeInfo.mode === 'copilot' ? '✓ Active' : 'Use GitHub Copilot via vscode.lm API',
+                });
+            }
+            if (modeInfo.cloud_available) {
+                options.push({
+                    label: '$(cloud) Cloud',
+                    description: 'Configured cloud provider (Anthropic / OpenAI)',
+                    detail: modeInfo.mode === 'cloud' ? '✓ Active' : 'Use cloud API keys from config',
+                });
+            }
+            if (modeInfo.local_available) {
+                options.push({
+                    label: '$(server) Local',
+                    description: 'LM Studio / Ollama',
+                    detail: modeInfo.mode === 'local' ? '✓ Active' : 'Use local inference server',
+                });
+            }
+
+            if (options.length === 0) {
+                void vscode.window.showWarningMessage('No LLM providers available. Configure a provider first.');
+                return;
+            }
+
+            const picked = await vscode.window.showQuickPick(options, {
+                title: 'MemoPilot: Select LLM Mode',
+                placeHolder: `Current: ${modeInfo.mode}`,
+            });
+            if (!picked) { return; }
+
+            const modeMap: Record<string, string> = {
+                '$(copilot) Copilot': 'copilot',
+                '$(cloud) Cloud': 'cloud',
+                '$(server) Local': 'local',
+            };
+            const newMode = modeMap[picked.label];
+            if (!newMode || newMode === modeInfo.mode) { return; }
+
+            await backendClient.setLLMMode(newMode);
+            context.globalState.update('memopilot.llmMode', newMode);
+            statusProvider.updateLLMMode(newMode, modeInfo.model_id, modeInfo.copilot_available);
+            void vscode.window.showInformationMessage(`MemoPilot: LLM mode switched to ${newMode}.`);
+        } catch (err: unknown) {
+            const msg = err instanceof Error ? err.message : String(err);
+            void vscode.window.showErrorMessage(`MemoPilot: Failed to switch LLM mode: ${msg}`);
+        }
+    };
+
+    const reindexAndSummarize = async () => {
+        if (!backendClient) {
+            void vscode.window.showWarningMessage('MemoPilot backend is not connected.');
+            return;
+        }
+        if (workspaceIndexingInFlight) {
+            void vscode.window.showInformationMessage('MemoPilot indexing already in progress.');
+            return;
+        }
+
+        const batchSize: number = vscode.workspace
+            .getConfiguration('memopilot')
+            .get('summarizationBatchSize', 25);
+
+        try {
+            workspaceIndexingInFlight = true;
+            await vscode.window.withProgress(
+                {
+                    location: vscode.ProgressLocation.Notification,
+                    title: `MemoPilot: Re-indexing and summarizing (${batchSize} symbols/request)...`,
+                    cancellable: false,
+                },
+                async () => {
+                    const result = await backendClient!.rebuildMemory(batchSize);
+                    vscode.window.showInformationMessage(
+                        `MemoPilot: ${result.symbols_extracted} symbols extracted. Summarization running in background.`,
+                    );
+                    await memoryProvider.refresh();
+                },
+            );
+        } catch (err: unknown) {
+            const msg = err instanceof Error ? err.message : String(err);
+            void vscode.window.showErrorMessage(`MemoPilot reindex failed: ${msg}`);
+        } finally {
+            workspaceIndexingInFlight = false;
+        }
+    };
+
+    const runSummarization = async () => {
+        if (!backendClient) {
+            void vscode.window.showWarningMessage('MemoPilot backend is not connected.');
+            return;
+        }
+        if (workspaceIndexingInFlight) {
+            void vscode.window.showInformationMessage('MemoPilot indexing already in progress.');
+            return;
+        }
+
+        const batchSize: number = vscode.workspace
+            .getConfiguration('memopilot')
+            .get('summarizationBatchSize', 25);
+
+        try {
+            workspaceIndexingInFlight = true;
+            await vscode.window.withProgress(
+                {
+                    location: vscode.ProgressLocation.Notification,
+                    title: `MemoPilot: Summarizing pending symbols (${batchSize} symbols/request)...`,
+                    cancellable: false,
+                },
+                async () => {
+                    await backendClient!.summarizePending(batchSize);
+                    vscode.window.showInformationMessage(
+                        'MemoPilot: Summarization running in background.',
+                    );
+                    await memoryProvider.refresh();
+                },
+            );
+        } catch (err: unknown) {
+            const msg = err instanceof Error ? err.message : String(err);
+            void vscode.window.showErrorMessage(`MemoPilot summarization failed: ${msg}`);
+        } finally {
+            workspaceIndexingInFlight = false;
+        }
+    };
+
     const ensureBackendClient = (): BackendClient | undefined => {
         if (!backendClient) {
             void vscode.window.showWarningMessage('MemoPilot backend is not connected.');
@@ -166,6 +303,19 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         ]);
 
         await refreshProviderStatus();
+
+        // Probe vscode.lm once at startup — backend caches the result for every synthesis call
+        if (backendManager) {
+            synthesisHostClient?.dispose();
+            synthesisHostClient = new SynthesisHostClient(backendManager, (available, _modelId) => {
+                if (available) {
+                    void vscode.commands.executeCommand('setContext', 'memopilot.llmReady', true);
+                }
+                // Probe result changes the backend's llm_mode — refresh STATUS panel to reflect it
+                void refreshProviderStatus();
+            });
+            void synthesisHostClient.probe();
+        }
     };
 
     const refreshProviderStatus = async (): Promise<void> => {
@@ -175,8 +325,21 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         }
 
         try {
-            const capabilities = await backendClient.listProviderCapabilities();
+            const [capabilities, modeInfo] = await Promise.all([
+                backendClient.listProviderCapabilities(),
+                backendClient.getLLMMode().catch(() => null),
+            ]);
             statusProvider.updateProviderStatus(capabilities.items ?? []);
+            const hasProvider = (capabilities.items ?? []).some(c => c.healthy);
+            if (hasProvider || modeInfo?.copilot_available) {
+                void vscode.commands.executeCommand('setContext', 'memopilot.llmReady', true);
+            }
+            if (modeInfo) {
+                statusProvider.updateLLMMode(modeInfo.mode, modeInfo.model_id, modeInfo.copilot_available);
+                context.globalState.update('memopilot.llmMode', modeInfo.mode);
+                context.globalState.update('memopilot.llmModeModelId', modeInfo.model_id);
+                context.globalState.update('memopilot.copilotAvailable', modeInfo.copilot_available);
+            }
         } catch (err: unknown) {
             const msg = err instanceof Error ? err.message : String(err);
             outputChannel.appendLine(`[MemoPilot] Failed to load provider capabilities: ${msg}`);
@@ -422,10 +585,10 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
                     value: 'cloud' as const,
                 },
                 {
-                    label: '$(server) Local model (Ollama)',
-                    description: 'Free, runs on your machine — no API key needed',
-                    detail: 'Used for: context synthesis when a local model is available',
-                    value: 'ollama' as const,
+                    label: '$(server) Local model (OpenAI-compatible)',
+                    description: 'Free, runs on your machine — Ollama, LM Studio, vLLM, OpenVINO, llama.cpp, etc.',
+                    detail: 'Used for: symbol summarization, context synthesis, memory writeback',
+                    value: 'local' as const,
                 },
             ],
             { title: 'Configure MemoPilot LLM Touch Points' },
@@ -433,59 +596,60 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         if (!touchPoint) { return; }
 
         try {
-            if (touchPoint.value === 'ollama') {
-                const currentUrl = vscode.workspace.getConfiguration('memopilot').get<string>('ollamaUrl', 'http://localhost:11434');
-                const ollamaUrl = await vscode.window.showInputBox({
-                    title: 'Ollama URL',
-                    value: currentUrl,
-                    prompt: 'URL of the local Ollama server',
+            if (touchPoint.value === 'local') {
+                const localUrl = await vscode.window.showInputBox({
+                    title: 'Local AI server URL',
+                    value: 'http://localhost:1234',
+                    prompt: 'Base URL of your local OpenAI-compatible server (Ollama, LM Studio, vLLM, etc.)',
+                    placeHolder: 'http://localhost:1234',
                 });
-                if (!ollamaUrl) { return; }
+                if (!localUrl) { return; }
 
-                // Discover models from Ollama
+                // Discover models via OpenAI-compatible /v1/models endpoint
                 let modelItems: vscode.QuickPickItem[] = [];
                 try {
                     const http = await import('http');
                     const discovered = await new Promise<string[]>((resolve, reject) => {
-                        const url = new URL('/api/tags', ollamaUrl);
-                        const req = http.get({ hostname: url.hostname, port: url.port || 11434, path: url.pathname, timeout: 4000 }, (res) => {
+                        const url = new URL('/v1/models', localUrl);
+                        const port = url.port || (url.protocol === 'https:' ? '443' : '80');
+                        const req = http.get({ hostname: url.hostname, port, path: url.pathname, timeout: 4000 }, (res) => {
                             let body = '';
                             res.on('data', (chunk: Buffer) => { body += chunk.toString(); });
                             res.on('end', () => {
                                 try {
-                                    const json = JSON.parse(body) as { models?: { name: string }[] };
-                                    resolve((json.models ?? []).map(m => m.name));
+                                    const json = JSON.parse(body) as { data?: { id: string }[] };
+                                    resolve((json.data ?? []).map(m => m.id));
                                 } catch { resolve([]); }
                             });
                         });
                         req.on('error', reject);
                         req.on('timeout', () => { req.destroy(); reject(new Error('timeout')); });
                     });
-                    modelItems = discovered.map(name => ({ label: name, description: '' }));
+                    modelItems = discovered.map(id => ({ label: id, description: '' }));
                 } catch {
-                    // Ollama not reachable — fall through to manual entry
+                    // Server not reachable — fall through to manual entry
                 }
 
-                let ollamaModel: string | undefined;
+                let localModel: string | undefined;
                 if (modelItems.length > 0) {
                     const picked = await vscode.window.showQuickPick(
                         [...modelItems, { label: '$(edit) Enter model name manually', description: '' }],
-                        { title: 'Select Ollama model', placeHolder: 'Choose a model from your local Ollama' },
+                        { title: 'Select local model', placeHolder: 'Choose a model from your local server' },
                     );
                     if (!picked) { return; }
                     if (picked.label.startsWith('$(edit)')) {
-                        ollamaModel = await vscode.window.showInputBox({ title: 'Ollama model name', placeHolder: 'e.g. qwen2.5:3b' });
+                        localModel = await vscode.window.showInputBox({ title: 'Model name', placeHolder: 'e.g. qwen2.5-coder-7b-instruct' });
                     } else {
-                        ollamaModel = picked.label;
+                        localModel = picked.label;
                     }
                 } else {
-                    ollamaModel = await vscode.window.showInputBox({
-                        title: 'Ollama model name',
-                        prompt: 'Could not reach Ollama — enter model name manually',
-                        placeHolder: 'e.g. qwen2.5:3b',
+                    localModel = await vscode.window.showInputBox({
+                        title: 'Model name',
+                        prompt: 'Could not reach server — enter model name manually',
+                        placeHolder: 'e.g. qwen2.5-coder-7b-instruct',
                     });
                 }
-                if (!ollamaModel) { return; }
+                if (!localModel) { return; }
 
                 // Write provider + model + url into .memopilot/config.yaml
                 const workspaceFolder = vscode.workspace.workspaceFolders?.[0];
@@ -508,14 +672,13 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
                 };
 
                 let yaml = existing || '# MemoPilot provider config — do not commit\n';
-                yaml = update(yaml, 'provider', 'ollama');
-                yaml = update(yaml, 'ollama_base_url', ollamaUrl);
-                yaml = update(yaml, 'ollama_model', ollamaModel);
+                yaml = update(yaml, 'provider', 'local');
+                yaml = update(yaml, 'local_url', localUrl);
+                yaml = update(yaml, 'local_model', localModel);
                 yaml = update(yaml, 'budget_profile', 'strict_local');
 
                 await vscode.workspace.fs.createDirectory(configDir);
                 await vscode.workspace.fs.writeFile(configFile, Buffer.from(yaml, 'utf8'));
-                await vscode.workspace.getConfiguration('memopilot').update('ollamaUrl', ollamaUrl, vscode.ConfigurationTarget.Workspace);
 
                 // Sync to provider registry immediately so sidebar updates without a restart
                 if (backendClient) {
@@ -526,7 +689,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
                 }
 
                 const action = await vscode.window.showInformationMessage(
-                    `Ollama configured: ${ollamaModel} at ${ollamaUrl}. Budget set to strict_local (no cloud fallback). Restart backend to apply.`,
+                    `Local AI configured: ${localModel} at ${localUrl}. Restart backend to apply.`,
                     'Restart Now',
                 );
                 if (action === 'Restart Now') {
@@ -727,28 +890,6 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         }
     };
 
-    const selectBudgetProfile = async () => {
-        const client = ensureBackendClient();
-        if (!client) { return; }
-        try {
-            const current = await client.getBudgetProfiles();
-            const selected = await vscode.window.showQuickPick(
-                Object.keys(current.profiles).map((profile) => ({
-                    label: profile,
-                    description: profile === current.active_profile ? 'active' : undefined,
-                })),
-                { title: 'Select budget profile' },
-            );
-            if (!selected) { return; }
-            const updated = await client.setBudgetProfile(selected.label);
-            void vscode.window.showInformationMessage(
-                `Budget profile set to ${updated.active_profile} (effective $${updated.effective_budget_usd.toFixed(2)}).`,
-            );
-        } catch (err: unknown) {
-            const msg = err instanceof Error ? err.message : String(err);
-            void vscode.window.showErrorMessage(`Budget profile update failed: ${msg}`);
-        }
-    };
 
     const managePolicyPacks = async () => {
         const client = ensureBackendClient();
@@ -901,14 +1042,14 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
             void openContextPreview();
         }),
         vscode.commands.registerCommand('memopilot.generateContextPack', manageContextTemplates),
-        vscode.commands.registerCommand('memopilot.showCostReport', () => {
-            CostDashboardPanel.createOrShow(context.extensionUri, backendClient);
-        }),
         vscode.commands.registerCommand('memopilot.openRules', async () => {
             rulesProvider.setClient(backendClient);
             await rulesProvider.refresh();
         }),
         vscode.commands.registerCommand('memopilot.rebuildMemory', rebuildMemory),
+        vscode.commands.registerCommand('memopilot.reindexAndSummarize', reindexAndSummarize),
+        vscode.commands.registerCommand('memopilot.runSummarization', runSummarization),
+        vscode.commands.registerCommand('memopilot.switchLLMMode', switchLLMMode),
         vscode.commands.registerCommand('memopilot.openWorkspaceProfile', openWorkspaceProfile),
         vscode.commands.registerCommand('memopilot.rebuildWorkspaceProfile', rebuildWorkspaceProfile),
         vscode.commands.registerCommand('memopilot.validateWorkspaceProfile', validateWorkspaceProfile),
@@ -924,7 +1065,6 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         vscode.commands.registerCommand('memopilot.backupMemory', backupMemory),
         vscode.commands.registerCommand('memopilot.restoreMemory', restoreMemory),
         vscode.commands.registerCommand('memopilot.optimizeToolsAndSkills', optimizeToolsAndSkills),
-        vscode.commands.registerCommand('memopilot.selectBudgetProfile', selectBudgetProfile),
         vscode.commands.registerCommand('memopilot.managePolicyPacks', managePolicyPacks),
         vscode.commands.registerCommand('memopilot.manageWorkspaces', manageWorkspaces),
         vscode.commands.registerCommand('memopilot.showPanel', () => {
@@ -1140,5 +1280,6 @@ async function triggerAutoIndex(
 }
 
 export async function deactivate(): Promise<void> {
+    synthesisHostClient?.dispose();
     await stopBackend();
 }

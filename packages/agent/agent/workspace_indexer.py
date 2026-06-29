@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import logging
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -16,7 +17,10 @@ from .project_scanner import WorkspaceScanner
 from .symbol_extractor import SymbolExtractor
 from .symbol_summarizer import SymbolSummarizer
 
-_SUMMARY_CAP_PER_RUN = 50
+logger = logging.getLogger(__name__)
+
+_SUMMARY_CAP_PER_RUN = 500
+_DEFAULT_BATCH_SIZE = 25
 
 
 @dataclass(frozen=True)
@@ -89,7 +93,12 @@ class WorkspaceIndexer:
             # Delete stale relationships BEFORE deleting symbols (subquery needs them)
             await conn.execute(
                 "DELETE FROM symbol_relationships WHERE from_symbol_id IN "
-                "(SELECT id FROM symbols WHERE file_path = ?)",
+                "(SELECT id FROM symbols WHERE file_path = ?) "
+                "OR to_symbol_id IN (SELECT id FROM symbols WHERE file_path = ?)",
+                (file_path, file_path),
+            )
+            await conn.execute(
+                "DELETE FROM symbol_relationships WHERE to_file_path = ?",
                 (file_path,),
             )
             await conn.execute("DELETE FROM symbols WHERE file_path = ?", (file_path,))
@@ -134,6 +143,13 @@ class WorkspaceIndexer:
 
         for file_path in removed_paths:
             await conn.execute(
+                "DELETE FROM symbol_relationships WHERE from_symbol_id IN "
+                "(SELECT id FROM symbols WHERE file_path = ?) "
+                "OR to_symbol_id IN (SELECT id FROM symbols WHERE file_path = ?)",
+                (file_path, file_path),
+            )
+            await conn.execute("DELETE FROM symbol_relationships WHERE to_file_path = ?", (file_path,))
+            await conn.execute(
                 """
                 UPDATE file_index
                 SET stale = 1, last_indexed_at = datetime('now')
@@ -157,13 +173,11 @@ class WorkspaceIndexer:
             duration_ms=duration_ms,
         )
 
-    async def _summarize_pending_symbols(self) -> None:
+    async def _summarize_pending_symbols(self, batch_size: int = _DEFAULT_BATCH_SIZE) -> None:
         """Background task: fill NULL summaries for function/class symbols.
 
-        Reads each symbol's own source lines from disk (not the full file),
-        so the LLM sees only the relevant code. Runs up to _SUMMARY_CAP_PER_RUN
-        summarizations per call and commits each result immediately so partial
-        progress is preserved if cancelled.
+        Sends symbols in batches of batch_size to reduce LLM call count.
+        Commits each batch immediately so partial progress is preserved.
         """
         if self._summarizer is None:
             return
@@ -181,25 +195,43 @@ class WorkspaceIndexer:
             (_SUMMARY_CAP_PER_RUN,),
         )
         rows = await cursor.fetchall()
-        for row in rows:
+        logger.info("_summarize_pending_symbols: %d symbols to process, batch_size=%d", len(rows), batch_size)
+
+        # Group into batches of batch_size
+        for i in range(0, len(rows), batch_size):
+            batch_rows = rows[i : i + batch_size]
+            batch_symbols: list[dict] = []
+            for row in batch_rows:
+                try:
+                    lines = self._read_text(
+                        self._config.workspace_path / row["file_path"]
+                    ).splitlines()
+                    source = "\n".join(lines[row["start_line"] - 1 : row["end_line"]])
+                    batch_symbols.append({
+                        "id": row["id"],
+                        "name": row["name"],
+                        "kind": row["kind"],
+                        "signature": row["signature"] or "",
+                        "source": source,
+                    })
+                except Exception:
+                    pass
+
+            if not batch_symbols:
+                continue
+
+            logger.info("_summarize_pending_symbols: sending batch %d/%d (%d symbols)", i // batch_size + 1, (len(rows) + batch_size - 1) // batch_size, len(batch_symbols))
             try:
-                lines = self._read_text(
-                    self._config.workspace_path / row["file_path"]
-                ).splitlines()
-                symbol_source = "\n".join(lines[row["start_line"] - 1 : row["end_line"]])
-                summary = await self._summarizer.summarize(
-                    name=row["name"],
-                    kind=row["kind"],
-                    signature=row["signature"] or "",
-                    source=symbol_source,
-                )
-                await conn.execute(
-                    "UPDATE symbols SET summary = ? WHERE id = ?",
-                    (summary, row["id"]),
-                )
+                summaries = await self._summarizer.summarize_batch(batch_symbols)
+                logger.info("_summarize_pending_symbols: batch returned %d summaries", len(summaries))
+                for sym_id, summary in summaries.items():
+                    await conn.execute(
+                        "UPDATE symbols SET summary = ? WHERE id = ?",
+                        (summary, sym_id),
+                    )
                 await conn.commit()
             except Exception:
-                pass  # never fail due to LLM error
+                logger.exception("_summarize_pending_symbols: batch %d failed", i // batch_size + 1)
 
     async def rebuild_memory(self) -> WorkspaceIndexResult:
         conn = await self._db.connect()

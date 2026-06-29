@@ -1,6 +1,6 @@
 import * as vscode from 'vscode';
 
-import { BackendClient, MemoryItemResponse } from '../BackendClient';
+import { BackendClient, MemoryItemResponse, IndexStatusResponse } from '../BackendClient';
 
 export const MEMORY_FILTERS = [
     'all',
@@ -21,6 +21,7 @@ export class MemoryManagerTreeProvider implements vscode.TreeDataProvider<vscode
     private filter: MemoryFilter = 'all';
     private items: MemoryItemResponse[] = [];
     private treeItems: vscode.TreeItem[] = [new vscode.TreeItem('Memory Manager not loaded yet.')];
+    private _pollTimer: ReturnType<typeof setInterval> | undefined;
 
     setClient(client: BackendClient | undefined): void {
         this.client = client;
@@ -47,16 +48,42 @@ export class MemoryManagerTreeProvider implements vscode.TreeDataProvider<vscode
         }
 
         try {
-            const response = await this.client.listMemoryItems(this.filter);
-            this.items = response.items;
-            this.treeItems = this.itemsToTreeItems(response.items);
+            const [memResponse, statusResponse] = await Promise.all([
+                this.client.listMemoryItems(this.filter),
+                this.client.getIndexStatus().catch(() => null as IndexStatusResponse | null),
+            ]);
+            this.items = memResponse.items;
+            this.treeItems = this.itemsToTreeItems(memResponse.items, statusResponse ?? undefined);
+
+            if (statusResponse?.summarizing) {
+                this._startPolling();
+            } else {
+                this._stopPolling();
+            }
         } catch (err: unknown) {
             const message = err instanceof Error ? err.message : String(err);
             this.items = [];
             this.treeItems = [new vscode.TreeItem(`Memory load failed: ${message}`)];
+            this._stopPolling();
         }
 
         this._onDidChangeTreeData.fire(undefined);
+    }
+
+    private _startPolling(): void {
+        if (this._pollTimer) { return; }
+        this._pollTimer = setInterval(() => { void this.refresh(); }, 10_000);
+    }
+
+    private _stopPolling(): void {
+        if (this._pollTimer) {
+            clearInterval(this._pollTimer);
+            this._pollTimer = undefined;
+        }
+    }
+
+    dispose(): void {
+        this._stopPolling();
     }
 
     getTreeItem(element: vscode.TreeItem): vscode.TreeItem {
@@ -67,11 +94,25 @@ export class MemoryManagerTreeProvider implements vscode.TreeDataProvider<vscode
         return this.treeItems;
     }
 
-    private itemsToTreeItems(items: MemoryItemResponse[]): vscode.TreeItem[] {
+    private itemsToTreeItems(items: MemoryItemResponse[], status?: IndexStatusResponse): vscode.TreeItem[] {
         const header = new vscode.TreeItem(`Filter: ${this.filter} (${items.length} items)`);
         header.description = 'Use "Review Memory" command to change filter and act on items.';
 
         if (items.length === 0) {
+            if (status?.summarizing) {
+                const pending = status.symbols_pending_summary ?? 0;
+                const spinner = new vscode.TreeItem(`Summarizing symbols... (${pending} remaining)`);
+                spinner.iconPath = new vscode.ThemeIcon('sync~spin');
+                spinner.description = 'Memory items will appear when complete.';
+                return [header, spinner];
+            }
+            if ((status?.symbols_pending_summary ?? 0) > 0) {
+                const pending = status!.symbols_pending_summary!;
+                const nudge = new vscode.TreeItem(`${pending} symbols not yet summarized`);
+                nudge.iconPath = new vscode.ThemeIcon('warning');
+                nudge.description = 'Run Summarization to continue.';
+                return [header, nudge];
+            }
             return [header, new vscode.TreeItem('No memory items found for current filter.')];
         }
 

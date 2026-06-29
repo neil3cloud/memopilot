@@ -68,7 +68,7 @@ from .retention import enforce_retention
 from .security_policy import CredentialRedactor, DatabaseWriteBlocker
 from .skill_loader import SkillLoaderService
 from .vector_backfill_service import VectorBackfillService
-from .context_synthesizer import ContextSynthesizer
+from .context_synthesizer import ContextSynthesizer, build_synthesis_user_prompt
 from .symbol_summarizer import SymbolSummarizer
 from .workspace_indexer import WorkspaceIndexer
 from .workspace_init import ensure_global_config, generate_workspace_bootstrap
@@ -92,6 +92,153 @@ _symbol_summarizer: SymbolSummarizer | None = None
 # Host model relay state — extension acts as LLM proxy for VS Code Copilot
 _task_sse_queues: dict[str, asyncio.Queue] = {}
 _host_relay_futures: dict[str, asyncio.Future] = {}
+
+# Summarization progress counter — tracks concurrent background runs safely
+_summarization_in_progress_count: int = 0
+
+# Strong references to background tasks — prevents GC from cancelling them mid-run
+_background_tasks: set["asyncio.Task[None]"] = set()
+
+# Session-based auto-writeback — accumulates tool call context, fires after inactivity
+_SESSION_INACTIVITY_SECONDS: int = 300  # 5 minutes
+_session_tool_calls: list[dict] = []  # {task_description, files_in_focus, ts}
+_session_synthesis_task: "asyncio.Task[None] | None" = None
+
+# LLM mode — "copilot" | "cloud" | "local"
+# copilot: all LLM calls routed through vscode.lm SSE relay
+# cloud: direct HTTP to configured cloud provider (anthropic/openai)
+# local: direct HTTP to configured local provider (LM Studio/Ollama)
+_llm_mode: str = "local"
+_llm_mode_model_id: str = ""  # copilot model id from probe
+
+# Unified LLM relay — extension listens on SSE, fulfills requests via vscode.lm
+_relay_sse_queue: asyncio.Queue = asyncio.Queue()
+_relay_futures: dict[str, asyncio.Future] = {}
+
+# Legacy aliases kept for backwards compat with existing synthesis path
+_host_model_available: bool = False
+_synthesis_sse_queue: asyncio.Queue = _relay_sse_queue
+_synthesis_relay_futures: dict[str, asyncio.Future] = _relay_futures
+
+
+def _get_effective_summarizer() -> "SymbolSummarizer | None":
+    """Return the summarizer to use based on current LLM mode."""
+    from .llm_client import RelayLLMClient
+    if _llm_mode == "copilot" and _host_model_available:
+        return SymbolSummarizer(RelayLLMClient(_relay_llm_request, request_type="summarize"))
+    return _symbol_summarizer
+
+
+async def _relay_llm_request(
+    request_type: str,
+    system: str,
+    user: str,
+    ctx_tokens: int = 0,
+    timeout: float = 45.0,
+    retry_delays: tuple[float, ...] = (1.0, 2.0, 4.0),
+) -> str:
+    """Send an LLM request through the extension SSE relay (copilot mode).
+
+    Retries with exponential backoff on llm_mode_changed or timeout.
+    Raises RuntimeError if all retries fail or mode switches away from copilot.
+    """
+    relay_id = str(uuid.uuid4())
+    loop = asyncio.get_event_loop()
+    fut: asyncio.Future = loop.create_future()
+    _relay_futures[relay_id] = fut
+    await _relay_sse_queue.put({
+        "type": "LLM_REQUEST",
+        "request_type": request_type,
+        "relay_id": relay_id,
+        "system": system,
+        "user": user,
+        "ctx_tokens": ctx_tokens,
+    })
+    try:
+        result = await asyncio.wait_for(fut, timeout=timeout)
+        return result
+    except (asyncio.TimeoutError, RuntimeError) as exc:
+        _relay_futures.pop(relay_id, None)
+        # If mode changed mid-flight, do not retry
+        if "llm_mode_changed" in str(exc):
+            raise
+        # Retry with backoff for transient failures
+        for delay in retry_delays:
+            if _llm_mode != "copilot":
+                raise RuntimeError("llm_mode_changed")
+            await asyncio.sleep(delay)
+            relay_id = str(uuid.uuid4())
+            fut = loop.create_future()
+            _relay_futures[relay_id] = fut
+            await _relay_sse_queue.put({
+                "type": "LLM_REQUEST",
+                "request_type": request_type,
+                "relay_id": relay_id,
+                "system": system,
+                "user": user,
+                "ctx_tokens": ctx_tokens,
+            })
+            try:
+                result = await asyncio.wait_for(fut, timeout=timeout)
+                return result
+            except (asyncio.TimeoutError, RuntimeError):
+                _relay_futures.pop(relay_id, None)
+        raise RuntimeError(f"relay failed after retries: {exc}")
+
+
+def _record_session_tool_call(task_description: str, files_in_focus: list[str]) -> None:
+    """Record a copilot tool call and reset the inactivity synthesis timer."""
+    import time as _time
+    global _session_synthesis_task
+    _session_tool_calls.append({
+        "task_description": task_description,
+        "files_in_focus": files_in_focus,
+        "ts": _time.time(),
+    })
+    logger.debug("session_tool_call recorded: %d in queue", len(_session_tool_calls))
+    # Cancel existing timer and reschedule
+    if _session_synthesis_task and not _session_synthesis_task.done():
+        _session_synthesis_task.cancel()
+    _session_synthesis_task = asyncio.create_task(_delayed_session_synthesis())
+    _background_tasks.add(_session_synthesis_task)
+    _session_synthesis_task.add_done_callback(_background_tasks.discard)
+
+
+async def _delayed_session_synthesis() -> None:
+    """Wait for inactivity window then synthesize session learnings into memory items."""
+    global _session_tool_calls
+    try:
+        await asyncio.sleep(_SESSION_INACTIVITY_SECONDS)
+    except asyncio.CancelledError:
+        return  # A new tool call came in — timer was reset, do nothing
+
+    calls = _session_tool_calls.copy()
+    _session_tool_calls.clear()
+
+    if not calls:
+        return
+
+    effective_client = _get_session_writeback_client()
+    if effective_client is None:
+        logger.warning("session_synthesis: no LLM client available, skipping")
+        return
+
+    logger.info("session_synthesis: firing for %d tool call(s)", len(calls))
+    try:
+        from .memory_seeder import MemorySeederService
+        seeder = MemorySeederService(config=_get_config(), db=_get_db())
+        count = await seeder.synthesize_session(calls, client=effective_client)
+        logger.info("session_synthesis: wrote %d memory item(s)", count)
+    except Exception:
+        logger.exception("session_synthesis: failed")
+
+
+def _get_session_writeback_client() -> "BaseLLMClient | None":
+    """Return the best available LLM client for session synthesis."""
+    from .llm_client import RelayLLMClient
+    if _llm_mode == "copilot" and _host_model_available:
+        return RelayLLMClient(_relay_llm_request, request_type="synthesize")
+    return _writeback_client
 
 
 async def _create_mcp_dispatcher() -> MCPDispatcher:
@@ -138,6 +285,7 @@ class WorkspaceIndexResponse(BaseModel):
 
 class WorkspaceIndexRequest(BaseModel):
     seed_memory: bool = True
+    summarization_batch_size: int = 25
 
 
 class WorkspaceIndexStatusResponse(BaseModel):
@@ -158,6 +306,8 @@ class IndexStatusResponse(BaseModel):
     symbols_count: int
     last_indexed_at: str | None = None
     never_indexed: bool
+    symbols_pending_summary: int = 0
+    summarizing: bool = False
 
 
 def _workspace_index_response_kwargs(result: object) -> dict[str, object]:
@@ -216,6 +366,20 @@ class TaskRunCostResponse(BaseModel):
     estimated_cost_usd: float = 0.0
     actual_cost_usd: float = 0.0
     selected_tier: str = "local"
+
+
+class TaskRunStartRequest(BaseModel):
+    user_request: str
+    selected_model: str | None = None
+    estimated_cost: float | None = Field(default=None, ge=0)
+    task_type: str | None = None
+    mode: str | None = None
+    risk_level: str | None = None
+    workspace_root: str | None = None
+
+
+class TaskRunStartResponse(BaseModel):
+    task_run_id: str
 
 
 class TaskHistoryEntry(BaseModel):
@@ -1517,15 +1681,28 @@ async def index_workspace(request: WorkspaceIndexRequest | None = None) -> Works
     config = _get_config()
     db = _get_db()
     seed_memory = request.seed_memory if request is not None else True
+    batch_size = max(1, request.summarization_batch_size if request is not None else 25)
 
-    indexer = WorkspaceIndexer(config=config, db=db, summarizer=_symbol_summarizer)
+    effective_summarizer = _get_effective_summarizer()
+    indexer = WorkspaceIndexer(config=config, db=db, summarizer=effective_summarizer)
     result = await indexer.index_workspace()
-    if _symbol_summarizer is not None and result.indexed_files > 0:
-        asyncio.create_task(indexer._summarize_pending_symbols())
+    if effective_summarizer is not None:
+        async def _run_summarization() -> None:
+            global _summarization_in_progress_count
+            _summarization_in_progress_count += 1
+            try:
+                await indexer._summarize_pending_symbols(batch_size=batch_size)
+            except Exception:
+                logger.exception("_run_summarization (index) failed")
+            finally:
+                _summarization_in_progress_count = max(0, _summarization_in_progress_count - 1)
+        _t = asyncio.create_task(_run_summarization())
+        _background_tasks.add(_t)
+        _t.add_done_callback(_background_tasks.discard)
     profile_service = WorkspaceProfileService(config=config, db=db)
     await profile_service.ensure_profile()
     memory_items_seeded = 0
-    if seed_memory and result.indexed_files > 0:
+    if seed_memory:
         seeder = MemorySeederService(config=config, db=db)
         memory_items_seeded = await seeder.seed(str(config.workspace_path))
 
@@ -1556,9 +1733,19 @@ async def workspace_index_status() -> IndexStatusResponse:
     symbols_cursor = await conn.execute("SELECT COUNT(*) AS symbols_count FROM symbols")
     symbols_row = await symbols_cursor.fetchone()
 
+    pending_cursor = await conn.execute(
+        """
+        SELECT COUNT(*) AS cnt FROM symbols s
+        JOIN file_index fi ON fi.file_path = s.file_path
+        WHERE s.summary IS NULL AND s.kind IN ('function', 'class') AND fi.stale = 0
+        """
+    )
+    pending_row = await pending_cursor.fetchone()
+
     indexed_files = int(file_row["indexed_files"] or 0)
     stale_files = int(file_row["stale_files"] or 0)
     symbols_count = int(symbols_row["symbols_count"] or 0)
+    symbols_pending_summary = int(pending_row["cnt"] or 0)
 
     return IndexStatusResponse(
         indexed_files=indexed_files,
@@ -1566,15 +1753,71 @@ async def workspace_index_status() -> IndexStatusResponse:
         symbols_count=symbols_count,
         last_indexed_at=file_row["last_indexed_at"],
         never_indexed=(indexed_files == 0 and stale_files == 0 and symbols_count == 0),
+        symbols_pending_summary=symbols_pending_summary,
+        summarizing=_summarization_in_progress_count > 0,
     )
 
 
+class RebuildMemoryRequest(BaseModel):
+    summarization_batch_size: int = 25
+
+
 @app.post("/v1/workspace/rebuild-memory", response_model=RebuildMemoryResponse)
-async def rebuild_memory() -> RebuildMemoryResponse:
+async def rebuild_memory(request: RebuildMemoryRequest | None = None) -> RebuildMemoryResponse:
     """Rebuild indexed workspace memory from source code."""
-    indexer = WorkspaceIndexer(config=_get_config(), db=_get_db())
+    batch_size = max(1, request.summarization_batch_size if request is not None else 25)
+    config = _get_config()
+    db = _get_db()
+    effective_summarizer = _get_effective_summarizer()
+    logger.info("rebuild_memory: batch_size=%d mode=%s summarizer=%s", batch_size, _llm_mode, type(effective_summarizer).__name__ if effective_summarizer else "None")
+    indexer = WorkspaceIndexer(config=config, db=db, summarizer=effective_summarizer)
     result = await indexer.rebuild_memory()
+    if effective_summarizer is not None:
+        async def _run_summarization() -> None:
+            global _summarization_in_progress_count
+            _summarization_in_progress_count += 1
+            try:
+                await indexer._summarize_pending_symbols(batch_size=batch_size)
+            except Exception:
+                logger.exception("_run_summarization (rebuild) failed")
+            finally:
+                _summarization_in_progress_count = max(0, _summarization_in_progress_count - 1)
+        _t = asyncio.create_task(_run_summarization())
+        _background_tasks.add(_t)
+        _t.add_done_callback(_background_tasks.discard)
+    else:
+        logger.warning("rebuild_memory: no summarizer available, skipping summarization")
     return RebuildMemoryResponse(rebuilt=True, **_workspace_index_response_kwargs(result))
+
+
+@app.post("/v1/workspace/summarize", response_model=RebuildMemoryResponse)
+async def summarize_pending(request: RebuildMemoryRequest | None = None) -> RebuildMemoryResponse:
+    """Summarize any symbols that don't yet have a summary, without re-indexing."""
+    batch_size = max(1, request.summarization_batch_size if request is not None else 25)
+    config = _get_config()
+    db = _get_db()
+    effective_summarizer = _get_effective_summarizer()
+    logger.info("summarize_pending: batch_size=%d mode=%s summarizer=%s", batch_size, _llm_mode, type(effective_summarizer).__name__ if effective_summarizer else "None")
+    _empty = RebuildMemoryResponse(rebuilt=False, python_project=True, total_files_scanned=0, indexed_files=0, unchanged_files=0, stale_files=0, skipped_files=0, symbols_extracted=0, duration_ms=0)
+    if effective_summarizer is None:
+        logger.warning("summarize_pending: no summarizer available")
+        return _empty
+    indexer = WorkspaceIndexer(config=config, db=db, summarizer=effective_summarizer)
+
+    async def _run_summarization() -> None:
+        global _summarization_in_progress_count
+        _summarization_in_progress_count += 1
+        try:
+            await indexer._summarize_pending_symbols(batch_size=batch_size)
+        except Exception:
+            logger.exception("_run_summarization (summarize-only) failed")
+        finally:
+            _summarization_in_progress_count = max(0, _summarization_in_progress_count - 1)
+
+    _t = asyncio.create_task(_run_summarization())
+    _background_tasks.add(_t)
+    _t.add_done_callback(_background_tasks.discard)
+    return _empty
 
 
 def _to_budget_status_response(status) -> BudgetStatusResponse:
@@ -1638,6 +1881,42 @@ def _to_model_route_budget_check_response(
     )
 
 
+class UsageStatsResponse(BaseModel):
+    symbols_indexed: int = 0
+    symbols_summarized: int = 0
+    memory_items_total: int = 0
+    memory_items_learned: int = 0
+    session_queries: int = 0
+
+
+@app.get("/v1/usage/stats", response_model=UsageStatsResponse)
+async def usage_stats() -> UsageStatsResponse:
+    """Lightweight usage statistics for the Usage Stats panel."""
+    try:
+        conn = await _get_db().connect()
+        symbols_indexed = (await (await conn.execute(
+            "SELECT COUNT(*) FROM symbols WHERE kind IN ('function','class')"
+        )).fetchone())[0]
+        symbols_summarized = (await (await conn.execute(
+            "SELECT COUNT(*) FROM symbols WHERE summary IS NOT NULL AND kind IN ('function','class')"
+        )).fetchone())[0]
+        memory_items_total = (await (await conn.execute(
+            "SELECT COUNT(*) FROM memory_items WHERE stale=0"
+        )).fetchone())[0]
+        memory_items_learned = (await (await conn.execute(
+            "SELECT COUNT(*) FROM memory_items WHERE stale=0 AND type='learned'"
+        )).fetchone())[0]
+    except Exception:
+        symbols_indexed = symbols_summarized = memory_items_total = memory_items_learned = 0
+    return UsageStatsResponse(
+        symbols_indexed=symbols_indexed,
+        symbols_summarized=symbols_summarized,
+        memory_items_total=memory_items_total,
+        memory_items_learned=memory_items_learned,
+        session_queries=len(_session_tool_calls),
+    )
+
+
 @app.get("/v1/cost/budget/status", response_model=BudgetStatusResponse)
 @app.get("/v1/cost/budget-status", response_model=BudgetStatusResponse)
 async def budget_status() -> BudgetStatusResponse:
@@ -1675,6 +1954,27 @@ async def check_budget(request: BudgetCheckRequest) -> BudgetCheckResponse:
         estimated_cost_usd=result.estimated_cost_usd,
         budget=_to_budget_status_response(result.status),
     )
+
+
+@app.post("/v1/task-runs/start", response_model=TaskRunStartResponse)
+async def start_task_run(request: TaskRunStartRequest) -> TaskRunStartResponse:
+    """Create a task run record for downstream cost and telemetry logging."""
+    config = _get_config()
+    workspace_root = request.workspace_root
+    if workspace_root:
+        workspace_service = WorkspaceRootsService(config=config, db=_get_db())
+        workspace_root = str(await workspace_service.resolve_workspace_root(workspace_root))
+    service = CostGuardService(config=config, db=_get_db())
+    task_run_id = await service.create_task_run(
+        user_request=request.user_request,
+        task_type=request.task_type,
+        mode=request.mode,
+        risk_level=request.risk_level,
+        selected_model=request.selected_model,
+        estimated_cost=request.estimated_cost,
+        workspace_root=workspace_root,
+    )
+    return TaskRunStartResponse(task_run_id=task_run_id)
 
 
 @app.post("/v1/vector/backfill", response_model=VectorBackfillResponse)
@@ -1845,6 +2145,7 @@ def _serialize_context_item(item: ContextItem) -> dict[str, object]:
     return {
         "content": item.content,
         "source": item.source,
+        "reference_id": item.reference_id,
         "source_type": item.source_type,
         "tokens": item.tokens,
         "relevance_score": item.relevance_score,
@@ -1858,6 +2159,7 @@ def _serialize_context_item(item: ContextItem) -> dict[str, object]:
 def _serialize_excluded_item(item) -> dict[str, object]:
     return {
         "source": item.source,
+        "reference_id": item.reference_id,
         "source_type": item.source_type,
         "exclusion_reason": item.exclusion_reason.value,
         "tokens_would_have_used": item.tokens_would_have_used,
@@ -2099,6 +2401,7 @@ async def _generate_context_pack_response(request: ContextBuildRequest) -> Conte
                 {
                     "content": f"{item.title}\n\n{item.body}".strip(),
                     "source": source_path or item.memory_id,
+                    "reference_id": item.memory_id,
                     "source_type": "memory",
                     "tokens": _estimate_context_tokens(f"{item.title}\n\n{item.body}".strip()),
                     "relevance_score": item.relevance_score,
@@ -2188,10 +2491,14 @@ async def _generate_context_pack_response(request: ContextBuildRequest) -> Conte
         context_pack_hash=context_pack_hash,
         request_json=request.model_dump_json(),
         included_memory_ids=[
-            item.source for item in included_items if item.source_type == "memory"
+            item.reference_id or item.source
+            for item in included_items
+            if item.source_type == "memory"
         ],
         excluded_memory_ids=[
-            item.source for item in excluded_items if item.source_type == "memory"
+            item.reference_id or item.source
+            for item in excluded_items
+            if item.source_type == "memory"
         ],
     )
 
@@ -2317,21 +2624,53 @@ async def assemble_context(request: ContextAssembleRequest) -> ContextAssembleRe
     )
     response = _render_assembled_context(request=request, context_pack=context_pack)
 
-    if (
-        _synthesizer is not None
-        and request.caller == "copilot_lm_tool"
-        and response.total_tokens > 1000
-    ):
-        try:
-            synthesized = await _synthesizer.synthesize(
-                task=request.task_description,
-                raw_markdown=response.rendered_markdown,
-                max_tokens=request.max_output_tokens or 4000,
-            )
-            response.rendered_markdown = synthesized
-            response.total_tokens = len(synthesized) // 4
-        except Exception:
-            pass  # fall back to unsynthesized context on any error
+    if request.caller == "copilot_lm_tool":
+        _record_session_tool_call(
+            task_description=request.task_description,
+            files_in_focus=list(request.files_in_focus or []),
+        )
+
+    if request.caller == "copilot_lm_tool" and response.total_tokens > 1000:
+        if _llm_mode == "copilot" and _host_model_available:
+            try:
+                synthesis_id = str(uuid.uuid4())
+                loop = asyncio.get_event_loop()
+                fut: asyncio.Future = loop.create_future()
+                _relay_futures[synthesis_id] = fut
+                from .context_synthesizer import SYSTEM as SYNTH_SYSTEM
+                user_prompt = build_synthesis_user_prompt(
+                    task=request.task_description,
+                    raw_markdown=response.rendered_markdown,
+                    max_chars=6000,
+                )
+                await _relay_sse_queue.put({
+                    "type": "LLM_REQUEST",
+                    "request_type": "synthesize",
+                    "relay_id": synthesis_id,
+                    "system": SYNTH_SYSTEM,
+                    "user": user_prompt,
+                    "ctx_tokens": response.total_tokens,
+                })
+                synthesized = await asyncio.wait_for(fut, timeout=30.0)
+                if synthesized:
+                    response.rendered_markdown = synthesized
+                    response.total_tokens = len(synthesized) // 4
+            except Exception:
+                _relay_futures.pop(synthesis_id, None)
+        elif _synthesizer is not None:
+            try:
+                synthesized = await asyncio.wait_for(
+                    _synthesizer.synthesize(
+                        task=request.task_description,
+                        raw_markdown=response.rendered_markdown,
+                        max_tokens=request.max_output_tokens or 4000,
+                    ),
+                    timeout=15.0,
+                )
+                response.rendered_markdown = synthesized
+                response.total_tokens = len(synthesized) // 4
+            except Exception:
+                pass
 
     return response
 
@@ -2643,6 +2982,113 @@ async def host_llm_response(response: HostResponseRequest):
         content = "".join(getattr(fut, "_token_buffer", []))
         fut.set_result(content)
         _host_relay_futures.pop(response.task_run_id, None)
+
+    return {"ok": True}
+
+
+class HostModelReadyRequest(BaseModel):
+    available: bool
+    model_id: str = ""
+
+
+@app.post("/v1/host/model-ready")
+async def host_model_ready(request: HostModelReadyRequest):
+    """Extension calls this once at startup after probing vscode.lm."""
+    global _host_model_available, _llm_mode, _llm_mode_model_id
+    _host_model_available = request.available
+    _llm_mode_model_id = request.model_id
+    if request.available and _llm_mode == "local":
+        # Auto-upgrade to copilot on first successful probe
+        _llm_mode = "copilot"
+    logger.info("Host model probe: available=%s model=%s mode=%s", request.available, request.model_id, _llm_mode)
+    return {"ok": True}
+
+
+class LLMModeRequest(BaseModel):
+    mode: str  # "copilot" | "cloud" | "local"
+
+
+@app.post("/v1/config/llm-mode")
+async def set_llm_mode(request: LLMModeRequest):
+    """Extension posts this when user toggles the LLM mode."""
+    global _llm_mode
+    allowed = {"copilot", "cloud", "local"}
+    if request.mode not in allowed:
+        raise HTTPException(status_code=400, detail=f"mode must be one of {allowed}")
+    if request.mode == "copilot" and not _host_model_available:
+        raise HTTPException(status_code=400, detail="Copilot model not available — probe first")
+    prev = _llm_mode
+    _llm_mode = request.mode
+    # Cancel any in-flight relay futures so they fail fast and caller can retry
+    if prev != request.mode:
+        for fut in list(_relay_futures.values()):
+            if not fut.done():
+                fut.set_exception(RuntimeError("llm_mode_changed"))
+        _relay_futures.clear()
+    logger.info("LLM mode changed: %s → %s", prev, request.mode)
+    return {"ok": True, "mode": _llm_mode}
+
+
+@app.get("/v1/config/llm-mode")
+async def get_llm_mode():
+    """Return current LLM mode and available options."""
+    return {
+        "mode": _llm_mode,
+        "model_id": _llm_mode_model_id,
+        "copilot_available": _host_model_available,
+        "cloud_available": _writeback_client is not None and getattr(_writeback_client, "provider_name", "") not in ("local", ""),
+        "local_available": _writeback_client is not None and getattr(_writeback_client, "provider_name", "") == "local",
+    }
+
+
+@app.get("/v1/synthesis/stream")
+async def synthesis_stream(request: Request):
+    """SSE stream the extension listens on for all LLM_REQUEST relay events."""
+    async def event_generator():
+        while True:
+            if await request.is_disconnected():
+                break
+            try:
+                event = await asyncio.wait_for(_relay_sse_queue.get(), timeout=30.0)
+                yield f"data: {json.dumps(event)}\n\n"
+            except asyncio.TimeoutError:
+                yield ": keepalive\n\n"
+    return StreamingResponse(event_generator(), media_type="text/event-stream")
+
+
+class RelayResponseRequest(BaseModel):
+    relay_id: str
+    token: str = ""
+    is_final: bool = False
+    error: str | None = None
+    # Legacy field — maps to relay_id if relay_id not provided
+    synthesis_id: str = ""
+
+
+@app.post("/v1/synthesis/host-response")
+async def synthesis_host_response(response: RelayResponseRequest):
+    """Extension streams relay tokens back here (used for all request types)."""
+    rid = response.relay_id or response.synthesis_id
+    fut = _relay_futures.get(rid)
+    if fut is None or fut.done():
+        return {"ok": True}
+
+    if response.error:
+        if not fut.done():
+            fut.set_exception(RuntimeError(response.error))
+        _relay_futures.pop(rid, None)
+        return {"ok": True}
+
+    if not hasattr(fut, "_token_buffer"):
+        fut._token_buffer = []  # type: ignore[attr-defined]
+    if response.token:
+        fut._token_buffer.append(response.token)  # type: ignore[attr-defined]
+
+    if response.is_final:
+        content = "".join(getattr(fut, "_token_buffer", []))
+        if not fut.done():
+            fut.set_result(content)
+        _relay_futures.pop(rid, None)
 
     return {"ok": True}
 
@@ -2981,11 +3427,13 @@ async def run_agentic_mcp(request: AgenticRunRequest) -> AgenticRunResponse:
                     task_description=request.context,
                     outcome=outcome,
                 )
-                logger.debug("Task writeback: %d fact(s) stored", count)
+                logger.info("Task writeback: %d fact(s) stored", count)
             except Exception as exc:
-                logger.debug("Task writeback failed (non-fatal): %s", exc)
+                logger.warning("Task writeback failed (non-fatal): %s", exc)
 
-        asyncio.create_task(_writeback_task())
+        _t = asyncio.create_task(_writeback_task())
+        _background_tasks.add(_t)
+        _t.add_done_callback(_background_tasks.discard)
 
     return agentic_response
 
