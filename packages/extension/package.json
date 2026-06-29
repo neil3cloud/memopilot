@@ -178,6 +178,21 @@
         "command": "memopilot.switchLLMMode",
         "title": "MemoPilot: Switch LLM Mode",
         "icon": "$(settings-gear)"
+      },
+      {
+        "command": "memopilot.bulkApproveMemory",
+        "title": "MemoPilot: Bulk Approve Memory",
+        "icon": "$(check-all)"
+      },
+      {
+        "command": "memopilot.approveMemoryItem",
+        "title": "Approve",
+        "icon": "$(check)"
+      },
+      {
+        "command": "memopilot.rejectMemoryItem",
+        "title": "Reject",
+        "icon": "$(x)"
       }
     ],
     "menus": {
@@ -192,6 +207,23 @@
           "command": "memopilot.runSummarization",
           "when": "view == memopilot-memory && memopilot.llmReady",
           "group": "navigation"
+        },
+        {
+          "command": "memopilot.bulkApproveMemory",
+          "when": "view == memopilot-memory",
+          "group": "navigation"
+        }
+      ],
+      "view/item/context": [
+        {
+          "command": "memopilot.approveMemoryItem",
+          "when": "view == memopilot-memory && viewItem == pending",
+          "group": "inline@1"
+        },
+        {
+          "command": "memopilot.rejectMemoryItem",
+          "when": "view == memopilot-memory && viewItem == pending",
+          "group": "inline@2"
         }
       ]
     },
