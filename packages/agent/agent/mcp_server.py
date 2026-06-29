@@ -1,8 +1,7 @@
 """Standalone MCP server implementing the Model Context Protocol for MemoPilot.
 
-Exposes 7 tools over stdio JSON-RPC:
-  memory_search, memory_store, context_build, model_route, patch_validate,
-  cost_check, memopilot-patch
+Exposes retrieval-first tools over stdio JSON-RPC:
+    memopilot-search, memopilot-symbols, memopilot-memory, memopilot-profile
 
 Start with: python -m agent.mcp_server
 """
@@ -11,13 +10,29 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import sys
+from pathlib import Path
 from typing import Any
+
+from .context_renderer import ContextPackRenderer
 
 _TOOL_SCHEMAS = [
     {
-        "name": "memory_search",
-        "description": "Search the MemoPilot memory store for relevant context.",
+        "name": "memopilot-search",
+        "description": "Assemble bounded code context for a developer query.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string"},
+                "max_output_tokens": {"type": "integer", "default": 4000},
+            },
+            "required": ["query"],
+        },
+    },
+    {
+        "name": "memopilot-symbols",
+        "description": "Look up symbols in the indexed workspace by exact or partial name.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -28,81 +43,23 @@ _TOOL_SCHEMAS = [
         },
     },
     {
-        "name": "memory_store",
-        "description": "Store a new memory item in the MemoPilot memory store.",
+        "name": "memopilot-memory",
+        "description": "Search the MemoPilot memory store for durable project facts.",
         "inputSchema": {
             "type": "object",
             "properties": {
-                "title": {"type": "string"},
-                "body": {"type": "string"},
-                "memory_class": {"type": "string", "default": "fact"},
+                "query": {"type": "string"},
+                "limit": {"type": "integer", "default": 10},
             },
-            "required": ["title", "body"],
+            "required": ["query"],
         },
     },
     {
-        "name": "context_build",
-        "description": "Build a context pack for a given task description.",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "task_description": {"type": "string"},
-                "suggested_files": {"type": "array", "items": {"type": "string"}},
-            },
-            "required": ["task_description"],
-        },
-    },
-    {
-        "name": "model_route",
-        "description": "Select the optimal model for a task.",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "task_type": {"type": "string"},
-                "context_tokens": {"type": "integer"},
-                "privacy_level": {"type": "string", "default": "local_preferred"},
-            },
-            "required": ["task_type", "context_tokens"],
-        },
-    },
-    {
-        "name": "patch_validate",
-        "description": "Validate a unified diff patch for syntax and safety.",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "diff": {"type": "string"},
-                "file_path": {"type": "string"},
-            },
-            "required": ["diff"],
-        },
-    },
-    {
-        "name": "cost_check",
-        "description": "Check remaining AI budget and cost status.",
+        "name": "memopilot-profile",
+        "description": "Return the current workspace profile and inferred project signals.",
         "inputSchema": {
             "type": "object",
             "properties": {},
-        },
-    },
-    {
-        "name": "memopilot-patch",
-        "description": (
-            "Generate a code patch using MemoPilot's LLM provider chain. "
-            "Returns a unified diff that implements the requested change."
-        ),
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "task_description": {"type": "string"},
-                "context_files": {
-                    "type": "array",
-                    "items": {"type": "string"},
-                    "description": "File paths to include as context.",
-                },
-                "workspace_root": {"type": "string"},
-            },
-            "required": ["task_description"],
         },
     },
 ]
@@ -111,27 +68,34 @@ _TOOL_SCHEMAS = [
 class MCPServer:
     def __init__(self) -> None:
         self._request_id: int = 0
+        self._renderer = ContextPackRenderer()
 
     async def run(self) -> None:
-        reader = asyncio.StreamReader()
-        protocol = asyncio.StreamReaderProtocol(reader)
         loop = asyncio.get_event_loop()
+        queue: asyncio.Queue[str | None] = asyncio.Queue()
 
-        await loop.connect_read_pipe(lambda: protocol, sys.stdin)
-        _, writer = await loop.connect_write_pipe(
-            lambda: asyncio.BaseProtocol(), sys.stdout
-        )
+        def _read_stdin() -> None:
+            try:
+                for line in sys.stdin:
+                    loop.call_soon_threadsafe(queue.put_nowait, line)
+            except Exception:
+                pass
+            finally:
+                loop.call_soon_threadsafe(queue.put_nowait, None)
+
+        import threading
+        threading.Thread(target=_read_stdin, daemon=True).start()
 
         while True:
             try:
-                line = await reader.readline()
-                if not line:
+                line = await queue.get()
+                if line is None:
                     break
-                request = json.loads(line.decode("utf-8"))
+                request = json.loads(line)
                 response = await self._handle(request)
                 if response is not None:
-                    writer.write((json.dumps(response) + "\n").encode("utf-8"))
-                    await asyncio.sleep(0)  # yield to event loop
+                    sys.stdout.write(json.dumps(response) + "\n")
+                    sys.stdout.flush()
             except (json.JSONDecodeError, EOFError):
                 break
 
@@ -166,20 +130,14 @@ class MCPServer:
         return self._error(req_id, f"Unknown method: {method}")
 
     async def _dispatch(self, tool_name: str, args: dict[str, Any]) -> str:
-        if tool_name == "memory_search":
-            return await self._handle_memory_search(args)
-        if tool_name == "memory_store":
-            return await self._handle_memory_store(args)
-        if tool_name == "context_build":
-            return await self._handle_context_build(args)
-        if tool_name == "model_route":
-            return await self._handle_model_route(args)
-        if tool_name == "patch_validate":
-            return await self._handle_patch_validate(args)
-        if tool_name == "cost_check":
-            return await self._handle_cost_check(args)
-        if tool_name == "memopilot-patch":
-            return await self._handle_memopilot_patch(args)
+        if tool_name == "memopilot-search":
+            return await self._handle_memopilot_search(args)
+        if tool_name == "memopilot-symbols":
+            return await self._handle_memopilot_symbols(args)
+        if tool_name == "memopilot-memory":
+            return await self._handle_memopilot_memory(args)
+        if tool_name == "memopilot-profile":
+            return await self._handle_memopilot_profile()
         raise ValueError(f"Unknown tool: {tool_name}")
 
     # ------------------------------------------------------------------
@@ -192,12 +150,11 @@ class MCPServer:
         path: str,
         body: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
-        import os
-
         import httpx
 
-        token = os.environ.get("MEMOPILOT_TOKEN", "")
-        port = int(os.environ.get("MEMOPILOT_PORT", "8765"))
+        env = self._load_runtime_env()
+        token = env.get("MEMOPILOT_TOKEN", "")
+        port = int(env.get("MEMOPILOT_PORT", "8765"))
         url = f"http://127.0.0.1:{port}{path}"
         headers = {"X-Agent-Token": token}
 
@@ -209,133 +166,84 @@ class MCPServer:
         resp.raise_for_status()
         return resp.json()  # type: ignore[no-any-return]
 
-    async def _handle_memory_search(self, args: dict[str, Any]) -> str:
+    async def _handle_memopilot_search(self, args: dict[str, Any]) -> str:
+        result = await self._backend_request(
+            "POST",
+            "/v1/context/assemble",
+            {
+                "task_description": args["query"],
+                "files_in_focus": args.get("files_in_focus", []),
+                "task_type_hint": args.get("task_type_hint", "general"),
+                "caller": "cursor_mcp_tool",
+                "max_output_tokens": args.get("max_output_tokens", 4000),
+            },
+        )
+        return str(result.get("rendered_markdown", "## MemoPilot Context\n\nNo content available."))
+
+    async def _handle_memopilot_symbols(self, args: dict[str, Any]) -> str:
+        result = await self._backend_request(
+            "POST",
+            "/v1/symbols/search",
+            {
+                "query": args["query"],
+                "limit": args.get("limit", 10),
+            },
+        )
+        items = result.get("symbols", [])
+        if not items:
+            return f"## MemoPilot Symbols\n\nNo symbols found for: \"{args['query']}\"\n"
+
+        lines = [f"## MemoPilot Symbols — \"{args['query']}\"\n", f"_{len(items)} result(s)_\n"]
+        for item in items:
+            location = f"{item.get('file_path', '?')}:{item.get('start_line', '?')}"
+            lines.append(f"### {item.get('name', 'unknown')} [{item.get('kind', 'unknown')}]")
+            lines.append(f"- Location: {location}")
+            if item.get("signature"):
+                lines.append(f"- Signature: `{item['signature']}`")
+            if item.get("summary"):
+                lines.append(f"- Summary: {item['summary']}")
+            lines.append("")
+        return "\n".join(lines).strip()
+
+    async def _handle_memopilot_memory(self, args: dict[str, Any]) -> str:
         result = await self._backend_request(
             "POST",
             "/v1/memory/recall",
             {"query": args["query"], "limit": args.get("limit", 10)},
         )
-        items = result.get("items", [])
-        if not items:
-            return "No memories found."
-        lines = [f"- [{item.get('trust_level', 0)}/10] {item.get('title', '')}: {item.get('body', '')[:200]}"
-                 for item in items]
-        return "\n".join(lines)
-
-    async def _handle_memory_store(self, args: dict[str, Any]) -> str:
-        result = await self._backend_request(
-            "POST",
-            "/v1/memory/suggestions",
-            {
-                "title": args["title"],
-                "body": args["body"],
-                "memory_class": args.get("memory_class", "fact"),
-                "source": "mcp",
-            },
-        )
-        return f"Memory stored: {result.get('memory_item_id', '(unknown)')}"
-
-    async def _handle_context_build(self, args: dict[str, Any]) -> str:
-        result = await self._backend_request(
-            "POST",
-            "/v1/context/build",
-            {
-                "task_description": args["task_description"],
-                "suggested_files": args.get("suggested_files", []),
-            },
-        )
-        return (
-            f"Context pack built â€” {result.get('total_tokens', 0):,} tokens, "
-            f"hash: {result.get('context_pack_hash', '?')}"
+        return self._renderer.render_memory_search(
+            caller="cursor_mcp_tool",
+            items=result.get("items", []),
+            query=args["query"],
         )
 
-    async def _handle_model_route(self, args: dict[str, Any]) -> str:
-        result = await self._backend_request(
-            "POST",
-            "/v1/model/route",
-            {
-                "task_type": args["task_type"],
-                "context_tokens": args["context_tokens"],
-                "privacy_level": args.get("privacy_level", "local_preferred"),
-            },
-        )
-        rec = result.get("recommended", {})
-        return (
-            f"Recommended: {rec.get('provider', '?')} / {rec.get('model_id', '?')} "
-            f"(${rec.get('cost_estimate_usd', 0):.4f}) â€” {'; '.join(rec.get('reasons', []))}"
-        )
+    async def _handle_memopilot_profile(self) -> str:
+        result = await self._backend_request("GET", "/v1/workspace/profile")
+        profile_yaml = result.get("profile_yaml", "")
+        if not profile_yaml:
+            return "## MemoPilot Workspace Profile\n\nNo workspace profile is available.\n"
+        return f"## MemoPilot Workspace Profile\n\n```yaml\n{profile_yaml.strip()}\n```"
 
-    async def _handle_patch_validate(self, args: dict[str, Any]) -> str:
-        diff = args.get("diff", "")
-        if not diff.strip().startswith("---"):
-            return "INVALID: diff must start with '--- '"
-        lines = diff.strip().splitlines()
-        hunks = sum(1 for l in lines if l.startswith("@@"))
-        return f"VALID: {hunks} hunk(s), {len(lines)} lines"
+    def _load_runtime_env(self) -> dict[str, str]:
+        env = dict(os.environ)
+        if env.get("MEMOPILOT_TOKEN") and env.get("MEMOPILOT_PORT"):
+            return env
 
-    async def _handle_cost_check(self, _args: dict[str, Any]) -> str:
-        try:
-            result = await self._backend_request("GET", "/v1/cost/report/savings")
-            return (
-                f"Month spend: ${result.get('month_spend_usd', 0):.4f} | "
-                f"Cache hits: {result.get('month_cache_hits', 0)}/{result.get('month_total_ai_calls', 0)} | "
-                f"Savings: ${result.get('cache_savings_usd', 0):.4f}"
-            )
-        except Exception:
-            return "Budget status unavailable."
-
-    async def _handle_memopilot_patch(self, args: dict[str, Any]) -> str:
-        workspace_root = args.get("workspace_root")
-
-        # Check if we're in a Cursor-like context (no host models)
-        # Fall through to non-host providers only
-        try:
-            route_result = await self._backend_request(
-                "POST",
-                "/v1/model/route",
-                {
-                    "task_type": "auto",
-                    "context_tokens": 4000,
-                    "privacy_level": "local_preferred",
-                },
-            )
-        except Exception:
-            route_result = {}
-
-        rec = route_result.get("recommended", {})
-        if rec.get("provider") == "none" and rec.get("model_id") == "none":
-            return (
-                "No AI providers available. To generate patches:\n"
-                "1. Install Ollama: https://ollama.com â€” then run: ollama pull qwen2.5-coder:7b\n"
-                "2. Or add API keys in .memopilot/config.yaml\n"
-            )
+        workspace = env.get("MEMOPILOT_WORKSPACE") or os.getcwd()
+        env_file = os.path.join(workspace, ".memopilot", ".cursor-mcp-env")
+        if not os.path.exists(env_file):
+            return env
 
         try:
-            patch_result = await self._backend_request(
-                "POST",
-                "/v1/task/generate-patch",
-                {
-                    "task_description": args["task_description"],
-                    "context_files": args.get("context_files", []),
-                    "workspace_root": workspace_root,
-                },
-            )
-        except Exception as exc:
-            return f"Patch generation failed: {exc}"
-
-        patches = patch_result.get("patches", [])
-        if not patches:
-            return "No patches generated."
-
-        parts = [
-            f"Summary: {patch_result.get('summary', '')}",
-            f"Model: {patch_result.get('model_used', '?')} | Risk: {patch_result.get('estimated_risk', '?')}",
-            "",
-        ]
-        for p in patches:
-            parts.append(f"=== {p.get('path', '?')} ===")
-            parts.append(p.get("diff", ""))
-        return "\n".join(parts)
+            for raw_line in Path(env_file).read_text(encoding="utf-8").splitlines():
+                line = raw_line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                key, value = line.split("=", 1)
+                env.setdefault(key.strip(), value.strip())
+        except OSError:
+            return env
+        return env
 
     # ------------------------------------------------------------------
     # JSON-RPC helpers

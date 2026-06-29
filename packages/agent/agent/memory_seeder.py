@@ -10,6 +10,7 @@ All seeded items are trust_level=5, memory_status='confirmed'.
 
 from __future__ import annotations
 
+import json
 import uuid
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -19,6 +20,7 @@ import yaml
 if TYPE_CHECKING:
     from .config import Config
     from .db import DatabaseManager
+    from .llm_client import BaseLLMClient
 
 
 class MemorySeederService:
@@ -101,7 +103,9 @@ class MemorySeederService:
                     "[]", workspace_root,
                 ),
             )
-            count += 1
+            changes = await conn.execute("SELECT changes() AS changes")
+            change_row = await changes.fetchone()
+            count += int(change_row["changes"] or 0) if change_row else 0
         return count
 
     # ------------------------------------------------------------------
@@ -139,7 +143,9 @@ class MemorySeederService:
                     "[]", workspace_root,
                 ),
             )
-            count += 1
+            changes = await conn.execute("SELECT changes() AS changes")
+            change_row = await changes.fetchone()
+            count += int(change_row["changes"] or 0) if change_row else 0
         return count
 
     # ------------------------------------------------------------------
@@ -152,7 +158,7 @@ class MemorySeederService:
             SELECT file_path FROM file_index
             WHERE (file_path LIKE '%/test_%' OR file_path LIKE '%_test.py'
                    OR file_path LIKE '%\\test_%' OR file_path LIKE '%\\_test.py')
-              AND (workspace_root = ? OR workspace_root IS NULL)
+                            AND workspace_root = ?
             ORDER BY file_path LIMIT 20
             """,
             (workspace_root,),
@@ -193,10 +199,131 @@ class MemorySeederService:
         )
         return 1
 
+    # ------------------------------------------------------------------
+    # Task writeback — extract project facts from completed agentic tasks
+    # ------------------------------------------------------------------
+
+    async def synthesize_session(
+        self,
+        calls: list[dict],
+        *,
+        client: "BaseLLMClient",
+    ) -> int:
+        """Synthesize memory items from a session's accumulated tool calls.
+
+        Args:
+            calls: list of {task_description, files_in_focus, ts} dicts
+            client: LLM client to use for synthesis
+
+        Returns:
+            count of memory items written
+        """
+        if not calls:
+            return 0
+
+        # Deduplicate task descriptions (keep unique, preserve order)
+        seen: set[str] = set()
+        unique_descriptions: list[str] = []
+        all_files: set[str] = set()
+        for call in calls:
+            desc = call.get("task_description", "").strip()
+            if desc and desc not in seen:
+                seen.add(desc)
+                unique_descriptions.append(desc)
+            all_files.update(call.get("files_in_focus") or [])
+
+        lines = "\n".join(f"- {d}" for d in unique_descriptions)
+        files_hint = ", ".join(sorted(all_files)[:10]) if all_files else "unknown"
+        prompt = (
+            f"Files touched: {files_hint}\n\n"
+            f"Topics the developer searched for during this session:\n{lines}"
+        )
+
+        try:
+            response = await client.complete(SESSION_SYNTHESIS_SYSTEM, prompt, max_tokens=300)
+            data = json.loads(response.content)
+            facts: list[str] = data.get("facts", [])[:5]
+        except Exception:
+            return 0
+
+        conn = await self._db.connect()
+        count = 0
+        for fact in facts:
+            if not fact.strip():
+                continue
+            await conn.execute(
+                """INSERT OR IGNORE INTO memory_items
+                   (id, type, title, body, source, memory_class, memory_status,
+                    trust_level, tags_json, stale, reusable, review_required,
+                    workspace_root, created_at, updated_at)
+                   VALUES (?,?,?,?,?,?,?,?,?,0,1,1,?,datetime('now'),datetime('now'))""",
+                (
+                    _uid(), "learned", fact[:80], fact, "session_synthesis",
+                    "fact", "pending_review", 3, "[]",
+                    str(self._config.workspace_path),
+                ),
+            )
+            count += 1
+        await conn.commit()
+        return count
+
+    async def writeback_from_task(
+        self,
+        *,
+        client: BaseLLMClient,
+        task_description: str,
+        outcome: str,
+    ) -> int:
+        prompt = f"Task: {task_description}\nOutcome: {outcome}"
+        try:
+            response = await client.complete(WRITEBACK_SYSTEM, prompt, max_tokens=200)
+            data = json.loads(response.content)
+            facts: list[str] = data.get("facts", [])[:3]
+        except Exception:
+            return 0
+
+        conn = await self._db.connect()
+        count = 0
+        for fact in facts:
+            if not fact.strip():
+                continue
+            await conn.execute(
+                """INSERT OR IGNORE INTO memory_items
+                   (id, type, title, body, source, memory_class, memory_status,
+                    trust_level, tags_json, stale, reusable, review_required,
+                    workspace_root, created_at, updated_at)
+                   VALUES (?,?,?,?,?,?,?,?,?,0,1,1,?,datetime('now'),datetime('now'))""",
+                (
+                    _uid(), "learned", fact[:80], fact, "task_writeback",
+                    "fact", "pending_review", 3, "[]",
+                    str(self._config.workspace_path),
+                ),
+            )
+            count += 1
+        await conn.commit()
+        return count
+
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+SESSION_SYNTHESIS_SYSTEM = (
+    "You extract reusable project facts from a developer's coding session. "
+    "You are given the topics they searched for and files they touched. "
+    "Extract facts that would help future developers understand this codebase — "
+    "architectural decisions, known gotchas, patterns, constraints. "
+    "Ignore generic topics. Focus on project-specific knowledge. "
+    'Respond ONLY with valid JSON: {"facts": ["fact1", "fact2"]}. '
+    "Each fact is one sentence, max 25 words. Return 1-5 facts or an empty list."
+)
+
+WRITEBACK_SYSTEM = (
+    "You extract project facts from completed coding tasks. "
+    'Respond ONLY with valid JSON: {"facts": ["fact1", "fact2"]}. '
+    "Each fact is one sentence, max 20 words. Return 1\u20133 facts or an empty list."
+)
+
 
 def _uid() -> str:
     return str(uuid.uuid4())

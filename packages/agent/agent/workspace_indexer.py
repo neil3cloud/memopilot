@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import logging
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -14,6 +15,12 @@ from .db import DatabaseManager
 from .graph_retriever import GraphRetriever
 from .project_scanner import WorkspaceScanner
 from .symbol_extractor import SymbolExtractor
+from .symbol_summarizer import SymbolSummarizer
+
+logger = logging.getLogger(__name__)
+
+_SUMMARY_CAP_PER_RUN = 500
+_DEFAULT_BATCH_SIZE = 25
 
 
 @dataclass(frozen=True)
@@ -38,11 +45,13 @@ class WorkspaceIndexer:
         db: DatabaseManager,
         scanner: WorkspaceScanner | None = None,
         symbol_extractor: SymbolExtractor | None = None,
+        summarizer: SymbolSummarizer | None = None,
     ) -> None:
         self._config = config
         self._db = db
         self._scanner = scanner or WorkspaceScanner(config.workspace_path)
         self._symbol_extractor = symbol_extractor or SymbolExtractor()
+        self._summarizer = summarizer
 
     async def index_workspace(self) -> WorkspaceIndexResult:
         started_at = time.perf_counter()
@@ -84,7 +93,12 @@ class WorkspaceIndexer:
             # Delete stale relationships BEFORE deleting symbols (subquery needs them)
             await conn.execute(
                 "DELETE FROM symbol_relationships WHERE from_symbol_id IN "
-                "(SELECT id FROM symbols WHERE file_path = ?)",
+                "(SELECT id FROM symbols WHERE file_path = ?) "
+                "OR to_symbol_id IN (SELECT id FROM symbols WHERE file_path = ?)",
+                (file_path, file_path),
+            )
+            await conn.execute(
+                "DELETE FROM symbol_relationships WHERE to_file_path = ?",
                 (file_path,),
             )
             await conn.execute("DELETE FROM symbols WHERE file_path = ?", (file_path,))
@@ -129,6 +143,13 @@ class WorkspaceIndexer:
 
         for file_path in removed_paths:
             await conn.execute(
+                "DELETE FROM symbol_relationships WHERE from_symbol_id IN "
+                "(SELECT id FROM symbols WHERE file_path = ?) "
+                "OR to_symbol_id IN (SELECT id FROM symbols WHERE file_path = ?)",
+                (file_path, file_path),
+            )
+            await conn.execute("DELETE FROM symbol_relationships WHERE to_file_path = ?", (file_path,))
+            await conn.execute(
                 """
                 UPDATE file_index
                 SET stale = 1, last_indexed_at = datetime('now')
@@ -152,8 +173,67 @@ class WorkspaceIndexer:
             duration_ms=duration_ms,
         )
 
+    async def _summarize_pending_symbols(self, batch_size: int = _DEFAULT_BATCH_SIZE) -> None:
+        """Background task: fill NULL summaries for function/class symbols.
+
+        Sends symbols in batches of batch_size to reduce LLM call count.
+        Commits each batch immediately so partial progress is preserved.
+        """
+        if self._summarizer is None:
+            return
+        conn = await self._db.connect()
+        cursor = await conn.execute(
+            """
+            SELECT s.id, s.file_path, s.name, s.kind, s.signature, s.start_line, s.end_line
+            FROM symbols s
+            JOIN file_index fi ON fi.file_path = s.file_path
+            WHERE s.summary IS NULL
+              AND s.kind IN ('function', 'class')
+              AND fi.stale = 0
+            LIMIT ?
+            """,
+            (_SUMMARY_CAP_PER_RUN,),
+        )
+        rows = await cursor.fetchall()
+        logger.info("_summarize_pending_symbols: %d symbols to process, batch_size=%d", len(rows), batch_size)
+
+        # Group into batches of batch_size
+        for i in range(0, len(rows), batch_size):
+            batch_rows = rows[i : i + batch_size]
+            batch_symbols: list[dict] = []
+            for row in batch_rows:
+                try:
+                    lines = self._read_text(
+                        self._config.workspace_path / row["file_path"]
+                    ).splitlines()
+                    source = "\n".join(lines[row["start_line"] - 1 : row["end_line"]])
+                    batch_symbols.append({
+                        "id": row["id"],
+                        "name": row["name"],
+                        "kind": row["kind"],
+                        "signature": row["signature"] or "",
+                        "source": source,
+                    })
+                except Exception:
+                    pass
+
+            if not batch_symbols:
+                continue
+
+            logger.info("_summarize_pending_symbols: sending batch %d/%d (%d symbols)", i // batch_size + 1, (len(rows) + batch_size - 1) // batch_size, len(batch_symbols))
+            try:
+                summaries = await self._summarizer.summarize_batch(batch_symbols)
+                logger.info("_summarize_pending_symbols: batch returned %d summaries", len(summaries))
+                for sym_id, summary in summaries.items():
+                    await conn.execute(
+                        "UPDATE symbols SET summary = ? WHERE id = ?",
+                        (summary, sym_id),
+                    )
+                await conn.commit()
+            except Exception:
+                logger.exception("_summarize_pending_symbols: batch %d failed", i // batch_size + 1)
+
     async def rebuild_memory(self) -> WorkspaceIndexResult:
-        """Rebuild indexed file/symbol memory from source files."""
         conn = await self._db.connect()
         await conn.execute("DELETE FROM symbols")
         await conn.execute("DELETE FROM file_index")
@@ -163,7 +243,13 @@ class WorkspaceIndexer:
 
     async def _fetch_existing_hashes(self, conn: aiosqlite.Connection) -> dict[str, str]:
         cursor = await conn.execute(
-            "SELECT file_path, content_hash FROM file_index WHERE language = 'python'"
+            """
+            SELECT file_path, content_hash
+            FROM file_index
+            WHERE language = 'python'
+              AND workspace_root = ?
+            """,
+            (str(self._config.workspace_path),),
         )
         rows = await cursor.fetchall()
         return {row["file_path"]: row["content_hash"] for row in rows}
@@ -173,15 +259,16 @@ class WorkspaceIndexer:
     ) -> None:
         await conn.execute(
             """
-            INSERT INTO file_index (file_path, language, content_hash, stale)
-            VALUES (?, ?, ?, 0)
+            INSERT INTO file_index (file_path, language, content_hash, stale, workspace_root)
+            VALUES (?, ?, ?, 0, ?)
             ON CONFLICT(file_path) DO UPDATE SET
                 language=excluded.language,
                 content_hash=excluded.content_hash,
                 stale=0,
+                workspace_root=excluded.workspace_root,
                 last_indexed_at=datetime('now')
             """,
-            (file_path, language, content_hash),
+            (file_path, language, content_hash, str(self._config.workspace_path)),
         )
 
     def _read_text(self, file_path: Path) -> str:

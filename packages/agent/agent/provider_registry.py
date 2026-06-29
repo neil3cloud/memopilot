@@ -163,49 +163,8 @@ class ProviderRegistryService:
         )
 
     async def _seed_provider_capabilities(self) -> None:
-        defaults = [
-            ProviderCapabilityRecord(
-                model_id="gpt-4o-mini",
-                source="openai",
-                max_context_tokens=128000,
-                supports_tool_calling=True,
-                supports_json_mode=True,
-                estimated_cost_per_1m_input=0.15,
-                estimated_cost_per_1m_output=0.6,
-                privacy_level="cloud",
-                allowed_task_types=["ask", "plan", "review"],
-                denied_task_types=[],
-                requires_approval=False,
-            ),
-            ProviderCapabilityRecord(
-                model_id="claude-sonnet-4.5",
-                source="anthropic",
-                max_context_tokens=200000,
-                supports_tool_calling=True,
-                supports_json_mode=True,
-                estimated_cost_per_1m_input=3.0,
-                estimated_cost_per_1m_output=15.0,
-                privacy_level="cloud",
-                allowed_task_types=["patch", "autofix", "investigate"],
-                denied_task_types=[],
-                requires_approval=True,
-            ),
-            ProviderCapabilityRecord(
-                model_id="llama3.1",
-                source="ollama",
-                max_context_tokens=32000,
-                supports_tool_calling=False,
-                supports_json_mode=False,
-                estimated_cost_per_1m_input=0.0,
-                estimated_cost_per_1m_output=0.0,
-                privacy_level="local",
-                allowed_task_types=["ask", "plan"],
-                denied_task_types=["autofix"],
-                requires_approval=False,
-            ),
-        ]
-        for item in defaults:
-            await self.upsert_provider_capability(item)
+        # Seeding removed: only real configured providers (via POST endpoint) are stored
+        pass
 
     def _row_to_capability(self, row) -> ProviderCapabilityRecord:
         def parse_list(raw: str | None) -> list[str]:

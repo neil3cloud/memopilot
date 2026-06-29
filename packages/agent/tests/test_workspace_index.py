@@ -141,3 +141,33 @@ async def test_workspace_index_status_reports_counts_after_index(
     assert data["indexed_files"] >= 1
     assert data["symbols_count"] >= 1
     assert data["never_indexed"] is False
+
+
+@pytest.mark.asyncio
+async def test_workspace_index_status_ignores_null_workspace_rows(
+    client: AsyncClient,
+    test_token: str,
+    tmp_workspace,
+    test_db: DatabaseManager,
+):
+    headers = {"X-Agent-Token": test_token}
+    await client.post("/v1/workspace/init", headers=headers)
+
+    baseline_response = await client.get("/v1/workspace/index/status", headers=headers)
+    assert baseline_response.status_code == 200
+    baseline = baseline_response.json()
+
+    conn = test_db.connection
+    assert conn is not None
+    await conn.execute(
+        "INSERT INTO file_index (file_path, content_hash, workspace_root) VALUES (?, ?, NULL)",
+        ("/other-workspace/legacy.py", "legacy-hash"),
+    )
+    await conn.commit()
+
+    status_response = await client.get("/v1/workspace/index/status", headers=headers)
+    assert status_response.status_code == 200
+    data = status_response.json()
+    assert data["indexed_files"] == baseline["indexed_files"]
+    assert data["stale_files"] == baseline["stale_files"]
+    assert data["symbols_count"] == baseline["symbols_count"]

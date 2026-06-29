@@ -25,6 +25,7 @@ __pycache__/
 .memopilot/agent.lock
 .memopilot/snapshots/
 .memopilot/context-packs/
+.memopilot-livecheck/
 
 # IDE
 .vscode/settings.json
@@ -37,3 +38,5 @@ Thumbs.db
 # Environment
 .env
 *.env
+
+.memopilot/config.yaml

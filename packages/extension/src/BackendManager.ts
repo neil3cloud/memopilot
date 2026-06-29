@@ -50,7 +50,7 @@ export class BackendManager {
         return this.token;
     }
 
-    async start(): Promise<void> {
+    async start(context?: vscode.ExtensionContext): Promise<void> {
         this._stopping = false;
         const pythonPath = await this.resolvePython();
         const agentDir = this.resolveAgentDir();
@@ -89,6 +89,13 @@ export class BackendManager {
                 MEMOPILOT_TOKEN: this.token,
                 MEMOPILOT_WORKSPACE: this.workspacePath,
                 PYTHONPATH: agentParent,
+                ...(context
+                    ? {
+                        OPENAI_API_KEY: await context.secrets.get('memopilot.openaiApiKey') ?? '',
+                        ANTHROPIC_API_KEY: await context.secrets.get('memopilot.anthropicApiKey') ?? '',
+                        MEMOPILOT_OLLAMA_URL: vscode.workspace.getConfiguration('memopilot').get<string>('ollamaUrl', 'http://localhost:11434'),
+                    }
+                    : {}),
             },
             stdio: ['ignore', 'pipe', 'pipe'],
         });
@@ -462,7 +469,12 @@ export class BackendManager {
     private writeCursorMcpEnv(memopilotDir: string): void {
         try {
             const envPath = path.join(memopilotDir, '.cursor-mcp-env');
-            const content = `MEMOPILOT_TOKEN=${this.token}\nMEMOPILOT_WORKSPACE=${this.workspacePath}\n`;
+            const content = [
+                `MEMOPILOT_TOKEN=${this.token}`,
+                `MEMOPILOT_PORT=${this.port ?? ''}`,
+                `MEMOPILOT_WORKSPACE=${this.workspacePath}`,
+                '',
+            ].join('\n');
             fs.writeFileSync(envPath, content, { mode: 0o600 });
 
             // Auto-add to .gitignore if not already present

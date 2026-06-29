@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 from httpx import AsyncClient
 
 from agent.db import DatabaseManager
+from agent.local_model_discovery import LocalModel
 
 
 @pytest.mark.asyncio
@@ -257,3 +259,41 @@ async def test_patch_assessment_and_provider_capabilities(client: AsyncClient, t
         item["model_id"] == "custom-waveb-model"
         for item in capabilities_after.json()["items"]
     )
+
+
+@pytest.mark.asyncio
+async def test_local_discover_upserts_discovered_models(client: AsyncClient, test_token: str):
+    headers = {"X-Agent-Token": test_token}
+    await client.post("/v1/workspace/init", headers=headers)
+
+    local_models = [
+        LocalModel(
+            model_id="llama3.1:latest",
+            name="llama3.1:latest",
+            source="ollama",
+            max_context_tokens=131072,
+            supports_tools=True,
+        ),
+        LocalModel(
+            model_id="phi4",
+            name="Phi 4",
+            source="lmstudio",
+            max_context_tokens=16384,
+            supports_tools=False,
+        ),
+    ]
+
+    with patch("agent.api.discover_all_local", autospec=True, return_value=local_models):
+        discovered = await client.get("/v1/providers/local-discover", headers=headers)
+
+    assert discovered.status_code == 200
+    body = discovered.json()
+    assert body["ollama_running"] is True
+    assert body["lmstudio_running"] is True
+    assert len(body["models"]) == 2
+    assert any(item["model_id"] == "llama3.1:latest" and item["source"] == "ollama" for item in body["models"])
+    assert any(item["model_id"] == "phi4" and item["source"] == "lmstudio" for item in body["models"])
+
+    capabilities = await client.get("/v1/providers/capabilities", headers=headers)
+    assert any(item["model_id"] == "llama3.1:latest" for item in capabilities.json()["items"])
+    assert any(item["model_id"] == "phi4" for item in capabilities.json()["items"])

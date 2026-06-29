@@ -1,32 +1,51 @@
 # MemoPilot
 
-**Rule-Aware, Local-Memory, Cost-Governed AI Development Agent Extension for VS Code/Cursor**
+**Local memory bank and context assembler for VS Code Copilot and Cursor**
 
-MemoPilot is a production-ready AI coding governance extension that combines local project memory, rule and skill enforcement, context-pack generation, cost-aware model routing, patch approval, and validation — helping developers use AI accurately and economically inside VS Code/Cursor.
+MemoPilot is a local-first context system for the workspace currently loaded in VS Code or Cursor. It indexes code, stores governed project memory, assembles bounded retrieval context, and exposes that context to Copilot Chat and Cursor before cloud LLM calls are made.
+
+MemoPilot's default product surface is now retrieval-first: search project context, inspect workspace memory, inspect the workspace profile, and supply higher-quality context to native editor agents. The older task-flow pipeline for patch generation and approval still exists, but it is a legacy mode and is no longer the default experience.
 
 ## Core Concept
 
-Before MemoPilot sends a single token to AI, it has already:
+Before MemoPilot sends a single token of project context to an external model, it has already:
 
 1. Indexed the project and built local memory from source code
-2. Loaded and resolved all global and project rules
-3. Identified applicable skills for the current task
-4. Selected only relevant files, symbols, and memory items
-5. Classified the task type and risk level without an LLM call
-6. Estimated the token cost and selected the cheapest capable model
-7. Redacted all detected secrets from the context
-8. Presented the developer with a complete, inspectable context pack
+2. Summarized all symbols via LLM (GitHub Copilot by default — no API key needed)
+3. Loaded and resolved all global and project rules
+4. Identified applicable skills and workspace constraints
+5. Selected only relevant files, symbols, and memory items
+6. Assembled a bounded, inspectable context block
+7. Redacted detected secrets from the context
+8. Tracked privacy and tool-call provenance
 
-After AI generates a response, MemoPilot requires approval before applying any patch, runs validation tools, and proposes memory updates held at low trust until developer approval.
+In default mode, MemoPilot does not apply patches or act as a standalone coding agent. It improves the context available to Copilot and Cursor. Legacy patch-generation and approval flows remain available behind the extension setting `memopilot.legacyAgentMode`.
+
+## Current Default Surface
+
+- Retrieval-first MCP tools: `memopilot-search`, `memopilot-symbols`, `memopilot-memory`, `memopilot-profile`
+- VS Code command default: `MemoPilot: Search Project Context`
+- Status bar default: opens retrieval-first context search
+- Legacy task flow: opt-in only via `memopilot.legacyAgentMode`
 
 ## Architecture
 
 ```
 VS Code/Cursor Extension (TypeScript)
+  ├── Copilot Chat (@memopilot LM tools) — primary interaction surface
+  ├── SynthesisHostClient — relays LLM requests from backend to vscode.lm API
   └── HTTP (HMAC token auth, dynamic port)
         └── Python Agent Backend (FastAPI, 127.0.0.1 only)
               └── SQLite + FTS5 + sqlite-vec (local memory)
 ```
+
+**LLM modes** (switchable at runtime via `MemoPilot: Switch LLM Mode`):
+
+| Mode | Provider | Requires |
+|------|----------|---------|
+| Copilot (default) | `vscode.lm` relay via extension | GitHub Copilot subscription |
+| Local | Ollama or LM Studio | Local model running at configured URL |
+| Cloud | OpenAI or Anthropic direct API | API key in `.memopilot/config.yaml` |
 
 ```
 packages/
@@ -71,7 +90,7 @@ docs/          — Product documentation
 
 | Feature | Phase |
 |---------|-------|
-| Cost Guard with budget tracking and savings reports | 11 |
+| Usage Stats panel (symbols indexed/summarized, memory items, session queries) | 11 |
 | Response caching (SHA-256 context pack hash) | 11 |
 | MCP integration (Azure DevOps, database) | 12 |
 | Agentic tool-call loop (capped at 5 iterations) | 12 |
@@ -130,7 +149,7 @@ docs/          — Product documentation
 | Failure categorisation with template-driven hints |
 | Per-task cost feedback and savings framing vs frontier baseline |
 
-### v2.4 — Tool Mode
+### v2.4 — Tool Mode + Copilot Realignment
 
 | Feature |
 |---------|
@@ -140,6 +159,12 @@ docs/          — Product documentation
 | Memory writeback pipeline (proposals from applied diffs) |
 | Tool call audit logging with per-caller session tracking |
 | Automatic Cursor token injection (`.memopilot/.cursor-mcp-env`) |
+| LLM mode toggle — Copilot / Local / Cloud switchable at runtime |
+| Batch LLM summarization — configurable batch size 25/50/75/100 symbols per request |
+| Separate "Reindex & Summarize" (full rebuild) and "Run Summarization" (resume-only) commands |
+| Auto session synthesis — 5-min Copilot Chat inactivity triggers distillation of session queries into memory items |
+| Usage Stats panel — replaces Cost Guard; shows symbols indexed/summarized, memory items, session queries |
+| Memory Manager UX — active spinner during summarization; warning badge when pending symbols need a re-run |
 
 ### Context Accuracy Refinement (v2.5)
 
@@ -171,7 +196,7 @@ docs/          — Product documentation
 
 **Completed:** Phases 1–33 (All phases through v2.7 + LLM Integration + Provider Wiring + Pipeline Fixes)
 
-- **LLM Integration (Phase 33):** End-to-end LLM pipeline live — `generate_patch()` calls GitHub Copilot (via `HostModelClient` SSE relay), Ollama, Anthropic, or OpenAI in configured fallback order. `HostModelClient` wired into `TaskFlowController.generatePatch()`. Pipeline cascade bugs fixed in both controller and panel. Copilot model detection in Provider Matrix and first-time setup check. Verified end-to-end: full analyze→context→route→patch→approve→validate→apply with real Copilot output.
+- **Copilot Realignment + LLM Integration (Phase 33):** Primary LLM is now GitHub Copilot via `vscode.lm` relay — `SynthesisHostClient` in the extension forwards backend LLM requests to `vscode.lm`, streams tokens back, no API key required. Three switchable LLM modes: Copilot (default), Local (Ollama/LM Studio), Cloud (OpenAI/Anthropic). Batch symbol summarization with configurable batch size (25/50/75/100). Separate "Reindex & Summarize" (full rebuild) and "Run Summarization" (resume-only) commands. Auto session synthesis (5-min inactivity timer writes 1–5 learned memory items from Copilot Chat session). Cost Guard replaced by Usage Stats panel. Memory Manager shows active spinner during summarization and warning badge when symbols are pending.
 
 - **Schema Remediation (26 issues resolved):** Lockfile format with schema/api version, FTS5 sync triggers, governance migration (memory_class, memory_status, visibility_scope, reusable, review_required), trust level inverted (5=best), supersedes_id removed in favor of memory_relations, schema constraints, snapshots folder spec
 - **Workflow Correctness:** Patch apply via `git apply --check` with snapshot rollback, response cache quality filter (success-only, disabled for critical tasks), investigation sessions (pre-task evidence), 8 investigation API endpoints, task classifier two-pass priority (file type > directory), workspace profile YAML as source of truth, per-command validation timeouts, MCP per-context caps (pre_fetch=8, patch=5, investigation=12)
@@ -192,8 +217,8 @@ Full end-to-end task flow UI now covers all 17 target scenario views:
 | Category | Views Delivered |
 |----------|---------------|
 | **Core Flow** | Task Entry, Context Pack Preview, Model Routing, Patch Preview, Approval Gate, Validation |
-| **Governance** | Rules & Skills, Cost Guard, Privacy Dashboard, Provider Matrix |
-| **History & Cost** | Task History, Cost Dashboard |
+| **Governance** | Rules & Skills, Usage Stats, Privacy Dashboard, Provider Matrix |
+| **History** | Task History |
 | **External** | MCP Tools, Evidence Board |
 | **Management** | Memory Manager, Workspace Profile, Workspace Status |
 
@@ -285,8 +310,13 @@ uv run pytest
 ### Install Extension
 
 ```bash
+# VS Code
 code --install-extension packages/extension/memopilot-1.0.1.vsix
+# Cursor
+cursor --install-extension packages/extension/memopilot-1.0.1.vsix
 ```
+
+Close your editor completely before installing to avoid EBUSY file-lock errors.
 
 ## Documentation
 

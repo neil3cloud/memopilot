@@ -34,6 +34,9 @@ class Config:
     mcp_cap_patch_generation: int = 5
     mcp_cap_investigation: int = 12
     mcp_hard_absolute_cap: int = 20
+    openai_api_key: str | None = None
+    anthropic_api_key: str | None = None
+    ollama_url: str = "http://localhost:11434"
 
     # Derived paths
     db_path: Path = field(init=False)
@@ -99,4 +102,7 @@ def load_config() -> Config:
         mcp_cap_patch_generation=int(iteration_caps.get("patch_generation", 5)),
         mcp_cap_investigation=int(iteration_caps.get("investigation", 12)),
         mcp_hard_absolute_cap=int(iteration_caps.get("hard_absolute_cap", 20)),
+        openai_api_key=os.environ.get("OPENAI_API_KEY") or None,
+        anthropic_api_key=os.environ.get("ANTHROPIC_API_KEY") or None,
+        ollama_url=os.environ.get("MEMOPILOT_OLLAMA_URL", "http://localhost:11434"),
     )

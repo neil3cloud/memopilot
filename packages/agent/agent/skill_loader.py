@@ -11,7 +11,6 @@ import yaml
 
 from .config import Config
 from .db import DatabaseManager
-from .evidence_classifier import EvidenceSourceClassifier
 from .tool_selector import select_tools
 
 
@@ -52,7 +51,6 @@ class SkillLoaderService:
     def __init__(self, *, config: Config, db: DatabaseManager) -> None:
         self._config = config
         self._db = db
-        self._classifier = EvidenceSourceClassifier()
 
     async def create_or_update_skill(
         self,
@@ -314,34 +312,6 @@ class SkillLoaderService:
             reasons=reasons,
             reasons_map=reasons_map,
         )
-
-    def classify_evidence_source(
-        self,
-        *,
-        evidence_path: str | None,
-        source_url: str | None,
-    ) -> tuple[str, int, str]:
-        from pathlib import Path
-
-        resolved: Path | None = None
-        if evidence_path:
-            candidate = Path(evidence_path)
-            if not candidate.is_absolute():
-                candidate = self._config.workspace_path / candidate
-            resolved = candidate.resolve()
-        preview: str | None = None
-        if resolved is not None:
-            try:
-                with resolved.open("rb") as handle:
-                    preview = handle.read(8192).decode("utf-8", errors="replace")
-            except OSError:
-                preview = None
-        result = self._classifier.classify(
-            evidence_path=resolved,
-            source_url=source_url,
-            content_preview=preview,
-        )
-        return result.source_type, result.trust_level, result.extraction_method
 
     async def _fetch_latest_skill_items(
         self,

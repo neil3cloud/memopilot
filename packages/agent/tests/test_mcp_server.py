@@ -12,8 +12,8 @@ from agent.mcp_server import MCPServer, _TOOL_SCHEMAS
 
 
 class TestToolSchemas:
-    def test_seven_tools_defined(self):
-        assert len(_TOOL_SCHEMAS) == 7
+    def test_four_tools_defined(self):
+        assert len(_TOOL_SCHEMAS) == 4
 
     def test_all_tools_have_required_fields(self):
         for tool in _TOOL_SCHEMAS:
@@ -22,14 +22,18 @@ class TestToolSchemas:
             assert "inputSchema" in tool
             assert tool["inputSchema"]["type"] == "object"
 
-    def test_memopilot_patch_tool_present(self):
+    def test_memopilot_patch_tool_removed(self):
         names = {t["name"] for t in _TOOL_SCHEMAS}
-        assert "memopilot-patch" in names
+        assert "memopilot-patch" not in names
 
-    def test_core_tools_present(self):
+    def test_retrieval_tools_present(self):
         names = {t["name"] for t in _TOOL_SCHEMAS}
-        for expected in ("memory_search", "memory_store", "context_build",
-                         "model_route", "patch_validate", "cost_check"):
+        for expected in (
+            "memopilot-search",
+            "memopilot-symbols",
+            "memopilot-memory",
+            "memopilot-profile",
+        ):
             assert expected in names
 
 
@@ -48,7 +52,7 @@ class TestMCPServerDispatch:
     async def test_tools_list_response(self):
         req = {"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}}
         resp = await self.server._handle(req)
-        assert len(resp["result"]["tools"]) == 7
+        assert len(resp["result"]["tools"]) == 4
 
     @pytest.mark.asyncio
     async def test_unknown_method_returns_error(self):
@@ -73,69 +77,104 @@ class TestMCPServerDispatch:
         assert "error" in resp
 
 
-class TestPatchValidateHandler:
+class TestMemopilotMemoryHandler:
     def setup_method(self):
         self.server = MCPServer()
 
     @pytest.mark.asyncio
-    async def test_valid_diff_accepted(self):
-        diff = "--- a/file.py\n+++ b/file.py\n@@ -1,1 +1,1 @@\n-old\n+new\n"
-        result = await self.server._handle_patch_validate({"diff": diff})
-        assert "VALID" in result
-        assert "1 hunk" in result
+    async def test_renders_memory_search_results(self):
+        async def mock_backend(method, path, body=None):
+            assert path == "/v1/memory/recall"
+            return {
+                "items": [
+                    {
+                        "title": "Settlement locking",
+                        "body": "Optimistic locking avoids deadlocks.",
+                        "memory_class": "fact",
+                        "trust_level": 4,
+                        "source": "review",
+                    }
+                ]
+            }
+
+        with patch.object(self.server, "_backend_request", side_effect=mock_backend):
+            result = await self.server._handle_memopilot_memory({"query": "locking"})
+
+        assert "MemoPilot Memory Search" in result
+        assert "Settlement locking" in result
 
     @pytest.mark.asyncio
-    async def test_invalid_diff_rejected(self):
-        result = await self.server._handle_patch_validate({"diff": "not a diff"})
-        assert "INVALID" in result
+    async def test_empty_memory_search_results(self):
+        async def mock_backend(method, path, body=None):
+            return {"items": []}
+
+        with patch.object(self.server, "_backend_request", side_effect=mock_backend):
+            result = await self.server._handle_memopilot_memory({"query": "missing"})
+
+        assert "No results found" in result
 
 
-class TestMemopilotPatchHandler:
+class TestMemopilotSearchHandler:
     def setup_method(self):
         self.server = MCPServer()
 
     @pytest.mark.asyncio
-    async def test_returns_no_providers_message_when_backend_unavailable(self):
+    async def test_search_uses_context_pack_endpoint(self):
+        async def mock_backend(method, path, body=None):
+            assert path == "/v1/context/assemble"
+            return {
+                "rendered_markdown": "## MemoPilot Context\n\n### `src/main.py`\n```\ndef run():\n    return True\n```",
+                "context_pack_hash": "hash-123",
+                "total_tokens": 100,
+                "quality_verdict": "good",
+            }
+
+        with patch.object(self.server, "_backend_request", side_effect=mock_backend):
+            result = await self.server._handle_memopilot_search({"query": "find billing flow"})
+
+        assert "MemoPilot Context" in result
+        assert "src/main.py" in result
+
+    @pytest.mark.asyncio
+    async def test_search_propagates_backend_errors(self):
         with patch.object(
             self.server, "_backend_request",
             side_effect=Exception("Connection refused"),
         ):
-            result = await self.server._handle_memopilot_patch(
-                {"task_description": "Fix the bug"}
-            )
-        assert "Patch generation failed" in result
+            with pytest.raises(Exception, match="Connection refused"):
+                await self.server._handle_memopilot_search({"query": "Fix the bug"})
 
     @pytest.mark.asyncio
-    async def test_returns_setup_instructions_when_no_providers(self):
+    async def test_symbols_render_results(self):
         async def mock_backend(method, path, body=None):
-            if path == "/v1/model/route":
-                return {"recommended": {"provider": "none", "model_id": "none"}}
-            return {}
+            assert path == "/v1/symbols/search"
+            return {
+                "symbols": [
+                    {
+                        "name": "TaskFlowController",
+                        "kind": "class",
+                        "file_path": "packages/extension/src/controllers/TaskFlowController.ts",
+                        "start_line": 1,
+                        "signature": "class TaskFlowController",
+                        "summary": "Orchestrates task execution.",
+                    }
+                ]
+            }
 
         with patch.object(self.server, "_backend_request", side_effect=mock_backend):
-            result = await self.server._handle_memopilot_patch(
-                {"task_description": "Fix the bug"}
-            )
-        assert "No AI providers" in result
-        assert "Ollama" in result
+            result = await self.server._handle_memopilot_symbols({"query": "TaskFlowController"})
+
+        assert "TaskFlowController" in result
+        assert "Orchestrates task execution." in result
 
     @pytest.mark.asyncio
-    async def test_returns_diff_on_success(self):
+    async def test_profile_renders_yaml(self):
         async def mock_backend(method, path, body=None):
-            if path == "/v1/model/route":
-                return {"recommended": {"provider": "anthropic", "model_id": "claude-haiku-4-5"}}
-            if path == "/v1/task/generate-patch":
-                return {
-                    "patches": [{"path": "src/main.py", "diff": "--- a/src/main.py\n+++ b/src/main.py\n"}],
-                    "summary": "Fixed bug",
-                    "model_used": "claude-haiku-4-5",
-                    "estimated_risk": "low",
-                }
-            return {}
+            assert path == "/v1/workspace/profile"
+            return {"profile_yaml": "workspace:\n  name: demo\n  primary_language: python\n"}
 
         with patch.object(self.server, "_backend_request", side_effect=mock_backend):
-            result = await self.server._handle_memopilot_patch(
-                {"task_description": "Fix the bug", "context_files": ["src/main.py"]}
-            )
-        assert "src/main.py" in result
-        assert "Fixed bug" in result
+            result = await self.server._handle_memopilot_profile()
+
+        assert "MemoPilot Workspace Profile" in result
+        assert "primary_language: python" in result

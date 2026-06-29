@@ -209,6 +209,22 @@ class CostGuardService:
     ) -> str:
         task_run_id = uuid.uuid4().hex
         conn = await self._db.connect()
+        # Some schema lineages can expose task_runs with an FK to
+        # investigation_sessions before the referenced table exists.
+        await conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS investigation_sessions (
+                id TEXT PRIMARY KEY,
+                title TEXT NOT NULL,
+                description TEXT,
+                mode TEXT NOT NULL DEFAULT 'investigation',
+                status TEXT NOT NULL DEFAULT 'open',
+                workspace_root TEXT NOT NULL,
+                created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+            )
+            """
+        )
         await conn.execute(
             """
             INSERT INTO task_runs

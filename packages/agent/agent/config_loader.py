@@ -26,24 +26,20 @@ _ENV_MAP = {
     "MEMOPILOT_OLLAMA_MODEL": "ollama_model",
     "MEMOPILOT_OLLAMA_URL": "ollama_base_url",
     "MEMOPILOT_LMSTUDIO_URL": "lmstudio_base_url",
+    "MEMOPILOT_LOCAL_URL": "local_url",
+    "MEMOPILOT_LOCAL_MODEL": "local_model",
     "MEMOPILOT_BUDGET_PROFILE": "budget_profile",
 }
 
 _TEMPLATE = """\
 # .memopilot/config.yaml — GITIGNORED — do not commit API keys
 
-provider: host           # host (VS Code Copilot) | ollama | anthropic | openai | lmstudio
-fallback_order:
-  - host
-  - ollama
-  - anthropic
-  - openai
+provider: local          # local | anthropic | openai | host
 budget_profile: cost_saver   # cost_saver | balanced | strict_local | max_accuracy
 
-# Local models (free, no API key needed)
-ollama_base_url: http://localhost:11434
-# ollama_model: qwen2.5-coder:7b
-lmstudio_base_url: http://localhost:1234
+# Local AI — any OpenAI-compatible server (Ollama, LM Studio, vLLM, OpenVINO, llama.cpp, etc.)
+local_url: http://localhost:1234
+local_model: qwen2.5-coder-7b-instruct
 
 # Cloud API keys (uncomment to enable)
 # anthropic_api_key: sk-ant-...
@@ -54,10 +50,8 @@ lmstudio_base_url: http://localhost:1234
 
 _DEFAULTS: dict = {
     "provider": "host",
-    "fallback_order": ["host", "ollama", "anthropic", "openai"],
     "budget_profile": "cost_saver",
-    "ollama_base_url": "http://localhost:11434",
-    "lmstudio_base_url": "http://localhost:1234",
+    "local_url": "http://localhost:1234",
 }
 
 

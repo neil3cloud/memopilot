@@ -1,6 +1,6 @@
 # MemoPilot: Master Product and Implementation Reference
 
-**Document Version:** 2.7 (LLM Integration + Provider Wiring + Pipeline Fixes) **Target Product:** MemoPilot — Rule-Aware, Local-Memory, Cost-Governed AI Development Agent Extension for VS Code/Cursor **Status:** Production Reference — End-to-End LLM Pipeline Live
+**Document Version:** 2.8 (Retrieval-First Realignment + Legacy Task-Flow Clarification) **Target Product:** MemoPilot — Local-Memory, Rule-Aware Context System for VS Code/Cursor **Status:** Production Reference — Retrieval-First Default Surface Live
 
 ---
 
@@ -50,15 +50,24 @@
 
 ### One-Sentence Summary
 
-A rule-aware, local-memory, cost-governed AI development agent extension for VS Code/Cursor that helps developers create, modify, investigate, and validate code accurately while minimizing unnecessary frontier-model usage.
+A rule-aware, local-memory, cost-governed context system for VS Code/Cursor that assembles high-signal project context for Copilot and Cursor before cloud LLM calls.
 
 ### Executive Summary
 
-MemoPilot is a production-ready AI development assistant extension for VS Code/Cursor. It is not a chatbot inside the editor. It is a **rule-aware, local-memory, cost-governed AI agent** that helps developers create, modify, review, investigate, and validate code with less dependency on expensive frontier models.
+MemoPilot is a production-ready, retrieval-first context extension for VS Code/Cursor. It is not a chatbot inside the editor. It is a **rule-aware, local-memory, cost-governed context system** that improves what native editor agents receive before any external model call.
 
-The extension builds and maintains a local application memory before sending any context to AI. It reads local and global rules, project conventions, skills, source code, documentation, symbols, test patterns, previous decisions, and task history. It then generates a minimal, explainable context pack and routes the task to the cheapest capable model available to the developer.
+The extension builds and maintains local application memory before sending any context to AI. It reads local and global rules, project conventions, skills, source code, documentation, symbols, test patterns, previous decisions, and task history. It then generates a minimal, explainable, bounded context pack and exposes retrieval tools for Copilot/Cursor workflows.
+
+In default mode, MemoPilot does not auto-enter standalone patch orchestration. Legacy patch generation, approval, and validation workflows remain available as an opt-in mode via `memopilot.legacyAgentMode`.
 
 The extension must respect existing developer rules, project rules, Cursor rules, Copilot instructions, repository documentation, code patterns, test requirements, and safety policies. It must never operate as a black box.
+
+### Default Product Surface (Realignment)
+
+- Retrieval-first MCP tools: `memopilot-search`, `memopilot-symbols`, `memopilot-memory`, `memopilot-profile`
+- Default VS Code command: `MemoPilot: Search Project Context`
+- Default status bar action: opens retrieval-first context search
+- Legacy task-flow pipeline: opt-in via `memopilot.legacyAgentMode`
 
 ### Target Users
 
@@ -88,11 +97,11 @@ The problem is not the lack of AI tools. The problem is **uncontrolled, inaccura
 
 ### What MemoPilot Is
 
-- A rule-aware AI development agent extension  
+- A retrieval-first, rule-aware context system for software development  
 - A local project memory system for software development  
 - A context-pack builder with controlled, explainable context selection  
 - A cost-aware model router  
-- A patch governance and approval workflow  
+- An optional legacy patch governance and approval workflow  
 - An evidence-aware bug and user story investigation tool  
 - A privacy boundary enforcer
 
@@ -100,7 +109,7 @@ The problem is not the lack of AI tools. The problem is **uncontrolled, inaccura
 
 - A Cursor clone  
 - A generic AI chatbot  
-- A fully autonomous coding bot  
+- A default standalone patching agent  
 - A replacement for developer review  
 - A system that blindly sends full repositories to cloud AI  
 - A system that silently applies patches  
@@ -109,7 +118,7 @@ The problem is not the lack of AI tools. The problem is **uncontrolled, inaccura
 
 ### Core Value Proposition
 
-Local application memory \+ rule enforcement \+ cost-aware model routing \+ explainable context \+ patch approval \+ validation \= higher accuracy at lower cost.
+Local application memory \+ rule enforcement \+ explainable bounded context \+ cost-aware model routing \= higher-accuracy AI assistance at lower cost.
 
 ### Differentiator vs. Generic AI Coding Assistants
 
@@ -121,6 +130,8 @@ Broad document AI and workspace platforms are general-purpose knowledge systems.
 
 ### Primary Use Cases
 
+- Retrieval-first project context assembly for Copilot/Cursor prompts  
+- Workspace memory and profile lookup during active development  
 - Feature implementation respecting project conventions and rules  
 - Bug investigation using code, logs, stack traces, and work items  
 - User story implementation with acceptance criteria alignment  
@@ -141,23 +152,23 @@ Broad document AI and workspace platforms are general-purpose knowledge systems.
 
 2\. MemoPilot indexes project files, symbols, rules, and docs.
 
-3\. Developer selects a mode (Ask, Plan, Patch, Test, Investigate, etc.).
+3\. Developer runs retrieval-first context search (or tool call from Copilot/Cursor).
 
-4\. Developer enters a task or attaches evidence.
+4\. MemoPilot resolves active rules and skills.
 
-5\. MemoPilot resolves active rules and skills.
+5\. MemoPilot retrieves relevant local memory, symbols, and profile data.
 
-6\. MemoPilot retrieves relevant local memory.
+6\. MemoPilot builds a minimal, inspectable context pack.
 
-7\. MemoPilot builds a minimal, inspectable context pack.
+7\. MemoPilot estimates token count and cost.
 
-8\. MemoPilot estimates token count and cost.
+8\. MemoPilot returns bounded context to the requesting surface.
 
-9\. MemoPilot selects the cheapest capable model.
+9\. Developer decides whether to proceed with an AI call using the supplied context.
 
-10\. Developer reviews and approves the context pack and model selection.
+10\. Optional: developer switches to legacy task-flow mode for plan/patch/approval.
 
-11\. AI generates a plan or patch.
+11\. Legacy mode can generate plan/patch output with governance checks.
 
 12\. Developer reviews diff and approves patch application.
 
@@ -3194,7 +3205,7 @@ MemoPilot should not be described as a chatbot, a RAG app, or a Cursor clone.
 
 It should be described as:
 
-**A production-ready AI coding governance extension that combines local project memory, rule and skill enforcement, evidence-aware investigation, context-pack generation, cost-aware model routing, patch approval, and validation — helping developers use AI accurately and economically inside VS Code/Cursor.**
+**A production-ready retrieval-first context and governance extension that combines local project memory, rule and skill enforcement, evidence-aware investigation, explainable context-pack generation, and cost-aware model routing — helping developers use AI accurately and economically inside VS Code/Cursor.**
 
 ### What This Means in Practice
 
@@ -3209,7 +3220,9 @@ Before MemoPilot sends a single token to AI, it has already:
 7. Redacted all detected secrets from the context.  
 8. Presented the developer with a complete, inspectable context pack.
 
-After AI generates a response, MemoPilot:
+In default retrieval-first mode, MemoPilot returns bounded context and memory insights to the editor surface.
+
+When legacy task-flow mode is enabled, MemoPilot can additionally:
 
 1. Classifies the patch risk from deterministic signals.  
 2. Computes a rule compliance score.  
@@ -3224,7 +3237,7 @@ This is not AI-assisted development with guardrails bolted on. This is **AI-assi
 
 ---
 
-*End of MemoPilot Master Product and Implementation Reference — Document Version 2.1*
+*End of MemoPilot Master Product and Implementation Reference — Document Version 2.8*
 
 ---
 
