@@ -39,6 +39,7 @@ export interface IndexStatusResponse {
     never_indexed: boolean;
     symbols_pending_summary?: number;
     summarizing?: boolean;
+    languages?: string[];
 }
 
 export interface RebuildMemoryResponse {

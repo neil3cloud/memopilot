@@ -11,12 +11,16 @@ from pathlib import Path
 import aiosqlite
 
 from .config import Config
+from .csharp_extractor import CSharpExtractor
+from .csharp_resolver import CSharpResolver
 from .db import DatabaseManager
+from .extractor_registry import ExtractorRegistry
 from .graph_retriever import GraphRetriever, SymbolRelationshipRecord
 from .jedi_resolver import JediResolver
 from .project_scanner import WorkspaceScanner
-from .symbol_extractor import SymbolExtractor
+from .python_extractor import PythonExtractor
 from .symbol_summarizer import SymbolSummarizer
+from .typescript_extractor import TypeScriptExtractor
 
 logger = logging.getLogger(__name__)
 
@@ -37,7 +41,7 @@ class WorkspaceIndexResult:
 
 
 class WorkspaceIndexer:
-    """Indexes workspace Python files and updates file + symbol tables."""
+    """Indexes workspace files and updates file + symbol tables."""
 
     def __init__(
         self,
@@ -45,15 +49,26 @@ class WorkspaceIndexer:
         config: Config,
         db: DatabaseManager,
         scanner: WorkspaceScanner | None = None,
-        symbol_extractor: SymbolExtractor | None = None,
         summarizer: SymbolSummarizer | None = None,
+        registry: ExtractorRegistry | None = None,
     ) -> None:
         self._config = config
         self._db = db
-        self._scanner = scanner or WorkspaceScanner(config.workspace_path)
-        self._symbol_extractor = symbol_extractor or SymbolExtractor()
         self._summarizer = summarizer
         self._jedi_resolver = JediResolver(str(config.workspace_path))
+        self._csharp_resolver = CSharpResolver(str(config.workspace_path))
+        self._graph = GraphRetriever(db=self._db)
+
+        # Initialize extractor registry with Python, TypeScript, and C# extractors
+        self._registry = registry or ExtractorRegistry()
+        if not self._registry.all_languages():
+            self._registry.register(PythonExtractor())
+            self._registry.register(TypeScriptExtractor())
+            self._registry.register(CSharpExtractor())
+
+        # Initialize scanner with supported extensions
+        extensions = self._registry.all_extensions()
+        self._scanner = scanner or WorkspaceScanner(config.workspace_path, file_extensions=extensions)
 
     async def index_workspace(self) -> WorkspaceIndexResult:
         started_at = time.perf_counter()
@@ -70,26 +85,48 @@ class WorkspaceIndexer:
 
         for rel_path in scan_result.python_files:
             file_path = rel_path.as_posix()
+            file_ext = rel_path.suffix
+
+            # Get the appropriate extractor for this file type
+            extractor = self._registry.get(file_ext)
+            if extractor is None:
+                # Skip unsupported file types (shouldn't happen if scanner is correct)
+                continue
+
             content = self._read_text(self._config.workspace_path / rel_path)
             content_hash = self._content_hash(content)
             previous_hash = existing_hashes.get(file_path)
+            language = extractor.language
 
             if previous_hash == content_hash:
                 unchanged_files += 1
                 await self._upsert_file_index(
                     conn=conn,
                     file_path=file_path,
-                    language="python",
+                    language=language,
                     content_hash=content_hash,
                 )
                 continue
 
             indexed_files += 1
-            symbols = self._symbol_extractor.extract(
+            raw_symbols = extractor.extract(
                 file_path=file_path,
                 source=content,
                 content_hash=content_hash,
             )
+            # Deduplicate by ID — extractors can produce the same node via
+            # multiple code paths (e.g. regex mis-match in C# method names).
+            seen_ids: set[str] = set()
+            symbols = []
+            for s in raw_symbols:
+                if s.id not in seen_ids:
+                    seen_ids.add(s.id)
+                    symbols.append(s)
+                else:
+                    logger.warning(
+                        "Duplicate symbol id %s (%s:%s) in %s — skipping",
+                        s.id, s.kind, s.name, file_path,
+                    )
             symbols_extracted += len(symbols)
 
             # Delete stale relationships BEFORE deleting symbols (subquery needs them)
@@ -107,7 +144,7 @@ class WorkspaceIndexer:
             for symbol in symbols:
                 await conn.execute(
                     """
-                    INSERT INTO symbols
+                    INSERT OR IGNORE INTO symbols
                     (
                         id, file_path, name, kind, start_line,
                         end_line, signature, summary, content_hash
@@ -127,7 +164,7 @@ class WorkspaceIndexer:
                 )
 
             # Extract and store structural relationships
-            relationships = self._symbol_extractor.extract_relationships(
+            relationships = extractor.extract_relationships(
                 file_path=file_path,
                 source=content,
                 symbols=list(symbols),
@@ -138,14 +175,14 @@ class WorkspaceIndexer:
                 source=content,
                 abs_file_path=str(self._config.workspace_path / rel_path),
                 relationships=relationships,
+                language=language,
             )
-            graph = GraphRetriever(db=self._db)
-            await graph.store_relationships(conn, relationships)
+            await self._graph.store_relationships(conn, relationships)
 
             await self._upsert_file_index(
                 conn=conn,
                 file_path=file_path,
-                language="python",
+                language=language,
                 content_hash=content_hash,
             )
 
@@ -188,12 +225,23 @@ class WorkspaceIndexer:
         source: str,
         abs_file_path: str,
         relationships: list[SymbolRelationshipRecord],
+        language: str,
     ) -> list[SymbolRelationshipRecord]:
-        """Enrich to_symbol_id for cross-module call relationships using Jedi.
+        """Enrich to_symbol_id for cross-module call relationships.
 
-        Only runs when jedi is installed. Falls back silently to the unchanged
-        relationship list if Jedi is unavailable or resolves nothing.
+        Supports Python call resolution (Jedi) and C# namespace/DI backfill.
         """
+        if language == "csharp":
+            file_namespace = self._csharp_resolver.extract_namespace_from_source(source)
+            return await self._csharp_resolver.backfill_relationship_symbols(
+                relationships,
+                conn,
+                file_namespace=file_namespace,
+            )
+
+        # Only use Jedi for Python files
+        if language != "python":
+            return relationships
         if not self._jedi_resolver.available:
             return relationships
 
@@ -343,8 +391,7 @@ class WorkspaceIndexer:
             """
             SELECT file_path, content_hash
             FROM file_index
-            WHERE language = 'python'
-              AND workspace_root = ?
+            WHERE workspace_root = ?
             """,
             (str(self._config.workspace_path),),
         )

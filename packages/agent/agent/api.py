@@ -308,6 +308,7 @@ class IndexStatusResponse(BaseModel):
     never_indexed: bool
     symbols_pending_summary: int = 0
     summarizing: bool = False
+    languages: list[str] = []
 
 
 def _workspace_index_response_kwargs(result: object) -> dict[str, object]:
@@ -1687,11 +1688,15 @@ async def index_workspace(request: WorkspaceIndexRequest | None = None) -> Works
     indexer = WorkspaceIndexer(config=config, db=db, summarizer=effective_summarizer)
     result = await indexer.index_workspace()
     if effective_summarizer is not None:
+        _seed_after = seed_memory
         async def _run_summarization() -> None:
             global _summarization_in_progress_count
             _summarization_in_progress_count += 1
             try:
                 await indexer._summarize_pending_symbols(batch_size=batch_size)
+                if _seed_after:
+                    _post_seeder = MemorySeederService(config=config, db=db)
+                    await _post_seeder.seed(str(config.workspace_path.resolve()))
             except Exception:
                 logger.exception("_run_summarization (index) failed")
             finally:
@@ -1700,11 +1705,13 @@ async def index_workspace(request: WorkspaceIndexRequest | None = None) -> Works
         _background_tasks.add(_t)
         _t.add_done_callback(_background_tasks.discard)
     profile_service = WorkspaceProfileService(config=config, db=db)
-    await profile_service.ensure_profile()
+    await profile_service.rebuild_profile()
     memory_items_seeded = 0
     if seed_memory:
         seeder = MemorySeederService(config=config, db=db)
-        memory_items_seeded = await seeder.seed(str(config.workspace_path))
+        # Seeds symbols already summarized from prior runs; newly indexed symbols
+        # will be seeded by _run_summarization above once it completes.
+        memory_items_seeded = await seeder.seed(str(config.workspace_path.resolve()))
 
     return WorkspaceIndexResponse(**_workspace_index_response_kwargs(result), memory_items_seeded=memory_items_seeded)
 
@@ -1747,6 +1754,13 @@ async def workspace_index_status() -> IndexStatusResponse:
     symbols_count = int(symbols_row["symbols_count"] or 0)
     symbols_pending_summary = int(pending_row["cnt"] or 0)
 
+    lang_cursor = await conn.execute(
+        "SELECT DISTINCT language FROM file_index WHERE workspace_root = ? AND language IS NOT NULL",
+        (root,),
+    )
+    lang_rows = await lang_cursor.fetchall()
+    languages = sorted(row["language"] for row in lang_rows)
+
     return IndexStatusResponse(
         indexed_files=indexed_files,
         stale_files=stale_files,
@@ -1755,6 +1769,7 @@ async def workspace_index_status() -> IndexStatusResponse:
         never_indexed=(indexed_files == 0 and stale_files == 0 and symbols_count == 0),
         symbols_pending_summary=symbols_pending_summary,
         summarizing=_summarization_in_progress_count > 0,
+        languages=languages,
     )
 
 
@@ -1787,6 +1802,8 @@ async def rebuild_memory(request: RebuildMemoryRequest | None = None) -> Rebuild
         _t.add_done_callback(_background_tasks.discard)
     else:
         logger.warning("rebuild_memory: no summarizer available, skipping summarization")
+    profile_service = WorkspaceProfileService(config=config, db=db)
+    await profile_service.rebuild_profile()
     return RebuildMemoryResponse(rebuilt=True, **_workspace_index_response_kwargs(result))
 
 
@@ -2024,7 +2041,6 @@ _INDEX_KEYWORD_STOPWORDS = {
     "build",
     "change",
     "code",
-    "context",
     "from",
     "have",
     "into",
@@ -2084,7 +2100,12 @@ async def _suggest_files_from_index(
         SELECT file_path
         FROM file_index
         WHERE stale = 0 AND ({file_where})
-        ORDER BY COALESCE(last_indexed_at, '') DESC, file_path ASC
+        ORDER BY
+            CASE WHEN lower(file_path) LIKE '%/test_%' OR lower(file_path) LIKE '%\\test_%'
+                      OR lower(file_path) LIKE '%_test.%' OR lower(file_path) LIKE '%/tests/%'
+                      OR lower(file_path) LIKE '%\\tests\\%' THEN 1 ELSE 0 END ASC,
+            COALESCE(last_indexed_at, '') DESC,
+            file_path ASC
         LIMIT ?
         """,
         file_params,
@@ -2313,7 +2334,7 @@ async def _generate_context_pack_response(request: ContextBuildRequest) -> Conte
         files_to_include = await _suggest_files_from_index(
             db=db,
             keywords=fallback_keywords,
-            limit=15,
+            limit=20,
         )
 
     workspace_service = WorkspaceRootsService(config=config, db=db)

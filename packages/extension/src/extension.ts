@@ -22,14 +22,71 @@ let statusBarItem: vscode.StatusBarItem;
 let workspaceIndexingInFlight = false;
 let extensionContext: vscode.ExtensionContext | undefined;
 
+let pendingChangesBar: vscode.StatusBarItem | undefined;
+let fileWatcher: vscode.FileSystemWatcher | undefined;
+const pendingNew = new Set<string>();
+const pendingModified = new Set<string>();
+const pendingDeleted = new Set<string>();
+
+function updatePendingChangesBar(): void {
+    const total = pendingNew.size + pendingModified.size + pendingDeleted.size;
+    if (total === 0) {
+        pendingChangesBar?.hide();
+        return;
+    }
+    if (!pendingChangesBar) { return; }
+    const parts: string[] = [];
+    if (pendingNew.size > 0) { parts.push(`${pendingNew.size} new`); }
+    if (pendingModified.size > 0) { parts.push(`${pendingModified.size} modified`); }
+    if (pendingDeleted.size > 0) { parts.push(`${pendingDeleted.size} deleted`); }
+    pendingChangesBar.text = `$(sync) MemoPilot: ${parts.join(', ')} — click to update`;
+    pendingChangesBar.tooltip = 'Click to reindex changed files in MemoPilot';
+    pendingChangesBar.show();
+}
+
+function setupFileWatcher(context: vscode.ExtensionContext): void {
+    fileWatcher?.dispose();
+    const pattern = new vscode.RelativePattern(
+        vscode.workspace.workspaceFolders![0],
+        '**/*.{cs,ts,tsx,py,js,jsx}',
+    );
+    fileWatcher = vscode.workspace.createFileSystemWatcher(pattern);
+
+    fileWatcher.onDidCreate((uri) => {
+        pendingNew.add(uri.fsPath);
+        pendingDeleted.delete(uri.fsPath);
+        updatePendingChangesBar();
+    });
+    fileWatcher.onDidChange((uri) => {
+        if (!pendingNew.has(uri.fsPath)) {
+            pendingModified.add(uri.fsPath);
+        }
+        updatePendingChangesBar();
+    });
+    fileWatcher.onDidDelete((uri) => {
+        pendingNew.delete(uri.fsPath);
+        pendingModified.delete(uri.fsPath);
+        pendingDeleted.add(uri.fsPath);
+        updatePendingChangesBar();
+    });
+
+    context.subscriptions.push(fileWatcher);
+}
+
 async function refreshIndexStatus(
     client: BackendClient,
     statusProvider: StatusTreeProvider,
     outputChannel: vscode.OutputChannel,
+    memoryProvider?: MemoryManagerTreeProvider,
+    profileProvider?: WorkspaceProfileTreeProvider,
 ): Promise<IndexStatusResponse | undefined> {
     try {
         const indexStatus = await client.getIndexStatus();
         statusProvider.updateIndexStatus(indexStatus);
+        if (indexStatus.languages && indexStatus.languages.length > 0) {
+            memoryProvider?.setIndexedLanguages(indexStatus.languages);
+            profileProvider?.setDetectedLanguages(indexStatus.languages);
+        }
         return indexStatus;
     } catch (err: unknown) {
         const msg = err instanceof Error ? err.message : String(err);
@@ -55,6 +112,10 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     statusBarItem.tooltip = 'MemoPilot — Starting backend...';
     statusBarItem.show();
     context.subscriptions.push(statusBarItem);
+
+    pendingChangesBar = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 99);
+    pendingChangesBar.command = 'memopilot.indexPendingChanges';
+    context.subscriptions.push(pendingChangesBar);
 
     // Tree views
     const statusProvider = new StatusTreeProvider();
@@ -108,7 +169,8 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
                     vscode.window.showInformationMessage(
                         `MemoPilot: ${parts.join(', ')} (${result.duration_ms}ms).`,
                     );
-                    await refreshIndexStatus(backendClient!, statusProvider, outputChannel);
+                    await refreshIndexStatus(backendClient!, statusProvider, outputChannel, memoryProvider, profileProvider);
+                    await costProvider.refresh();
                 },
             );
         } catch (err: unknown) {
@@ -130,6 +192,8 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
             vscode.window.showInformationMessage(
                 `MemoPilot memory rebuilt: ${result.indexed_files} files, ${result.symbols_extracted} symbols.`,
             );
+            await refreshIndexStatus(backendClient, statusProvider, outputChannel, memoryProvider, profileProvider);
+            await costProvider.refresh();
         } catch (err: unknown) {
             const msg = err instanceof Error ? err.message : String(err);
             vscode.window.showErrorMessage(`MemoPilot memory rebuild failed: ${msg}`);
@@ -233,6 +297,8 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
             workspaceIndexingInFlight = false;
             memoryProvider.setReindexing(false);
             await memoryProvider.refresh();
+            await refreshIndexStatus(backendClient!, statusProvider, outputChannel, memoryProvider, profileProvider);
+            await costProvider.refresh();
         }
     };
 
@@ -264,6 +330,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
                         'MemoPilot: Summarization running in background.',
                     );
                     await memoryProvider.refresh();
+                    await costProvider.refresh();
                 },
             );
         } catch (err: unknown) {
@@ -290,6 +357,11 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         costProvider.setClient(backendClient);
         historyProvider.setClient(backendClient);
         mcpProvider.setClient(backendClient);
+
+        // Load indexed languages from configuration
+        const indexedLanguages = vscode.workspace.getConfiguration('memopilot').get<string[]>('indexedLanguages', ['python']);
+        memoryProvider.setIndexedLanguages(indexedLanguages);
+
         // Update the main panel if it's open
         if (MemoPilotPanel.currentPanel) {
             MemoPilotPanel.currentPanel.setClient(backendClient);
@@ -351,7 +423,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 
     const restartBackendNow = async (): Promise<void> => {
         await stopBackend();
-        await startBackend(context, outputChannel, statusProvider, refreshGovernanceViews);
+        await startBackend(context, outputChannel, statusProvider, refreshGovernanceViews, memoryProvider, profileProvider);
     };
 
     const openWorkspaceProfile = async () => {
@@ -1127,6 +1199,14 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         vscode.commands.registerCommand('memopilot.optimizeToolsAndSkills', optimizeToolsAndSkills),
         vscode.commands.registerCommand('memopilot.managePolicyPacks', managePolicyPacks),
         vscode.commands.registerCommand('memopilot.manageWorkspaces', manageWorkspaces),
+        vscode.commands.registerCommand('memopilot.indexPendingChanges', async () => {
+            if (!backendClient) { return; }
+            pendingNew.clear();
+            pendingModified.clear();
+            pendingDeleted.clear();
+            pendingChangesBar?.hide();
+            await vscode.commands.executeCommand('memopilot.indexWorkspace');
+        }),
         vscode.commands.registerCommand('memopilot.showPanel', () => {
             MemoPilotPanel.createOrShow(context.extensionUri, backendClient);
         }),
@@ -1138,6 +1218,18 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     // Register Language Model Tools (VS Code 1.99+ Copilot Chat integration)
     const toolDisposables = registerLanguageModelTools(context, () => backendClient);
     context.subscriptions.push(...toolDisposables);
+
+    // Listen for configuration changes (e.g., memopilot.indexedLanguages)
+    context.subscriptions.push(
+        vscode.workspace.onDidChangeConfiguration((event) => {
+            if (event.affectsConfiguration('memopilot.indexedLanguages') ||
+                event.affectsConfiguration('memopilot.showLanguageBadges')) {
+                const indexedLanguages = vscode.workspace.getConfiguration('memopilot').get<string[]>('indexedLanguages', ['python']);
+                memoryProvider.setIndexedLanguages(indexedLanguages);
+                void memoryProvider.refresh();
+            }
+        }),
+    );
 
     // Start backend if workspace is open
     const workspaceFolder = vscode.workspace.workspaceFolders?.[0];
@@ -1153,6 +1245,8 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         outputChannel,
         statusProvider,
         refreshGovernanceViews,
+        memoryProvider,
+        profileProvider,
     );
 
     // Auto-index on activation — silent background, non-blocking
@@ -1170,6 +1264,8 @@ async function startBackend(
     outputChannel: vscode.OutputChannel,
     statusProvider: StatusTreeProvider,
     onConnectedRefresh: () => Promise<void>,
+    memoryProvider?: MemoryManagerTreeProvider,
+    profileProvider?: WorkspaceProfileTreeProvider,
 ): Promise<void> {
     const workspaceFolder = vscode.workspace.workspaceFolders?.[0];
     if (!workspaceFolder) { return; }
@@ -1198,7 +1294,7 @@ async function startBackend(
                 if (action === 'Restart Backend') {
                     await stopBackend();
                     unexpectedExitRetryCount = 0;
-                    await startBackend(context, outputChannel, statusProvider, onConnectedRefresh);
+                    await startBackend(context, outputChannel, statusProvider, onConnectedRefresh, memoryProvider, profileProvider);
                 }
                 return;
             }
@@ -1209,7 +1305,7 @@ async function startBackend(
             
             await new Promise(resolve => setTimeout(resolve, backoffMs));
             await stopBackend();
-            await startBackend(context, outputChannel, statusProvider, onConnectedRefresh);
+            await startBackend(context, outputChannel, statusProvider, onConnectedRefresh, memoryProvider, profileProvider);
         };
 
         backendManager = new BackendManager(workspaceFolder.uri.fsPath, outputChannel, onUnexpectedExit);
@@ -1256,7 +1352,11 @@ async function startBackend(
             
             await onConnectedRefresh();
 
-            await refreshIndexStatus(backendClient, statusProvider, outputChannel);
+            await refreshIndexStatus(backendClient, statusProvider, outputChannel, memoryProvider, profileProvider);
+
+            if (vscode.workspace.workspaceFolders?.length) {
+                setupFileWatcher(context);
+            }
         }
     } catch (err: unknown) {
         const msg = err instanceof Error ? err.message : String(err);
