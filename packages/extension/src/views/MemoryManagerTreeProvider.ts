@@ -13,6 +13,34 @@ export const MEMORY_FILTERS = [
 
 export type MemoryFilter = (typeof MEMORY_FILTERS)[number];
 
+// Language flag emojis
+const LANGUAGE_BADGE_OVERRIDES: Record<string, string> = {
+    'python': '[Py]',
+    'typescript': '[TS]',
+    'javascript': '[JS]',
+    'csharp': '[C#]',
+    'c#': '[C#]',
+    'kotlin': '[KT]',
+    'golang': '[Go]',
+    'go': '[Go]',
+    'rust': '[Rs]',
+    'swift': '[SW]',
+    'ruby': '[Rb]',
+    'java': '[Jv]',
+    'cpp': '[C+]',
+    'c++': '[C+]',
+};
+
+function languageBadge(lang: string): string {
+    const key = lang.toLowerCase();
+    if (LANGUAGE_BADGE_OVERRIDES[key]) {
+        return LANGUAGE_BADGE_OVERRIDES[key];
+    }
+    // Auto-generate from the first two characters of the language name
+    const abbr = lang.replace(/[^a-zA-Z0-9#+]/g, '').slice(0, 2).toUpperCase();
+    return abbr ? `[${abbr}]` : `[${lang.slice(0, 2).toUpperCase()}]`;
+}
+
 export class MemoryManagerTreeProvider implements vscode.TreeDataProvider<vscode.TreeItem> {
     private _onDidChangeTreeData = new vscode.EventEmitter<vscode.TreeItem | undefined>();
     readonly onDidChangeTreeData = this._onDidChangeTreeData.event;
@@ -23,9 +51,14 @@ export class MemoryManagerTreeProvider implements vscode.TreeDataProvider<vscode
     private treeItems: vscode.TreeItem[] = [new vscode.TreeItem('Memory Manager not loaded yet.')];
     private _pollTimer: ReturnType<typeof setInterval> | undefined;
     private _reindexing = false;
+    private indexedLanguages: string[] = [];
 
     setClient(client: BackendClient | undefined): void {
         this.client = client;
+    }
+
+    setIndexedLanguages(languages: string[]): void {
+        this.indexedLanguages = languages;
     }
 
     setReindexing(flag: boolean): void {
@@ -127,7 +160,8 @@ export class MemoryManagerTreeProvider implements vscode.TreeDataProvider<vscode
     }
 
     private itemsToTreeItems(items: MemoryItemResponse[], status?: IndexStatusResponse): vscode.TreeItem[] {
-        const header = new vscode.TreeItem(`Filter: ${this.filter} (${items.length} items)`);
+        const languageBadges = this.getLanguageBadges();
+        const header = new vscode.TreeItem(`Filter: ${this.filter} (${items.length} items) ${languageBadges}`);
         header.description = 'Use "Review Memory" command to change filter and act on items.';
 
         if (items.length === 0) {
@@ -155,7 +189,8 @@ export class MemoryManagerTreeProvider implements vscode.TreeDataProvider<vscode
                 const staleLabel = item.stale ? 'stale' : 'fresh';
                 const isPending = this.isPending(item);
                 const pendingLabel = isPending ? 'pending' : 'active';
-                const treeItem = new vscode.TreeItem(`${trustEmoji} ${item.title}`);
+                const languageBadge = this.getLanguageBadgeForItem(item);
+                const treeItem = new vscode.TreeItem(`${trustEmoji} ${languageBadge} ${item.title}`);
                 treeItem.description = `${item.type} • trust ${item.trust_level} • ${pendingLabel} • ${staleLabel}`;
                 treeItem.tooltip = `${item.body}\n\nid=${item.id}`;
                 // contextValue drives inline approve/reject buttons via package.json menus
@@ -165,6 +200,45 @@ export class MemoryManagerTreeProvider implements vscode.TreeDataProvider<vscode
                 return treeItem;
             }),
         ];
+    }
+
+    private getLanguageBadges(): string {
+        const showBadges = vscode.workspace.getConfiguration('memopilot').get<boolean>('showLanguageBadges', true);
+        if (!showBadges || this.indexedLanguages.length === 0) {
+            return '';
+        }
+
+        const badges = this.indexedLanguages
+            .map((lang) => languageBadge(lang))
+            .join(' ');
+        return badges;
+    }
+
+    private getLanguageBadgeForItem(item: MemoryItemResponse): string {
+        const showBadges = vscode.workspace.getConfiguration('memopilot').get<boolean>('showLanguageBadges', true);
+        if (!showBadges) {
+            return '';
+        }
+
+        // Try to infer language from item type (e.g., "symbol@python", "symbol@typescript")
+        const typeMatch = item.type.match(/@([a-zA-Z0-9#+]+)/i);
+        if (typeMatch) {
+            return languageBadge(typeMatch[1]);
+        }
+
+        // Try to infer language from source path extension
+        if (item.source_path) {
+            const extMap: Record<string, string> = {
+                '.py': 'python', '.ts': 'typescript', '.tsx': 'typescript',
+                '.js': 'javascript', '.jsx': 'javascript', '.cs': 'csharp',
+                '.go': 'go', '.rs': 'rust', '.kt': 'kotlin', '.java': 'java',
+                '.rb': 'ruby', '.swift': 'swift', '.cpp': 'cpp', '.cc': 'cpp',
+            };
+            const ext = Object.keys(extMap).find(e => item.source_path!.endsWith(e));
+            if (ext) { return languageBadge(extMap[ext]); }
+        }
+
+        return '';
     }
 
     private trustEmoji(trustLevel: number): string {

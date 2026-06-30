@@ -4,6 +4,8 @@ import * as path from 'path';
 import * as fs from 'fs';
 import { ChildProcess, spawn } from 'child_process';
 
+const EXTENSION_VERSION = '1.0.1-build-20260630';
+
 interface BackendLockfile {
     port: number;
     pid: number;
@@ -72,7 +74,7 @@ export class BackendManager {
             fs.unlinkSync(this.lockFilePath);
         }
 
-        this.outputChannel.appendLine(`[MemoPilot] Starting backend: ${pythonPath} -m agent.main`);
+        this.outputChannel.appendLine(`[MemoPilot v${EXTENSION_VERSION}] Starting backend: ${pythonPath} -m agent.main`);
         this.outputChannel.appendLine(`[MemoPilot] Agent dir: ${agentDir}`);
         this.outputChannel.appendLine(`[MemoPilot] Agent parent (cwd): ${agentParent}`);
         this.outputChannel.appendLine(`[MemoPilot] Workspace: ${this.workspacePath}`);
@@ -125,8 +127,8 @@ export class BackendManager {
         });
 
         // Wait for lockfile to appear with port
-        this.port = await this.waitForPort(30000);
-        this.outputChannel.appendLine(`[MemoPilot] Backend started on port ${this.port}`);
+        this.port = await this.waitForPort(60000);
+        this.outputChannel.appendLine(`[MemoPilot v${EXTENSION_VERSION}] Backend started on port ${this.port}`);
 
         // Write .cursor-mcp-env for MCP server (Cursor integration)
         this.writeCursorMcpEnv(memopilotDir);
@@ -233,6 +235,9 @@ export class BackendManager {
             { module: 'PIL', packageName: 'pillow>=11.0.0' },
             { module: 'docx', packageName: 'python-docx>=1.1.2' },
             { module: 'pptx', packageName: 'python-pptx>=1.0.2' },
+            { module: 'tree_sitter', packageName: 'tree-sitter>=0.23.0' },
+            { module: 'tree_sitter_typescript', packageName: 'tree-sitter-typescript>=0.23.0' },
+            { module: 'tree_sitter_c_sharp', packageName: 'tree-sitter-c-sharp>=0.23.0' },
         ];
 
         const moduleScript = [
@@ -387,7 +392,7 @@ export class BackendManager {
         const hint = this.stderrBuffer
             ? `\nLast stderr:\n${this.stderrBuffer.slice(-500)}`
             : '';
-        throw new Error(`Backend failed to start within 30 seconds (no lockfile)${hint}`);
+        throw new Error(`Backend failed to start within 60 seconds (no lockfile)${hint}`);
     }
 
     private readLockfile(): BackendLockfile | undefined {

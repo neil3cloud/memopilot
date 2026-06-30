@@ -17,6 +17,15 @@ DEFAULT_EXCLUDED_DIRS = {
     "venv",
     "node_modules",
     "__pycache__",
+    "dist",
+    "build",
+    "out",
+    "bin",
+    "obj",
+    ".next",
+    ".nuxt",
+    "coverage",
+    ".cache",
 }
 
 
@@ -33,6 +42,7 @@ class ScanResult:
     python_files: list[Path]
     skipped_files: int
     python_project: bool
+    languages_detected: set[str]  # e.g. {'python', 'typescript', 'csharp'}
 
 
 def _normalize_rel_path(path: Path) -> str:
@@ -115,15 +125,18 @@ class GitIgnoreMatcher:
 
 
 class WorkspaceScanner:
-    """Scans workspace files and returns Python file candidates."""
+    """Scans workspace files for multiple language types."""
 
-    def __init__(self, workspace_path: Path) -> None:
+    def __init__(self, workspace_path: Path, file_extensions: list[str] | None = None) -> None:
         self.workspace_path = workspace_path
+        # Default to Python if no extensions provided (backward compatibility)
+        self._extensions = set(file_extensions or [".py"])
         self._gitignore = GitIgnoreMatcher.from_workspace(workspace_path)
 
     def scan(self) -> ScanResult:
-        python_files: list[Path] = []
+        indexed_files: list[Path] = []
         skipped_files = 0
+        languages_detected: set[str] = set()
 
         for root, dirs, files in os.walk(self.workspace_path):
             root_path = Path(root)
@@ -143,18 +156,26 @@ class WorkspaceScanner:
                 if self._gitignore.is_ignored(rel_file, is_dir=False):
                     skipped_files += 1
                     continue
-                if rel_file.suffix == ".py":
-                    python_files.append(rel_file)
+                if rel_file.suffix in self._extensions:
+                    indexed_files.append(rel_file)
+                    # Track detected languages
+                    if rel_file.suffix == ".py":
+                        languages_detected.add("python")
+                    elif rel_file.suffix in (".ts", ".tsx", ".js", ".jsx"):
+                        languages_detected.add("typescript")
+                    elif rel_file.suffix == ".cs":
+                        languages_detected.add("csharp")
 
-        python_files.sort(key=lambda path: path.as_posix())
+        indexed_files.sort(key=lambda path: path.as_posix())
         return ScanResult(
-            python_files=python_files,
+            python_files=indexed_files,
             skipped_files=skipped_files,
-            python_project=self._is_python_project(python_files),
+            python_project=self._is_python_project(indexed_files),
+            languages_detected=languages_detected,
         )
 
-    def _is_python_project(self, python_files: list[Path]) -> bool:
+    def _is_python_project(self, indexed_files: list[Path]) -> bool:
         for marker in PYTHON_PROJECT_MARKERS:
             if (self.workspace_path / marker).exists():
                 return True
-        return len(python_files) > 0
+        return any(path.suffix == ".py" for path in indexed_files)

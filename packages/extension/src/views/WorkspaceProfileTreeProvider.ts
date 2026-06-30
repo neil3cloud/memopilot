@@ -8,6 +8,12 @@ export class WorkspaceProfileTreeProvider implements vscode.TreeDataProvider<vsc
 
     private client: BackendClient | undefined;
     private items: vscode.TreeItem[] = [new vscode.TreeItem('Workspace profile not loaded yet.')];
+    private _detectedLanguages: string[] = [];
+
+    setDetectedLanguages(languages: string[]): void {
+        this._detectedLanguages = languages;
+        this._onDidChangeTreeData.fire(undefined);
+    }
 
     setClient(client: BackendClient | undefined): void {
         this.client = client;
@@ -46,7 +52,10 @@ export class WorkspaceProfileTreeProvider implements vscode.TreeDataProvider<vsc
         };
 
         const nameItem = new vscode.TreeItem(`Workspace: ${pick('name')}`);
-        const languageItem = new vscode.TreeItem(`Language: ${pick('primary_language')}`);
+        const langDisplay = this._detectedLanguages.length > 0
+            ? this._detectedLanguages.join(', ')
+            : pick('primary_language');
+        const languageItem = new vscode.TreeItem(`Language: ${langDisplay}`);
         const budgetItem = new vscode.TreeItem(`Budget profile: ${pick('budget_profile')}`);
         const privacyItem = new vscode.TreeItem(`Redact secrets: ${pick('redact_secrets')}`);
         const modelItem = new vscode.TreeItem(`Frontier requires approval: ${pick('frontier_requires_approval')}`);

@@ -76,6 +76,10 @@
         "title": "MemoPilot: Index Workspace Memory"
       },
       {
+        "command": "memopilot.indexPendingChanges",
+        "title": "MemoPilot: Update Index for Pending Changes"
+      },
+      {
         "command": "memopilot.analyzeTask",
         "title": "MemoPilot: Search Project Context"
       },
@@ -320,6 +324,26 @@
           ],
           "default": 25,
           "description": "Number of symbols sent in a single LLM request during summarization. Higher values are faster but may hit rate limits."
+        },
+        "memopilot.indexedLanguages": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "enum": [
+              "python",
+              "typescript",
+              "csharp"
+            ]
+          },
+          "default": [
+            "python"
+          ],
+          "description": "Programming languages to index in the workspace. Enable TypeScript to index .ts/.js files, C# to index .cs files in ASP.NET projects, etc."
+        },
+        "memopilot.showLanguageBadges": {
+          "type": "boolean",
+          "default": true,
+          "description": "Show language badges (🐍/🟨/🔷) in the Memory Manager tree view and memory summaries."
         }
       }
     }
