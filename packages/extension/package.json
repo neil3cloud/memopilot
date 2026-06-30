@@ -343,7 +343,7 @@
         "memopilot.showLanguageBadges": {
           "type": "boolean",
           "default": true,
-          "description": "Show language badges (🐍/🟨/🔷) in the Memory Manager tree view and memory summaries."
+          "description": "Show language badges (e.g. [Py], [TS], [C#]) in the Memory Manager tree view and memory summaries."
         }
       }
     }
