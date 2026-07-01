@@ -354,6 +354,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         memoryProvider.setClient(backendClient);
         privacyProvider.setClient(backendClient);
         rulesProvider.setClient(backendClient);
+        contextProvider.setClient(backendClient);
         costProvider.setClient(backendClient);
         historyProvider.setClient(backendClient);
         mcpProvider.setClient(backendClient);
@@ -499,11 +500,23 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         if (!taskDescription) { return; }
 
         try {
-            const assembled = await client.assembleContext({
-                task_description: taskDescription,
-                workspace_root: getWorkspaceRoot(),
-                caller: 'memopilot_ui',
-                max_output_tokens: 8000,
+            const [assembled, pack] = await Promise.all([
+                client.assembleContext({
+                    task_description: taskDescription,
+                    workspace_root: getWorkspaceRoot(),
+                    caller: 'memopilot_ui',
+                    max_output_tokens: 8000,
+                }),
+                client.buildContextPack({ task_description: taskDescription }),
+            ]);
+            contextProvider.setContextPack({
+                files: pack.files,
+                rules_count: pack.rules.length,
+                skills_count: pack.skills.length,
+                total_tokens: pack.total_tokens,
+                estimated_cost_usd: pack.estimated_cost_usd,
+                quality_score: pack.quality_score,
+                callers_not_in_context: pack.callers_not_in_context,
             });
             const document = await vscode.workspace.openTextDocument({
                 language: 'markdown',
@@ -697,6 +710,37 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         } catch (err: unknown) {
             const msg = err instanceof Error ? err.message : String(err);
             void vscode.window.showErrorMessage(`Template manager failed: ${msg}`);
+        }
+    };
+
+    const selectBudgetProfile = async () => {
+        const client = ensureBackendClient();
+        if (!client) { return; }
+        try {
+            const current = await client.getBudgetProfiles();
+            const PROFILE_DESCRIPTIONS: Record<string, string> = {
+                balanced: 'Uses cheapest capable model; allows frontier when needed',
+                cost_saver: 'Weights routing toward cheaper models',
+                strict_local: 'All AI calls must use local models (Ollama)',
+                enterprise_privacy: 'Only local-privacy providers permitted',
+            };
+            const picked = await vscode.window.showQuickPick(
+                Object.keys(current.profiles).map(profile => ({
+                    label: profile,
+                    description: profile === current.active_profile ? 'active' : undefined,
+                    detail: PROFILE_DESCRIPTIONS[profile],
+                    profile,
+                })),
+                { title: 'Select Budget Profile' },
+            );
+            if (!picked) { return; }
+            const updated = await client.setBudgetProfile(picked.profile);
+            void vscode.window.showInformationMessage(
+                `Budget profile set to "${updated.active_profile}" (effective budget: $${updated.effective_budget_usd.toFixed(2)}/mo)`,
+            );
+        } catch (err: unknown) {
+            const msg = err instanceof Error ? err.message : String(err);
+            void vscode.window.showErrorMessage(`MemoPilot budget profile selection failed: ${msg}`);
         }
     };
 
@@ -1197,6 +1241,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         vscode.commands.registerCommand('memopilot.backupMemory', backupMemory),
         vscode.commands.registerCommand('memopilot.restoreMemory', restoreMemory),
         vscode.commands.registerCommand('memopilot.optimizeToolsAndSkills', optimizeToolsAndSkills),
+        vscode.commands.registerCommand('memopilot.selectBudgetProfile', selectBudgetProfile),
         vscode.commands.registerCommand('memopilot.managePolicyPacks', managePolicyPacks),
         vscode.commands.registerCommand('memopilot.manageWorkspaces', manageWorkspaces),
         vscode.commands.registerCommand('memopilot.indexPendingChanges', async () => {

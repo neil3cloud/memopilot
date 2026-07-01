@@ -33,7 +33,6 @@ def select_tools(
     task_type: str,
     available_tools: list[str],
     task_text: str = "",
-    budget_profile: str = "balanced",
 ) -> ToolSelection:
     """Select relevant tools for a task.
 
@@ -73,11 +72,6 @@ def select_tools(
             include("ado_mcp", "Work item reference detected in task text")
         else:
             exclude("ado_mcp", "No work item reference found")
-
-    if budget_profile in ("strict_local", "enterprise_privacy"):
-        for tool in list(selected):
-            if tool.endswith("_mcp"):
-                exclude(tool, f"Blocked by budget_profile={budget_profile}")
 
     for tool in available_tools:
         if tool not in selected and tool not in excluded:

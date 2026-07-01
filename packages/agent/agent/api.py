@@ -44,7 +44,7 @@ from .context_quality_scorer import (
 )
 from .context_renderer import ContextPackRenderer
 from .cost_guard import BudgetCheck as CostGuardBudgetCheck
-from .cost_guard import CostGuardService, check_budget_gate, infer_selected_tier
+from .cost_guard import CostGuardService, infer_selected_tier
 from .db import DatabaseManager
 from .document_ingestion import extract_csv, extract_docx, extract_excel, extract_pdf, extract_pptx
 from .endpoint_registry import ENDPOINT_STATUS
@@ -126,6 +126,11 @@ def _get_effective_summarizer() -> "SymbolSummarizer | None":
     from .llm_client import RelayLLMClient
     if _llm_mode == "copilot" and _host_model_available:
         return SymbolSummarizer(RelayLLMClient(_relay_llm_request, request_type="summarize"))
+    # If the mode hasn't been confirmed by the host probe yet (_host_model_available is False
+    # and _llm_mode is still the boot default "local"), don't use the config-based client —
+    # it may point at a local server that isn't running. Return None so summarization waits.
+    if not _host_model_available and _llm_mode == "local":
+        return None
     return _symbol_summarizer
 
 
@@ -1202,7 +1207,6 @@ class ToolSkillOptimizeRequest(BaseModel):
     task_text: str
     available_tools: list[str] = Field(default_factory=list)
     task_type: str | None = None
-    budget_profile: str = "balanced"
 
 
 class ToolSkillOptimizeResponse(BaseModel):
@@ -4255,7 +4259,6 @@ async def optimize_tools_and_skills(
         task_text=request.task_text,
         available_tools=request.available_tools,
         task_type=request.task_type,
-        budget_profile=request.budget_profile,
     )
     return ToolSkillOptimizeResponse(
         suggested_tools=result.suggested_tools,

@@ -375,8 +375,13 @@ class WorkspaceIndexer:
                         (summary, sym_id),
                     )
                 await conn.commit()
-            except Exception:
+            except Exception as exc:
                 logger.exception("_summarize_pending_symbols: batch %d failed", i // batch_size + 1)
+                # Provider unreachable — stop batching rather than hammering a dead endpoint.
+                import httpx
+                if isinstance(exc, httpx.ConnectError):
+                    logger.warning("_summarize_pending_symbols: provider unreachable, aborting remaining batches")
+                    break
 
     async def rebuild_memory(self) -> WorkspaceIndexResult:
         conn = await self._db.connect()

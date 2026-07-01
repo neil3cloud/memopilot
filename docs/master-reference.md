@@ -1,6 +1,6 @@
 # MemoPilot: Master Product and Implementation Reference
 
-**Document Version:** 2.8 (Retrieval-First Realignment + Legacy Task-Flow Clarification) **Target Product:** MemoPilot — Local-Memory, Rule-Aware Context System for VS Code/Cursor **Status:** Production Reference — Retrieval-First Default Surface Live
+**Document Version:** 2.9 (Dead Code Removal + Extension UI Accuracy Pass) **Target Product:** MemoPilot — Local-Memory, Rule-Aware Context System for VS Code/Cursor **Status:** Production Reference — Retrieval-First Default Surface Live
 
 ---
 
@@ -19,7 +19,7 @@
 11. [Database Schema](#11-database-schema)  
 12. [Rule and Skill System](#12-rule-and-skill-system)  
 13. [Context Pack System](#13-context-pack-system)  
-14. [Evidence-Aware Bug and User Story Investigation](#14-evidence-aware-bug-and-user-story-investigation)  
+14. [Evidence-Aware Bug and User Story Investigation (Backend Only)](#14-evidence-aware-bug-and-user-story-investigation)  
 15. [Non-Code Artifact Analysis](#15-non-code-artifact-analysis)  
 16. [Model Provider Strategy](#16-model-provider-strategy)  
 17. [Cost Guard](#17-cost-guard)  
@@ -58,16 +58,15 @@ MemoPilot is a production-ready, retrieval-first context extension for VS Code/C
 
 The extension builds and maintains local application memory before sending any context to AI. It reads local and global rules, project conventions, skills, source code, documentation, symbols, test patterns, previous decisions, and task history. It then generates a minimal, explainable, bounded context pack and exposes retrieval tools for Copilot/Cursor workflows.
 
-In default mode, MemoPilot does not auto-enter standalone patch orchestration. Legacy patch generation, approval, and validation workflows remain available as an opt-in mode via `memopilot.legacyAgentMode`.
+In default mode, MemoPilot does not auto-enter standalone patch orchestration. Patch generation, approval, and validation workflows exist in the Python backend but have no active extension UI commands — they are available only as internal pipeline stages wired through the TaskFlowController.
 
 The extension must respect existing developer rules, project rules, Cursor rules, Copilot instructions, repository documentation, code patterns, test requirements, and safety policies. It must never operate as a black box.
 
 ### Default Product Surface (Realignment)
 
-- Retrieval-first MCP tools: `memopilot-search`, `memopilot-symbols`, `memopilot-memory`, `memopilot-profile`
+- Retrieval-first MCP/LM tools: `memopilot-search`, `memopilot-symbols`, `memopilot-memory`, `memopilot-profile`
 - Default VS Code command: `MemoPilot: Search Project Context`
 - Default status bar action: opens retrieval-first context search
-- Legacy task-flow pipeline: opt-in via `memopilot.legacyAgentMode`
 
 ### Target Users
 
@@ -101,8 +100,7 @@ The problem is not the lack of AI tools. The problem is **uncontrolled, inaccura
 - A local project memory system for software development  
 - A context-pack builder with controlled, explainable context selection  
 - A cost-aware model router  
-- An optional legacy patch governance and approval workflow  
-- An evidence-aware bug and user story investigation tool  
+- An evidence-aware bug and user story investigation tool (backend only)  
 - A privacy boundary enforcer
 
 ### What MemoPilot Is Not
@@ -166,17 +164,7 @@ Broad document AI and workspace platforms are general-purpose knowledge systems.
 
 9\. Developer decides whether to proceed with an AI call using the supplied context.
 
-10\. Optional: developer switches to legacy task-flow mode for plan/patch/approval.
-
-11\. Legacy mode can generate plan/patch output with governance checks.
-
-12\. Developer reviews diff and approves patch application.
-
-13\. MemoPilot applies patch and runs validation tools.
-
-14\. MemoPilot proposes memory updates; developer approves.
-
-15\. Task history and cost are logged.
+10\. Task history and cost are logged.
 
 ---
 
@@ -243,14 +231,10 @@ MemoPilot is a VS Code/Cursor extension with AI agent capability, providing:
 - Workspace profiles  
 - Rule and skill resolution  
 - Context-pack generation with templates  
-- Agent modes (Ask, Plan, Patch, Test, Review, Investigate, Autofix)  
+- Agent modes (Ask, Plan, Patch, Test, Review, Investigate, Autofix) — wired through TaskFlowController; patch/approval/validation have no dedicated extension UI commands  
 - Cost-aware model routing  
-- AI-assisted code review and patch generation  
-- Test and lint validation  
-- User-approved file changes  
+- AI-assisted code analysis  
 - Task history and cost tracking  
-- Evidence-aware bug and user story investigation  
-- Non-code artifact analysis (logs, PDFs, spreadsheets, screenshots)  
 - Memory Manager UI  
 - Privacy Boundary Dashboard  
 - Provider Capability Matrix  
@@ -406,14 +390,12 @@ No patch is ever applied automatically. No memory is updated before validation.
 - Provider Capability Matrix  
 - AI Call Replay / Reproduce Mode  
 - Context Pack Templates  
-- Agent Modes (Ask, Plan, Context Pack, Patch, Test, Review, Autofix)  
-- Patch Risk Classifier  
-- Rule Compliance Score  
+- Agent Modes (Ask, Plan, Context Pack, Patch, Test, Review, Autofix) — patch/approval/validation wired through TaskFlowController  
+- Patch Risk Classifier (backend)  
+- Rule Compliance Score (backend)  
 - Human-in-the-loop memory updates  
 - Intelligent Context Selection with inclusion/exclusion reasoning  
-- Bug/User Story Investigation Mode  
-- Evidence Board  
-- Investigation Context Pack
+- Bug/User Story Investigation Mode (backend; no dedicated extension UI commands)
 
 ### 4.3 Production Capabilities (v1.5)
 
@@ -509,19 +491,13 @@ VS Code/Cursor Extension
 
   ├── Memory Manager UI
 
-  ├── Evidence Board
-
   ├── Context Pack Preview
-
-  ├── Diff Preview
 
   ├── Rule/Skill Viewer
 
   ├── Cost Guard UI
 
   ├── Privacy Boundary Dashboard
-
-  ├── Approval Controls
 
   └── MCP Tool Client (vscode.lm.invokeTool — primary)
 
@@ -599,23 +575,24 @@ The extension is written in TypeScript and is responsible only for UI, editor in
 
 ### 7.1 Commands
 
+There are 29 registered commands. The authoritative list is in `packages/extension/src/extension.ts`. The following commands are confirmed NOT registered and do not exist in the extension:
+
+- `MemoPilot: Generate Patch` (patch generation flows through TaskFlowController, not a standalone command)
+- `MemoPilot: Show Diff` / `MemoPilot: Apply Approved Patch` / `MemoPilot: Run Validation`
+- `MemoPilot: Open Investigation` / `MemoPilot: Attach Evidence` / `MemoPilot: Run Investigation`
+- `MemoPilot: Review Applied Patch`
+
+Key registered commands include (non-exhaustive):
+
 MemoPilot: Index Workspace Memory
 
-MemoPilot: Show Project Memory
+MemoPilot: Search Project Context
 
-MemoPilot: Analyze Current Task
+MemoPilot: Show Project Memory
 
 MemoPilot: Generate Context Pack
 
 MemoPilot: Review Current File
-
-MemoPilot: Generate Patch
-
-MemoPilot: Show Diff
-
-MemoPilot: Apply Approved Patch
-
-MemoPilot: Run Validation
 
 MemoPilot: Show Cost Report
 
@@ -647,45 +624,23 @@ MemoPilot: Approve AI Summary
 
 MemoPilot: Reject AI Summary
 
+MemoPilot: Approve Memory Item
+
+MemoPilot: Reject Memory Item
+
 MemoPilot: Rebuild Selected Memory
 
 MemoPilot: Search Memory
 
-MemoPilot: Create Context Template
+MemoPilot: Index Pending Changes
 
-MemoPilot: Edit Context Template
-
-MemoPilot: Apply Context Template
-
-MemoPilot: Preview Context Template
-
-MemoPilot: Replay AI Call
-
-MemoPilot: Open Context Pack Used
-
-MemoPilot: Open AI Response
-
-MemoPilot: Open Patch Attempt
-
-MemoPilot: Re-run Validation
-
-MemoPilot: Compare Replayed Output
+MemoPilot: Select Budget Profile
 
 MemoPilot: Backup Memory
 
 MemoPilot: Restore Memory
 
-MemoPilot: Export Rules
-
-MemoPilot: Import Skills
-
 MemoPilot: Reset Memory
-
-MemoPilot: Open Investigation
-
-MemoPilot: Attach Evidence
-
-MemoPilot: Run Investigation
 
 ### 7.2 UI Sections
 
@@ -725,21 +680,9 @@ Cost Guard
 
 Current Task
 
-  \-\> mode selector (Ask | Plan | Context Pack | Patch | Test | Review | Autofix | Investigate)
+  \-\> mode selector (Ask | Plan | Context Pack | Patch | Test | Review | Autofix)
 
-  \-\> task input, analyze, generate patch, show diff
-
-Approval Gate
-
-  \-\> apply patch only after explicit approval
-
-  \-\> patch risk level, rule compliance score
-
-Evidence Board (Investigation Mode)
-
-  \-\> evidence sources, extracted findings, code matches, AI analysis,
-
-     patch plan, validation requirements
+  \-\> task input, analyze
 
 MCP Tools
 
@@ -1856,133 +1799,13 @@ Actual token counts from provider API responses are stored in `ai_calls.input_to
 
 ## 14\. Evidence-Aware Bug and User Story Investigation
 
-### 14.1 Purpose
+> **Note:** The Investigation Mode backend modules (`investigation_runner.py`, `evidence_classifier.py`, investigation API endpoints) exist and are implemented in the Python backend. However, the extension has **no registered commands or UI** for this feature. The `MemoPilot: Attach Evidence`, `MemoPilot: Run Investigation`, and `MemoPilot: Open Investigation` commands are not registered. The Evidence Board sidebar view was removed from the extension. Investigation mode is backend infrastructure only — it is not accessible from the VS Code extension UI in the current implementation.
 
-Use non-code artifacts as controlled evidence sources to improve root-cause analysis, user story understanding, implementation planning, and test generation. This replaces the common pattern of manually copying content from work items, logs, and documents into AI chat windows with a governed, trust-aware workflow.
-
-### 14.2 Supported Evidence Sources
-
-| Source Type | Examples |
-| :---- | :---- |
-| Work items | Azure DevOps, GitHub Issues |
-| Screenshots | UI bugs, error dialogs |
-| PDFs | Specs, architecture docs, requirements |
-| Spreadsheets | Excel, CSV test cases, data dictionaries |
-| Markdown docs | README, CONTRIBUTING, ADRs |
-| Text logs | Application logs, server logs |
-| Stack traces | Python tracebacks, .NET exceptions |
-| API payloads | JSON/XML request/response samples |
-| Database schemas | DDL files, schema exports |
-| Existing code | Relevant source files |
-| Existing tests | Test files related to the issue |
-| Current git diff | Pending uncommitted changes |
-
-### 14.3 Evidence Board UI
-
-The Evidence Board is a dedicated panel for investigation tasks. It is activated when the developer selects **Investigate** mode.
-
-Bug/User Story
-
-  \-\> work item ID, title, description, acceptance criteria
-
-Evidence Files
-
-  \-\> attached files with source type, trust level, extraction status
-
-Extracted Findings
-
-  \-\> structured findings extracted from evidence sources, with source attribution
-
-Code Matches
-
-  \-\> files, symbols, and test files matched to evidence findings
-
-AI Analysis
-
-  \-\> AI-generated root-cause analysis based on context pack and evidence
-
-Patch Plan
-
-  \-\> proposed implementation steps before patch generation
-
-Validation Requirements
-
-  \-\> test coverage targets derived from acceptance criteria and evidence
-
-### 14.4 Investigation Workflow
-
-1\. Developer selects Investigate mode.
-
-2\. Developer enters bug or user story description.
-
-3\. Developer attaches evidence files (logs, screenshots, PDFs, etc.)
-
-   or enters a work item ID for MCP fetch.
-
-4\. MemoPilot classifies each evidence source and assigns a trust level.
-
-5\. MemoPilot extracts structured findings from each source.
-
-6\. MemoPilot searches memory and codebase for matches.
-
-7\. MemoPilot builds an Investigation Context Pack.
-
-8\. Developer reviews the context pack and approves AI call.
-
-9\. AI generates root-cause analysis and patch plan.
-
-10\. Developer approves transition to Patch Mode.
-
-11\. MemoPilot generates patch, shows diff, requires approval.
-
-12\. MemoPilot runs validation, updates memory.
-
-### 14.5 Investigation Context Pack Structure
-
-\# Investigation: \<Bug or User Story Title\>
-
-\#\# Source Work Item
-
-\<title, description, acceptance criteria — if fetched via MCP\>
-
-\#\# Evidence Sources
-
-\<list of attached evidence with trust level and source type\>
-
-\#\# Extracted Findings
-
-\<structured findings from each evidence source\>
-
-\#\# Impacted Code Areas
-
-\<matched files, symbols, and modules\>
-
-\#\# Related Tests
-
-\<existing test files covering impacted areas\>
-
-\#\# Missing Test Coverage
-
-\<acceptance criteria not covered by existing tests\>
-
-\#\# Active Rules
-
-\<rules relevant to the impacted area\>
-
-\#\# Constraints
-
-\<do not modify unrelated modules, do not auto-apply\>
-
-\#\# Expected Output
-
-\<root-cause analysis, implementation plan, test plan\>
-
-### 14.6 Evidence Safety Rules
+### 14.1 Evidence Safety Rules (backend enforcement when called via API)
 
 - All evidence sources are classified before entering the context pack.  
 - Trust level is assigned per source type and explicitly shown.  
 - Secrets are redacted from all evidence content before AI call.  
-- Developer must approve the context pack before cloud AI call.  
 - OCR and image interpretation results default to trust level 5 until user-approved.  
 - Findings are never auto-promoted to rules. Promotion requires explicit developer approval via Memory Manager.  
 - Evidence sources from external work items (ADO, GitHub) are marked as trust level 3 at best without code verification.
@@ -2220,12 +2043,14 @@ Each agent mode defines what MemoPilot is allowed to do in a given interaction.
 
 ### 17.3 Budget Profiles
 
+Budget profiles affect the **cost multiplier math** used for cost estimation, savings framing, and graduated budget enforcement. They do NOT restrict which providers or models can be used — the user sets the LLM mode explicitly. The `check_budget_gate()`, `normalize_selected_tier()`, `BudgetGateResult`, `check_provider_budget()`, and `_is_frontier_model()` functions have been removed from `cost_guard.py`.
+
 | Profile | Behavior |
 | :---- | :---- |
-| Strict Local Mode | No cloud calls; local model only; context-pack-only fallback |
-| Cost Saver Mode | Local first; cheap cloud allowed; frontier blocked unless manually approved |
-| Balanced Mode | Local/cheap cloud default; frontier allowed for high-risk tasks |
-| Max Accuracy Mode | Frontier allowed for complex tasks; still uses context pruning and approval |
+| Strict Local Mode | Cost multiplier assumes local-only; savings calculated against local baseline |
+| Cost Saver Mode | Cost multiplier favors cheap cloud; graduated budget enforcement active |
+| Balanced Mode | Cost multiplier uses cheap cloud/local blend as baseline |
+| Max Accuracy Mode | Cost multiplier uses frontier baseline; still uses context pruning |
 | Enterprise Privacy Mode | No cloud AI; no MCP unless approved; no external document retrieval |
 
 Budget profiles are stored in workspace profile and cost guard settings:
@@ -2251,6 +2076,8 @@ cloud\_requires\_context\_preview: true
 ---
 
 ## 18\. Patch Generation and Validation
+
+> **Note:** The patch generation, diff preview, approval gate, and validation runner modules exist in the Python backend (`patcher.py`, `validator.py`, `validation_runner.py`, `approval_gate.py`) and are wired through `TaskFlowController` in the extension. However, there are **no standalone registered extension commands** for `Generate Patch`, `Show Diff`, `Apply Approved Patch`, or `Run Validation`. These pipeline stages execute internally when the task flow advances through the controller state machine.
 
 ### 18.1 Patch Generation Flow
 
@@ -2690,8 +2517,7 @@ Tests verify:
 - Status bar reflects backend state (connected / unavailable)  
 - Version mismatch from `/v1/health` blocks further requests  
 - Patch approval UI sends `approved=1` only on explicit click  
-- MCP Tools panel shows correct server status  
-- Evidence Board activates in Investigate mode
+- MCP Tools panel shows correct server status
 
 **Mock backend:** A lightweight Express server serves fixture responses in tests. Real Python backend is never started in extension tests.
 
@@ -3006,27 +2832,24 @@ Pass: `all-MiniLM-L6-v2` embeds a 500-line Python file in \< 2 seconds on a mid-
 
 ---
 
-### Phase 15: Evidence-Aware Bug and User Story Investigation
+### Phase 15: Evidence-Aware Bug and User Story Investigation (Backend Only)
 
-**Objectives:** Implement Investigation Mode, Evidence Board, and Investigation Context Pack.
+**Objectives:** Implement Investigation Mode backend modules and Investigation Context Pack. Note: the Evidence Board sidebar view and investigation-related extension commands (`Attach Evidence`, `Run Investigation`) were not shipped in the extension. Investigation capability exists as backend API infrastructure only.
 
 **Tasks:**
 
-- Add Investigate agent mode.  
-- Implement Evidence Board UI panel.  
+- Add Investigate agent mode (backend classifier support).  
 - Implement evidence source classification and trust level assignment.  
 - Implement text extraction for Markdown, text, and CSV (v1 sources).  
 - Implement secret redaction for evidence content.  
 - Implement Investigation Context Pack template.  
 - Implement impacted file discovery from evidence findings.  
 - Implement missing test coverage detection from acceptance criteria.  
-- Add `MemoPilot: Attach Evidence` and `MemoPilot: Run Investigation` commands.  
 - Add `evidence_sources` migration.
 
 **Acceptance criteria:**
 
-- Evidence files can be attached and classified.  
-- Extracted findings appear in Evidence Board with trust levels.  
+- Evidence sources can be classified and trust levels assigned (via API).  
 - Investigation Context Pack includes all evidence sections.  
 - OCR and image content defaults to trust level 5\.  
 - Findings are never auto-promoted to rules.  
@@ -3115,11 +2938,11 @@ Pass: `all-MiniLM-L6-v2` embeds a 500-line Python file in \< 2 seconds on a mid-
 
 \- Context pack templates
 
-\- Agent modes (Ask, Plan, Context Pack, Patch, Test, Review, Autofix, Investigate)
+\- Agent modes (Ask, Plan, Context Pack, Patch, Test, Review, Autofix) — patch/validation pipeline wired through TaskFlowController
 
-\- Patch risk classifier
+\- Patch risk classifier (backend)
 
-\- Rule compliance score
+\- Rule compliance score (backend)
 
 \- Privacy Boundary Dashboard
 
@@ -3129,11 +2952,7 @@ Pass: `all-MiniLM-L6-v2` embeds a 500-line Python file in \< 2 seconds on a mid-
 
 \- Human-in-the-loop memory updates
 
-\- Bug/User Story Investigation Mode
-
-\- Evidence Board
-
-\- Investigation Context Pack
+\- Bug/User Story Investigation Mode (backend only — no extension UI commands)
 
 ### v1.5
 
@@ -3222,7 +3041,7 @@ Before MemoPilot sends a single token to AI, it has already:
 
 In default retrieval-first mode, MemoPilot returns bounded context and memory insights to the editor surface.
 
-When legacy task-flow mode is enabled, MemoPilot can additionally:
+When the task flow pipeline is used (via TaskFlowController), MemoPilot can additionally:
 
 1. Classifies the patch risk from deterministic signals.  
 2. Computes a rule compliance score.  
@@ -3307,14 +3126,14 @@ packages/extension/src/
 | Validation Results | PatchPreviewPanel (inline) | Webview ✅ |
 | Memory / Task History | TaskHistoryTreeProvider | Tree ✅ |
 | Cost Dashboard | CostDashboardPanel | Webview ✅ |
-| Evidence Board | EvidenceBoardTreeProvider | Tree ✅ |
+| Evidence Board | Not implemented — removed from extension | — |
 | Privacy Boundary Dashboard | PrivacyDashboardTreeProvider | Tree ✅ |
 | Provider Capability Matrix | ProviderMatrixPanel | Webview ✅ |
 | Memory Manager | MemoryManagerTreeProvider | Tree ✅ |
 | Workspace Profile | WorkspaceProfileTreeProvider | Tree ✅ |
 | MCP / External Context | McpToolsTreeProvider | Tree ✅ |
 
-**All 17 target views have live UI implementations.** End-to-end New Task → generated patch linkage is still pending.
+**Note:** The Evidence Board view was removed from the extension. The current extension has 9 active sidebar views: Status, Workspace Profile, Memory Manager, Rules & Skills, Context Pack, Usage Stats, Privacy Dashboard, Task History, MCP Tools. All other views listed above exist as panel implementations but the Evidence Board sidebar is not registered.
 
 ### TaskFlowController State Machine
 
@@ -3621,18 +3440,18 @@ MemoPilot v2.4 adds **Tool Mode**: MemoPilot can now act as a callable tool surf
 
 ### Tool Surface
 
+There are exactly **4 registered MCP/LM tools**:
+
 | Tool | Purpose |
 |---|---|
-| `memopilot-context` | Build a governed context pack for a task description |
-| `memopilot-recall` | Search local project memory by query |
-| `memopilot-rules` | Retrieve active rules applicable to a file or task |
-| `memopilot-workspace-profile` | Return the workspace technology profile, commands, and memory health |
-| `memopilot-memory-search` | Deep memory search with semantic + keyword matching |
-| `memopilot-review-applied-patch` | Submit a diff for post-hoc review and writeback proposals |
+| `memopilot-search` | Search project context (files, symbols, memory) |
+| `memopilot-symbols` | Look up symbols by name or path |
+| `memopilot-memory` | Retrieve local project memory items |
+| `memopilot-profile` | Return the workspace technology profile and memory health |
 
 ### LM Tools API Integration
 
-Tool Mode registers six callable tools through the **VS Code Language Model Tools API** using `src/tools/LanguageModelToolsRegistrar.ts`. Registration is feature-gated for VS Code 1.99+ so older editor versions silently skip tool registration rather than breaking extension startup. Each tool call is forwarded to the local MemoPilot backend and requests bounded Markdown output for direct model consumption.
+Tool Mode registers four callable tools through the **VS Code Language Model Tools API** using `src/tools/LanguageModelToolsRegistrar.ts`. Registration is feature-gated for VS Code 1.99+ so older editor versions silently skip tool registration rather than breaking extension startup. Each tool call is forwarded to the local MemoPilot backend and requests bounded Markdown output for direct model consumption.
 
 ### MCP Server Architecture
 

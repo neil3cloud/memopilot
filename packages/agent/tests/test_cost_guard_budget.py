@@ -3,33 +3,13 @@ from __future__ import annotations
 import pytest
 from httpx import AsyncClient
 
-from agent.cost_guard import BudgetStatus, CostGuardService, calculate_savings, check_budget_gate
+from agent.cost_guard import CostGuardService, calculate_savings
 from agent.migration_runner import run_migrations
 
 
 async def _run_db_migrations(test_db) -> None:
     conn = await test_db.connect()
     await run_migrations(conn)
-
-
-def _make_budget_status(pct_used: float, monthly_budget: float = 20.0) -> BudgetStatus:
-    spent = round(monthly_budget * pct_used, 4)
-    remaining = max(monthly_budget - spent, 0.0)
-    return BudgetStatus(
-        monthly_budget_usd=monthly_budget,
-        spent_usd=spent,
-        saved_usd=0.0,
-        remaining_usd=remaining,
-        warning_threshold_usd=round(monthly_budget * 0.8, 4),
-        warning_triggered=pct_used >= 0.8,
-        blocked=pct_used >= 1.0,
-        spend_ratio=round(pct_used, 4),
-        pct_used=round(pct_used, 4),
-        at_limit=pct_used >= 1.0,
-        warning_threshold=0.80,
-        at_warning=pct_used >= 0.8,
-        last_updated_at=None,
-    )
 
 
 async def _record_cloud_spend(client: AsyncClient, headers: dict[str, str], actual_cost: float) -> None:
@@ -135,24 +115,6 @@ async def test_per_task_cost_in_response(client: AsyncClient, test_token: str):
     assert payload["cost"]["estimated_cost_usd"] == pytest.approx(0.25)
     assert payload["cost"]["selected_tier"] == "cheap_cloud"
     assert "budget_gate" in payload
-
-
-def test_budget_enforcement_blocks_cloud_at_100():
-    result = check_budget_gate("cheap_cloud", 0.01, _make_budget_status(1.0))
-    assert result.blocked is True
-
-
-def test_frontier_approval_required_at_90_pct():
-    result = check_budget_gate("frontier", 0.10, _make_budget_status(0.92))
-    assert result.requires_approval is True
-    assert result.blocked is False
-    assert result.approval_prompt is not None
-    assert "Remaining monthly budget" in result.approval_prompt
-
-
-def test_local_model_not_blocked_at_100():
-    result = check_budget_gate("local", 1.0, _make_budget_status(1.0))
-    assert result.blocked is False
 
 
 @pytest.mark.asyncio

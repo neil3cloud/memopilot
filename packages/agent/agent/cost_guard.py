@@ -42,16 +42,6 @@ class BudgetCheck:
 
 
 @dataclass(frozen=True)
-class BudgetGateResult:
-    blocked: bool
-    reason: str
-    requires_approval: bool
-    approval_prompt: str | None
-    show_warning: bool
-    warning_message: str | None
-
-
-@dataclass(frozen=True)
 class SavingsReport:
     actual_cost: float
     hypothetical_frontier_cost: float
@@ -133,64 +123,6 @@ class CostGuardService:
             reason = "monthly_budget_warning"
         return BudgetCheck(
             allowed=allowed,
-            reason=reason,
-            estimated_cost_usd=estimated_cost_usd,
-            status=status,
-        )
-
-    async def check_provider_budget(
-        self,
-        *,
-        provider: str | None,
-        model: str | None,
-        privacy_level: str | None,
-        estimated_cost_usd: float,
-        requires_approval: bool = False,
-        approval_granted: bool = False,
-    ) -> BudgetCheck:
-        status = await self.get_budget_status()
-        estimated_cost_usd = max(estimated_cost_usd, 0.0)
-        is_local = self._is_local_provider(provider=provider, privacy_level=privacy_level)
-        profile_reason = self._profile_restriction_reason(
-            provider=provider,
-            model=model,
-            privacy_level=privacy_level,
-            requires_approval=requires_approval,
-            approval_granted=approval_granted,
-        )
-        if profile_reason is not None:
-            return BudgetCheck(
-                allowed=False,
-                reason=profile_reason,
-                estimated_cost_usd=estimated_cost_usd,
-                status=status,
-            )
-        if is_local:
-            return BudgetCheck(
-                allowed=True,
-                reason="local_provider_allowed",
-                estimated_cost_usd=estimated_cost_usd,
-                status=status,
-            )
-        if status.blocked and estimated_cost_usd > 0:
-            return BudgetCheck(
-                allowed=False,
-                reason="monthly_budget_exceeded",
-                estimated_cost_usd=estimated_cost_usd,
-                status=status,
-            )
-        if estimated_cost_usd > status.remaining_usd:
-            return BudgetCheck(
-                allowed=False,
-                reason="monthly_budget_exceeded",
-                estimated_cost_usd=estimated_cost_usd,
-                status=status,
-            )
-        reason = "cloud_provider_allowed"
-        if estimated_cost_usd > 0 and status.warning_triggered:
-            reason = "monthly_budget_warning"
-        return BudgetCheck(
-            allowed=True,
             reason=reason,
             estimated_cost_usd=estimated_cost_usd,
             status=status,
@@ -445,128 +377,6 @@ class CostGuardService:
             return loaded
         return {}
 
-    def _profile_restriction_reason(
-        self,
-        *,
-        provider: str | None,
-        model: str | None,
-        privacy_level: str | None,
-        requires_approval: bool,
-        approval_granted: bool,
-    ) -> str | None:
-        profile = self._active_budget_profile()
-        is_local = self._is_local_provider(provider=provider, privacy_level=privacy_level)
-        normalized_privacy = (privacy_level or "").strip().lower()
-        if profile == "strict_local" and not is_local:
-            return "profile_blocks_non_local_provider"
-        if profile == "enterprise_privacy" and normalized_privacy != "local":
-            return "profile_requires_local_privacy"
-        if (
-            profile == "cost_saver"
-            and not is_local
-            and self._is_frontier_model(model=model, requires_approval=requires_approval)
-            and not approval_granted
-        ):
-            return "frontier_model_requires_approval"
-        return None
-
-    def _is_local_provider(self, *, provider: str | None, privacy_level: str | None) -> bool:
-        normalized_provider = (provider or "").strip().lower()
-        normalized_privacy = (privacy_level or "").strip().lower()
-        if normalized_privacy == "local":
-            return True
-        return normalized_provider in {"ollama", "local", "llama.cpp"}
-
-    def _is_frontier_model(self, *, model: str | None, requires_approval: bool) -> bool:
-        if requires_approval:
-            return True
-        normalized = (model or "").strip().lower()
-        if not normalized:
-            return False
-        if any(local_marker in normalized for local_marker in ("llama", "mistral", "ollama")):
-            return False
-        if "mini" in normalized:
-            return False
-        return any(
-            marker in normalized
-            for marker in ("gpt-4", "gpt-5", "claude", "sonnet", "opus", "frontier")
-        )
-
-
-def check_budget_gate(
-    selected_tier: str,
-    estimated_cost: float,
-    budget_status: BudgetStatus,
-) -> BudgetGateResult:
-    tier = normalize_selected_tier(selected_tier)
-    estimated_cost = max(estimated_cost, 0.0)
-    if tier == "local":
-        return BudgetGateResult(
-            blocked=False,
-            reason="local_model_exempt",
-            requires_approval=False,
-            approval_prompt=None,
-            show_warning=False,
-            warning_message=None,
-        )
-
-    monthly_budget = max(budget_status.monthly_budget_usd, 0.0)
-    projected_pct = 1.0 if budget_status.at_limit else 0.0
-    if monthly_budget > 0:
-        projected_pct = max(
-            budget_status.pct_used,
-            (budget_status.spent_usd + estimated_cost) / monthly_budget,
-        )
-
-    if projected_pct >= 1.0 or budget_status.at_limit:
-        return BudgetGateResult(
-            blocked=True,
-            reason="monthly_budget_exceeded",
-            requires_approval=False,
-            approval_prompt=None,
-            show_warning=False,
-            warning_message=(
-                "Monthly budget exhausted for non-local models. "
-                f"Remaining budget: ${budget_status.remaining_usd:.3f}."
-            ),
-        )
-
-    if projected_pct >= BUDGET_APPROVAL_THRESHOLD and tier == "frontier":
-        return BudgetGateResult(
-            blocked=False,
-            reason="frontier_approval_required",
-            requires_approval=True,
-            approval_prompt=(
-                f"Frontier model requires approval. Remaining monthly budget: "
-                f"${budget_status.remaining_usd:.3f}. Estimated task cost: ${estimated_cost:.3f}."
-            ),
-            show_warning=False,
-            warning_message=None,
-        )
-
-    if projected_pct >= BUDGET_WARNING_THRESHOLD:
-        return BudgetGateResult(
-            blocked=False,
-            reason="budget_warning",
-            requires_approval=False,
-            approval_prompt=None,
-            show_warning=True,
-            warning_message=(
-                f"Budget warning: {projected_pct:.0%} of monthly budget used. "
-                f"Remaining budget: ${budget_status.remaining_usd:.3f}."
-            ),
-        )
-
-    return BudgetGateResult(
-        blocked=False,
-        reason="within_budget",
-        requires_approval=False,
-        approval_prompt=None,
-        show_warning=False,
-        warning_message=None,
-    )
-
-
 async def calculate_savings(
     start_date: date | datetime | str,
     end_date: date | datetime | str,
@@ -664,15 +474,6 @@ def current_month_range() -> tuple[datetime, datetime]:
     now = datetime.now(UTC)
     start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
     return start, now + timedelta(seconds=1)
-
-
-def normalize_selected_tier(selected_tier: str | None) -> str:
-    normalized = (selected_tier or "").strip().lower().replace("-", "_")
-    if normalized in {"local", "cheap_cloud", "frontier"}:
-        return normalized
-    if normalized in {"cheap", "cloud", "mini"}:
-        return "cheap_cloud"
-    return "local"
 
 
 def infer_selected_tier(

@@ -5,7 +5,7 @@ alwaysApply: true
 
 # MemoPilot Retrieval-First Rule
 
-Workspace: agents-check-git-status-command
+Workspace: memopilot-1
 Primary language: python
 Detected frameworks: none detected
 
@@ -19,6 +19,8 @@ Preferred tool order:
 
 Do not treat MemoPilot as a patch executor in default mode. Use it as the primary context source.
 <!-- MemoPilot managed block: end -->
+
+
 
 
 
