@@ -353,7 +353,7 @@
     "watch": "esbuild ./src/extension.ts --bundle --outfile=out/extension.js --external:vscode --format=cjs --platform=node --sourcemap --watch",
     "lint": "eslint src --ext ts",
     "test": "pnpm run build && tsc -p . && node ./out/test/runTests.js",
-    "prebundle-agent": "node -e \"const fs=require('fs');fs.rmSync('agent',{recursive:true,force:true});fs.cpSync('../agent/agent','agent',{recursive:true})\"",
+    "prebundle-agent": "node -e \"const fs=require('fs');fs.rmSync('agent',{recursive:true,force:true});fs.cpSync('../agent/agent','agent',{recursive:true});fs.copyFileSync('../agent/requirements.txt','requirements.txt')\"",
     "package": "pnpm run build && pnpm run prebundle-agent && vsce package --no-dependencies"
   },
   "devDependencies": {

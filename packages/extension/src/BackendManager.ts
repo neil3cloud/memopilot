@@ -79,7 +79,7 @@ export class BackendManager {
         this.outputChannel.appendLine(`[MemoPilot] Agent parent (cwd): ${agentParent}`);
         this.outputChannel.appendLine(`[MemoPilot] Workspace: ${this.workspacePath}`);
 
-        await this.ensureBackendDependencies(pythonPath);
+        await this.ensureBackendDependencies(pythonPath, agentDir);
 
         this.stderrBuffer = '';
         this.stdoutBuffer = '';
@@ -222,27 +222,19 @@ export class BackendManager {
         return isWindows ? 'python' : 'python3';
     }
 
-    private async ensureBackendDependencies(pythonPath: string): Promise<void> {
-        const requiredModules: Array<{ module: string; packageName: string }> = [
-            { module: 'fastapi', packageName: 'fastapi>=0.109.0' },
-            { module: 'uvicorn', packageName: 'uvicorn[standard]>=0.27.0' },
-            { module: 'pydantic', packageName: 'pydantic>=2.5.0' },
-            { module: 'aiosqlite', packageName: 'aiosqlite>=0.19.0' },
-            { module: 'detect_secrets', packageName: 'detect-secrets>=1.5.0' },
-            { module: 'openpyxl', packageName: 'openpyxl>=3.1.5' },
-            { module: 'pdfplumber', packageName: 'pdfplumber>=0.11.4' },
-            { module: 'yaml', packageName: 'pyyaml>=6.0' },
-            { module: 'PIL', packageName: 'pillow>=11.0.0' },
-            { module: 'docx', packageName: 'python-docx>=1.1.2' },
-            { module: 'pptx', packageName: 'python-pptx>=1.0.2' },
-            { module: 'tree_sitter', packageName: 'tree-sitter>=0.23.0' },
-            { module: 'tree_sitter_typescript', packageName: 'tree-sitter-typescript>=0.23.0' },
-            { module: 'tree_sitter_c_sharp', packageName: 'tree-sitter-c-sharp>=0.23.0' },
+    private async ensureBackendDependencies(pythonPath: string, agentDir: string): Promise<void> {
+        // All modules the agent imports at startup — single source of truth is requirements.txt.
+        // This list is only for the "anything missing?" probe; the actual install uses the file.
+        const requiredModules = [
+            'fastapi', 'uvicorn', 'pydantic', 'aiosqlite', 'httpx',
+            'detect_secrets', 'PIL', 'openpyxl', 'pdfplumber', 'yaml',
+            'docx', 'pptx', 'pytesseract', 'sqlite_vec', 'jedi',
+            'tree_sitter', 'tree_sitter_typescript', 'tree_sitter_c_sharp',
         ];
 
         const moduleScript = [
             'import importlib.util, json',
-            `required = ${JSON.stringify(requiredModules.map((item) => item.module))}`,
+            `required = ${JSON.stringify(requiredModules)}`,
             'missing = [name for name in required if importlib.util.find_spec(name) is None]',
             'print(json.dumps(missing))',
         ].join(';');
@@ -256,26 +248,35 @@ export class BackendManager {
             return;
         }
 
-        const packagesToInstall = requiredModules
-            .filter((item) => missingModules.includes(item.module))
-            .map((item) => item.packageName);
-        if (packagesToInstall.length === 0) {
-            return;
-        }
+        this.outputChannel.appendLine(`[MemoPilot] Missing modules: ${missingModules.join(', ')}`);
 
-        this.outputChannel.appendLine(
-            `[MemoPilot] Installing backend dependencies: ${packagesToInstall.join(', ')}`
-        );
-        await this.ensurePipAvailable(pythonPath);
-        const install = await this.runPythonCommand(
-            pythonPath,
-            ['-m', 'pip', 'install', '--disable-pip-version-check', ...packagesToInstall],
-        );
-        if (install.exitCode !== 0) {
+        // requirements.txt is bundled at the parent of the agent dir.
+        const requirementsPath = path.resolve(agentDir, '..', 'requirements.txt');
+        if (!fs.existsSync(requirementsPath)) {
             throw new Error(
-                `Failed to install backend dependencies: ${install.stderr || install.stdout}`
+                `requirements.txt not found at ${requirementsPath}. ` +
+                `Please reinstall the MemoPilot extension.`
             );
         }
+
+        this.outputChannel.appendLine(`[MemoPilot] Installing backend dependencies (this runs once)...`);
+        await vscode.window.withProgress(
+            { location: vscode.ProgressLocation.Notification, title: 'MemoPilot: Installing backend dependencies (first-time setup)...' },
+            async () => {
+                await this.ensurePipAvailable(pythonPath);
+                const install = await this.runPythonCommand(pythonPath, [
+                    '-m', 'pip', 'install',
+                    '--disable-pip-version-check', '--quiet',
+                    '-r', requirementsPath,
+                ]);
+                if (install.exitCode !== 0) {
+                    throw new Error(
+                        `Failed to install backend dependencies:\n${install.stderr || install.stdout}`
+                    );
+                }
+            }
+        );
+        this.outputChannel.appendLine('[MemoPilot] Backend dependencies installed successfully.');
     }
 
     private async ensurePipAvailable(pythonPath: string): Promise<void> {
