@@ -97,7 +97,7 @@ async def test_memory_backup_and_restore(client: AsyncClient, test_token: str, t
 
 
 @pytest.mark.asyncio
-async def test_optimizer_budget_profiles_and_classifier(
+async def test_optimizer_tool_classifier(
     client: AsyncClient,
     test_token: str,
 ):
@@ -110,7 +110,6 @@ async def test_optimizer_budget_profiles_and_classifier(
         json={
             "task_text": "Refactor parser tests for AB#1234 and update docs",
             "task_type": "bounded_refactor",
-            "budget_profile": "balanced",
             "available_tools": ["fts_search", "rule_resolver", "pytest", "ruff", "ado_mcp"],
         },
     )

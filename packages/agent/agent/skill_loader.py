@@ -228,14 +228,12 @@ class SkillLoaderService:
         task_text: str,
         available_tools: list[str],
         task_type: str | None = None,
-        budget_profile: str = "balanced",
     ) -> OptimizerResult:
         task_lower = task_text.lower()
         selection = select_tools(
             task_type or "",
             available_tools,
             task_text=task_text,
-            budget_profile=budget_profile,
         )
         suggested_tools = list(selection.selected_tools)
         excluded_tools = list(selection.excluded_tools)
@@ -298,7 +296,6 @@ class SkillLoaderService:
                         "included": reasons_map,
                         "excluded_tools": excluded_tools,
                         "task_type": task_type,
-                        "budget_profile": budget_profile,
                     }
                 ),
             ),

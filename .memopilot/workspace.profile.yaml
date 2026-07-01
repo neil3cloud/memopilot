@@ -1,5 +1,5 @@
 workspace:
-  name: agents-check-git-status-command
+  name: memopilot-1
   primary_language: python
   frameworks: []
   test_commands:  # user-edited
@@ -8,7 +8,9 @@ workspace:
   - ruff check
   typecheck_commands:  # user-edited
   - mypy .
-  active_rules: []
+  active_rules:
+  - .github\copilot-instructions.md
+  - .cursor\rules
   active_skills: []
   model_policy:  # user-edited
     budget_profile: cost_saver

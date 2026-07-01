@@ -34,12 +34,13 @@ _ENV_MAP = {
 _TEMPLATE = """\
 # .memopilot/config.yaml — GITIGNORED — do not commit API keys
 
-provider: local          # local | anthropic | openai | host
+# provider: local        # Uncomment and set to use a local model server instead of GitHub Copilot
+#                        # Options: local | anthropic | openai
 budget_profile: cost_saver   # cost_saver | balanced | strict_local | max_accuracy
 
 # Local AI — any OpenAI-compatible server (Ollama, LM Studio, vLLM, OpenVINO, llama.cpp, etc.)
-local_url: http://localhost:1234
-local_model: qwen2.5-coder-7b-instruct
+# local_url: http://localhost:1234
+# local_model: qwen2.5-coder-7b-instruct
 
 # Cloud API keys (uncomment to enable)
 # anthropic_api_key: sk-ant-...
