@@ -24,6 +24,7 @@ import uuid
 from datetime import UTC, datetime
 from pathlib import Path
 
+import aiosqlite
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
@@ -51,6 +52,7 @@ from .endpoint_registry import ENDPOINT_STATUS
 from .git_history_indexer import GitHistoryIndexer
 from .graph_retriever import GraphRetriever
 from .image_analysis import ImageAnalysisResult, analyze_image
+from .keyword_extraction import extract_search_keywords
 from .llm_client import BaseLLMClient, build_client
 from .local_model_discovery import discover_all_local
 from .mcp_orchestrator import MCPDispatcher, MCPOrchestrator, ToolCall
@@ -67,6 +69,8 @@ from .response_cache import ResponseCacheService
 from .retention import enforce_retention
 from .security_policy import CredentialRedactor, DatabaseWriteBlocker
 from .skill_loader import SkillLoaderService
+from .symbol_ranker import rank_symbols_for_task
+from .symbol_source import build_skeleton_line, read_symbol_source
 from .vector_backfill_service import VectorBackfillService
 from .context_synthesizer import ContextSynthesizer, build_synthesis_user_prompt
 from .symbol_summarizer import SymbolSummarizer
@@ -2035,52 +2039,6 @@ def _estimate_context_tokens(text: str) -> int:
     return max(1, (len(text) + 3) // 4)
 
 
-_INDEX_KEYWORD_STOPWORDS = {
-    "also",
-    "about",
-    "across",
-    "after",
-    "agent",
-    "before",
-    "build",
-    "change",
-    "code",
-    "from",
-    "have",
-    "into",
-    "just",
-    "mode",
-    "project",
-    "that",
-    "their",
-    "them",
-    "there",
-    "these",
-    "they",
-    "this",
-    "those",
-    "task",
-    "want",
-    "with",
-}
-
-
-def _extract_search_keywords(text: str) -> list[str]:
-    tokens = re.findall(r"[A-Za-z_][A-Za-z0-9_]+", text.lower())
-    keywords: list[str] = []
-    seen: set[str] = set()
-    for token in tokens:
-        if len(token) < 4 or token in _INDEX_KEYWORD_STOPWORDS:
-            continue
-        if token in seen:
-            continue
-        seen.add(token)
-        keywords.append(token)
-        if len(keywords) >= 20:
-            break
-    return keywords
-
-
 async def _suggest_files_from_index(
     *,
     db: DatabaseManager,
@@ -2328,26 +2286,300 @@ def _read_context_file_item(workspace_root: str, file_path: str) -> ContextItem:
     )
 
 
+_SYMBOLS_PER_FILE_LIMIT = 5
+
+
+async def _build_symbol_level_context_items(
+    *,
+    db: DatabaseManager,
+    workspace_root: str,
+    files_to_include: list[str],
+    task_description: str,
+) -> list[ContextItem]:
+    """Build context items at symbol granularity instead of whole-file dumps.
+
+    For each requested file: the top-ranked symbols (by relevance to the
+    task) are included as full source (Tier 1); every other symbol in that
+    file is represented as a one-line signature+summary skeleton entry
+    (Tier 2), batched into a single ContextItem per file so nothing is
+    silently dropped, just not expanded. Files with zero indexed symbols
+    (config files, unparseable files, unsupported languages) fall back to
+    the original whole-file read unchanged.
+
+    Ordering matters: build_budget_aware_context_pack() does not sort —
+    it consumes items in the order given and cuts off once a tier's budget
+    is exhausted. This function returns: Tier 1 symbols sorted by
+    relevance descending, then Tier 2 skeleton blocks sorted by their
+    file's best Tier-1 score descending, then whole-file fallbacks for
+    files with no indexed symbols.
+    """
+    conn = await db.connect()
+    placeholders = ",".join("?" for _ in files_to_include)
+    cursor = await conn.execute(
+        f"""
+        SELECT id, file_path, name, kind, start_line, end_line, signature, summary
+        FROM symbols
+        WHERE file_path IN ({placeholders})
+        ORDER BY file_path, start_line
+        """,
+        files_to_include,
+    )
+    rows = await cursor.fetchall()
+
+    symbols_by_file: dict[str, list[aiosqlite.Row]] = {}
+    for row in rows:
+        symbols_by_file.setdefault(row["file_path"], []).append(row)
+
+    fallback_items: list[ContextItem] = []
+    files_with_symbols = [f for f in files_to_include if f in symbols_by_file]
+    files_without_symbols = [f for f in files_to_include if f not in symbols_by_file]
+    for file_path in files_without_symbols:
+        fallback_items.append(_read_context_file_item(workspace_root, file_path))
+
+    if not files_with_symbols:
+        return fallback_items
+
+    ranked = await rank_symbols_for_task(
+        db=db,
+        task_description=task_description,
+        file_paths=files_with_symbols,
+        limit=_SYMBOLS_PER_FILE_LIMIT * len(files_with_symbols),
+    )
+    # Normalize bm25-derived scores into a safe positive range so they never
+    # accidentally fall under build_budget_aware_context_pack's default
+    # min_relevance_score filter (0.15) regardless of raw match strength.
+    max_score = max((r.score for r in ranked), default=0.0)
+    normalized_score: dict[str, float] = {}
+    for r in ranked:
+        normalized_score[r.id] = 0.3 + 0.7 * (r.score / max_score) if max_score > 0 else 0.5
+
+    tier1_ids_by_file: dict[str, list[str]] = {}
+    for r in ranked:
+        bucket = tier1_ids_by_file.setdefault(r.file_path, [])
+        if len(bucket) < _SYMBOLS_PER_FILE_LIMIT:
+            bucket.append(r.id)
+
+    tier1_items: list[ContextItem] = []
+    tier2_blocks: list[tuple[float, ContextItem]] = []
+    for file_path in files_with_symbols:
+        file_symbols = symbols_by_file[file_path]
+        tier1_ids = set(tier1_ids_by_file.get(file_path, []))
+        best_score_for_file = 0.0
+
+        for row in file_symbols:
+            if row["id"] not in tier1_ids:
+                continue
+            score = normalized_score.get(row["id"], 0.5)
+            best_score_for_file = max(best_score_for_file, score)
+            source = await read_symbol_source(
+                workspace_root=Path(workspace_root),
+                file_path=file_path,
+                start_line=row["start_line"],
+                end_line=row["end_line"],
+            )
+            tier1_items.append(
+                ContextItem(
+                    content=source,
+                    # Symbol names aren't always unique within a file — C#
+                    # method names are stored bare (no "ClassName." qualifier
+                    # like Python/TS), so two different methods named e.g.
+                    # "CreateAsync" on different classes in the same file
+                    # would otherwise collide on this key. The id suffix
+                    # keeps every entry uniquely addressable regardless of
+                    # whether the caller path dedupes (some don't — see
+                    # assemble_context's early-return branch).
+                    source=f"{file_path}::{row['name']}#{row['id'][:8]}",
+                    source_type="symbol",
+                    tokens=_estimate_context_tokens(source),
+                    relevance_score=score,
+                    inclusion_reason="",
+                    retrieval_method="symbol_rank",
+                    trust_level=5,
+                    tier="current_file",
+                    reference_id=row["id"],
+                )
+            )
+
+        skeleton_lines = [
+            build_skeleton_line(
+                name=row["name"],
+                kind=row["kind"],
+                signature=row["signature"],
+                summary=row["summary"],
+            )
+            for row in file_symbols
+            if row["id"] not in tier1_ids
+        ]
+        if skeleton_lines:
+            skeleton_content = "\n".join(skeleton_lines)
+            tier2_blocks.append(
+                (
+                    best_score_for_file,
+                    ContextItem(
+                        content=skeleton_content,
+                        source=f"{file_path}::__skeleton__",
+                        source_type="symbol_skeleton",
+                        tokens=_estimate_context_tokens(skeleton_content),
+                        relevance_score=max(0.15, best_score_for_file * 0.5),
+                        inclusion_reason="",
+                        retrieval_method="symbol_rank",
+                        trust_level=5,
+                        tier="current_file",
+                    ),
+                )
+            )
+
+    tier1_items.sort(key=lambda item: -item.relevance_score)
+    tier2_blocks.sort(key=lambda pair: -pair[0])
+
+    tier3_items = await _build_cross_file_callee_items(
+        db=db,
+        workspace_root=workspace_root,
+        tier1_items=tier1_items,
+        files_already_included=set(files_to_include),
+    )
+
+    return tier1_items + [item for _, item in tier2_blocks] + fallback_items + tier3_items
+
+
+_TIER3_FULL_SOURCE_LINE_LIMIT = 20
+
+
+async def _build_cross_file_callee_items(
+    *,
+    db: DatabaseManager,
+    workspace_root: str,
+    tier1_items: list[ContextItem],
+    files_already_included: set[str],
+) -> list[ContextItem]:
+    """Tier 3: pull in callees of Tier-1 symbols that live in files the
+    caller never requested, so a call the model needs to understand doesn't
+    silently vanish just because it happens to live in a different file.
+
+    Small callees (<= _TIER3_FULL_SOURCE_LINE_LIMIT lines) are included as
+    full source; larger ones as a single skeleton line — never dropped
+    outright. Callees whose file is already covered by Tier 1/2 are skipped
+    as redundant. Deliberately not sorted into the Tier 1/2 relevance
+    ordering — these are lower-confidence than a directly-ranked match, so
+    they're appended last and compete for whatever budget remains.
+    """
+    tier1_symbol_ids = [item.reference_id for item in tier1_items if item.reference_id]
+    if not tier1_symbol_ids:
+        return []
+
+    graph = GraphRetriever(db=db)
+    callees_by_caller = await graph.get_callees_batch(tier1_symbol_ids)
+
+    seen_callee_ids: set[str] = set()
+    tier3_items: list[ContextItem] = []
+    for callees in callees_by_caller.values():
+        for callee in callees:
+            if callee.file_path in files_already_included:
+                continue
+            if callee.id in seen_callee_ids:
+                continue
+            seen_callee_ids.add(callee.id)
+
+            is_small = (
+                callee.start_line is not None
+                and callee.end_line is not None
+                and (callee.end_line - callee.start_line) <= _TIER3_FULL_SOURCE_LINE_LIMIT
+            )
+            if is_small:
+                content = await read_symbol_source(
+                    workspace_root=Path(workspace_root),
+                    file_path=callee.file_path,
+                    start_line=callee.start_line,
+                    end_line=callee.end_line,
+                )
+            else:
+                content = build_skeleton_line(
+                    name=callee.name,
+                    kind=callee.kind,
+                    signature=callee.signature,
+                    summary=callee.summary,
+                )
+
+            tier3_items.append(
+                ContextItem(
+                    content=content,
+                    # Same id-suffix rationale as Tier 1 above — callee.name
+                    # isn't guaranteed unique within a file either.
+                    source=f"{callee.file_path}::{callee.name}#{callee.id[:8]}",
+                    source_type="symbol" if is_small else "symbol_skeleton",
+                    tokens=_estimate_context_tokens(content),
+                    relevance_score=0.25,
+                    inclusion_reason="Cross-file call from an included symbol.",
+                    retrieval_method="cross_file_call",
+                    trust_level=5,
+                    tier="current_file",
+                    reference_id=callee.id,
+                )
+            )
+    return tier3_items
+
+
+async def _suggest_files_by_symbol_content(
+    *, db: DatabaseManager, task_description: str, limit: int
+) -> list[str]:
+    """Find candidate files by ranking symbol name/signature/summary content
+    workspace-wide, rather than matching keywords against file paths.
+
+    _suggest_files_from_index only matches the task text against file PATHS
+    — a class like "ReservationService" living inside a generically-named
+    "Services.cs" (alongside several unrelated services) is invisible to
+    that search no matter how relevant its content is. This complements it
+    by finding files through what's actually defined in them.
+    """
+    ranked = await rank_symbols_for_task(
+        db=db, task_description=task_description, file_paths=None, limit=limit * 3
+    )
+    seen: list[str] = []
+    for r in ranked:
+        if r.file_path not in seen:
+            seen.append(r.file_path)
+        if len(seen) >= limit:
+            break
+    logger.info("_suggest_files_by_symbol_content: %d ranked → %d files", len(ranked), len(seen))
+    if seen:
+        logger.info("_suggest_files_by_symbol_content: top files = %s", seen[:5])
+    return seen
+
+
 async def _generate_context_pack_response(request: ContextBuildRequest) -> ContextBuildResponse:
     """Build a context pack for preview with token estimates."""
     config = _get_config()
     db = _get_db()
     files_to_include = request.file_overrides if request.file_overrides else request.suggested_files
     if not files_to_include:
-        fallback_keywords = _extract_search_keywords(request.task_description)
-        files_to_include = await _suggest_files_from_index(
+        fallback_keywords = extract_search_keywords(request.task_description)
+        symbol_matched_files = await _suggest_files_by_symbol_content(
+            db=db, task_description=request.task_description, limit=20
+        )
+        filename_matched_files = await _suggest_files_from_index(
             db=db,
             keywords=fallback_keywords,
             limit=20,
         )
+        files_to_include = symbol_matched_files + [
+            f for f in filename_matched_files if f not in symbol_matched_files
+        ]
+        logger.info(
+            "file_discovery: %d from symbols, %d from filenames, %d total",
+            len(symbol_matched_files), len(filename_matched_files), len(files_to_include),
+        )
+    else:
+        logger.info("file_discovery: skipped, %d files already provided", len(files_to_include))
 
     workspace_service = WorkspaceRootsService(config=config, db=db)
     workspace_root = str(await workspace_service.resolve_workspace_root(request.workspace_root))
 
-    file_items = [
-        _read_context_file_item(workspace_root, file_path)
-        for file_path in files_to_include[:20]
-    ]
+    file_items = await _build_symbol_level_context_items(
+        db=db,
+        workspace_root=workspace_root,
+        files_to_include=files_to_include[:20],
+        task_description=request.task_description,
+    )
 
     rules: list[str] = []
     try:
@@ -2485,9 +2717,13 @@ async def _generate_context_pack_response(request: ContextBuildRequest) -> Conte
     )
 
     file_entries = [
-        ContextFileEntry(path=item.source, tokens=item.tokens, content=item.content)
+        ContextFileEntry(
+            path=re.sub(r"#[0-9a-f]{6,}$", "", item.source),
+            tokens=item.tokens,
+            content=item.content,
+        )
         for item in included_items
-        if item.source_type == "file"
+        if item.source_type in ("file", "symbol", "symbol_skeleton")
     ]
     included_rules = [item.content for item in included_items if item.source_type == "rule"]
     included_skills = [item.content for item in included_items if item.source_type == "skill"]
@@ -2636,6 +2872,13 @@ async def generate_context_pack(request: ContextBuildRequest) -> ContextBuildRes
 
 @app.post("/v1/context/assemble", response_model=ContextAssembleResponse)
 async def assemble_context(request: ContextAssembleRequest) -> ContextAssembleResponse:
+    # model_max_tokens must be set (not None) or _generate_context_pack_response
+    # takes its early-return "preview" branch, which skips budget enforcement,
+    # truncation, AND deduplication entirely — this endpoint feeds an actual
+    # LLM call, so it needs the budget-aware path. ContextBudget carves a
+    # fixed 60% of model_max_tokens into the usable pack budget, so scale up
+    # here to make the *effective* budget match the caller's max_output_tokens
+    # rather than silently cutting it to 60%.
     context_pack = await _generate_context_pack_response(
         ContextBuildRequest(
             task_description=request.task_description,
@@ -2645,6 +2888,7 @@ async def assemble_context(request: ContextAssembleRequest) -> ContextAssembleRe
             caller=request.caller,
             output_format="markdown_for_llm",
             max_output_tokens=request.max_output_tokens,
+            model_max_tokens=int(request.max_output_tokens / 0.6) + 1,
         )
     )
     response = _render_assembled_context(request=request, context_pack=context_pack)
@@ -2656,7 +2900,15 @@ async def assemble_context(request: ContextAssembleRequest) -> ContextAssembleRe
         )
 
     if request.caller == "copilot_lm_tool" and response.total_tokens > 1000:
-        if _llm_mode == "copilot" and _host_model_available:
+        cache_service = ResponseCacheService(db=_get_db())
+        cached = await cache_service.lookup(
+            context_pack_hash=context_pack.context_pack_hash,
+            task_type=request.task_type_hint,
+        )
+        if cached is not None:
+            response.rendered_markdown = cached.response_text
+            response.total_tokens = len(cached.response_text) // 4
+        elif _llm_mode == "copilot" and _host_model_available:
             try:
                 synthesis_id = str(uuid.uuid4())
                 loop = asyncio.get_event_loop()
@@ -2680,6 +2932,14 @@ async def assemble_context(request: ContextAssembleRequest) -> ContextAssembleRe
                 if synthesized:
                     response.rendered_markdown = synthesized
                     response.total_tokens = len(synthesized) // 4
+                    await cache_service.put(
+                        context_pack_hash=context_pack.context_pack_hash,
+                        response_text=synthesized,
+                        provider="copilot",
+                        model=None,
+                        estimated_cost=0.0,
+                        actual_cost=None,
+                    )
             except Exception:
                 _relay_futures.pop(synthesis_id, None)
         elif _synthesizer is not None:
@@ -2694,6 +2954,15 @@ async def assemble_context(request: ContextAssembleRequest) -> ContextAssembleRe
                 )
                 response.rendered_markdown = synthesized
                 response.total_tokens = len(synthesized) // 4
+                underlying_client = getattr(_synthesizer, "_client", None)
+                await cache_service.put(
+                    context_pack_hash=context_pack.context_pack_hash,
+                    response_text=synthesized,
+                    provider=getattr(underlying_client, "provider_name", None),
+                    model=getattr(underlying_client, "model_id", None),
+                    estimated_cost=0.0,
+                    actual_cost=None,
+                )
             except Exception:
                 pass
 

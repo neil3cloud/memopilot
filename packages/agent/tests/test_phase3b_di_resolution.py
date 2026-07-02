@@ -200,14 +200,17 @@ public class GlobalService
         
         resolver = CSharpResolver("/workspace")
         
-        # Create relationship with to_symbol_id=None
+        # Create relationship with to_symbol_id=None. relation_type is
+        # "imports" — matches what csharp_extractor.py actually emits and
+        # the symbol_relationships CHECK constraint; backfill_relationship_symbols
+        # previously checked "import" (singular), which never matched.
         rel = SymbolRelationshipRecord(
             id="rel1",
             from_symbol_id="source123",
             to_symbol_id=None,
             to_symbol_name="System",
             to_file_path=None,
-            relation_type="import",
+            relation_type="imports",
             workspace_root="/workspace",
         )
         
@@ -235,14 +238,16 @@ public class GlobalService
         
         resolver = CSharpResolver("/workspace")
         
-        # Create inheritance relationship
+        # Create inheritance relationship. relation_type is "inherits"
+        # (matches the extractor and the CHECK constraint) — this test
+        # previously used "inheritance", which never matched.
         rel = SymbolRelationshipRecord(
             id="rel2",
             from_symbol_id="derived123",
             to_symbol_id=None,
             to_symbol_name="BaseRepository",
             to_file_path=None,
-            relation_type="inheritance",
+            relation_type="inherits",
             workspace_root="/workspace",
         )
         

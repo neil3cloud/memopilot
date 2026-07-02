@@ -131,3 +131,127 @@ public class PaymentService
     finally:
         await db.close()
 
+
+@pytest.mark.asyncio
+async def test_typescript_cross_file_calls_resolve_after_full_indexing_run(tmp_path: Path):
+    """A call to an imported function resolves to_symbol_id once the full
+    workspace is indexed — the target file's symbols aren't necessarily
+    indexed yet at the moment the calling file is processed, so this needs
+    the deferred resolution pass in _resolve_cross_module_calls, not just
+    same-file resolution done during extraction."""
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+
+    (workspace / "orders.ts").write_text(
+        """import { chargeCustomer } from './billing';
+
+export function validatePayment(order) {
+    chargeCustomer(order);
+    return true;
+}
+""",
+        encoding="utf-8",
+    )
+    (workspace / "billing.ts").write_text(
+        """export function chargeCustomer(order) {
+    return true;
+}
+""",
+        encoding="utf-8",
+    )
+
+    config = Config(
+        workspace_path=workspace,
+        memopilot_dir=workspace / ".memopilot",
+        global_dir=workspace / ".memopilot-global",
+    )
+    db = DatabaseManager(Path(":memory:"))
+    conn = await db.connect()
+    await run_migrations(conn)
+
+    try:
+        indexer = WorkspaceIndexer(config=config, db=db)
+        result = await indexer.index_workspace()
+        assert result.indexed_files == 2
+
+        cursor = await conn.execute(
+            """
+            SELECT sr.to_symbol_id, sr.to_file_path, s.name AS callee_name
+            FROM symbol_relationships sr
+            JOIN symbols s ON s.id = sr.to_symbol_id
+            WHERE sr.relation_type = 'calls' AND sr.to_symbol_name = 'chargeCustomer'
+            """
+        )
+        rows = await cursor.fetchall()
+        assert len(rows) == 1, "expected the cross-file call to chargeCustomer to resolve"
+        assert rows[0]["to_file_path"] == "billing.ts"
+        assert rows[0]["callee_name"] == "chargeCustomer"
+    finally:
+        await db.close()
+
+
+@pytest.mark.asyncio
+async def test_csharp_cross_file_calls_resolve_after_full_indexing_run(tmp_path: Path):
+    """Same principle as the TS test above, for C#: a call to a method
+    defined in another file resolves once the full workspace is indexed,
+    via CSharpResolver's namespace-scoped backfill pass."""
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+
+    (workspace / "billing.cs").write_text(
+        """namespace Billing;
+public class BillingService
+{
+    public bool ChargeCustomer(Order order)
+    {
+        return true;
+    }
+}
+""",
+        encoding="utf-8",
+    )
+    (workspace / "orders.cs").write_text(
+        """namespace Orders;
+using Billing;
+public class OrderService
+{
+    public bool ValidatePayment(Order order)
+    {
+        var billing = new BillingService();
+        billing.ChargeCustomer(order);
+        return true;
+    }
+}
+""",
+        encoding="utf-8",
+    )
+
+    config = Config(
+        workspace_path=workspace,
+        memopilot_dir=workspace / ".memopilot",
+        global_dir=workspace / ".memopilot-global",
+    )
+    db = DatabaseManager(Path(":memory:"))
+    conn = await db.connect()
+    await run_migrations(conn)
+
+    try:
+        indexer = WorkspaceIndexer(config=config, db=db)
+        result = await indexer.index_workspace()
+        assert result.indexed_files == 2
+
+        cursor = await conn.execute(
+            """
+            SELECT sr.to_symbol_id, sr.to_file_path, s.name AS callee_name, s.file_path
+            FROM symbol_relationships sr
+            JOIN symbols s ON s.id = sr.to_symbol_id
+            WHERE sr.relation_type = 'calls' AND sr.to_symbol_name = 'ChargeCustomer'
+            """
+        )
+        rows = await cursor.fetchall()
+        assert len(rows) == 1, "expected the cross-file call to ChargeCustomer to resolve"
+        assert rows[0]["file_path"] == "billing.cs"
+        assert rows[0]["callee_name"] == "ChargeCustomer"
+    finally:
+        await db.close()
+

@@ -63,7 +63,7 @@ class CSharpExtractor:
         symbols: list[SymbolRecord],
         workspace_root: str,
     ) -> list[SymbolRelationshipRecord]:
-        """Extract C# relationships (using statements, inheritance, DI injection)."""
+        """Extract C# relationships (using statements, inheritance, DI injection, calls)."""
         from .graph_retriever import make_relationship_id
 
         relationships: list[SymbolRelationshipRecord] = []
@@ -123,7 +123,110 @@ class CSharpExtractor:
                 )
             )
 
+        # Extract method-call invocations. Same-file calls (including
+        # this.Method()/receiver.Method() — C# method symbol names are
+        # stored bare, unlike Python/TS's "ClassName.method" convention, so
+        # an exact-name lookup already covers member calls) resolve
+        # immediately. Cross-file calls are left unresolved here — the
+        # indexer's namespace-based CSharpResolver backfill pass resolves
+        # them later, once every file in the workspace is indexed.
+        if self._parser is not None:
+            try:
+                tree = self._parser.parse(source.encode("utf-8"))
+                symbol_by_name = {s.name: s for s in symbols if s.kind in ("method", "function")}
+                self._extract_calls(
+                    tree.root_node,
+                    source=source,
+                    symbols=symbols,
+                    symbol_by_name=symbol_by_name,
+                    relationships=relationships,
+                    workspace_root=workspace_root,
+                    enclosing_symbol=None,
+                )
+            except Exception as e:
+                logger.debug(f"C# call extraction failed for {file_path}: {e}")
+
         return relationships
+
+    def _extract_calls(
+        self,
+        node,
+        *,
+        source: str,
+        symbols: list[SymbolRecord],
+        symbol_by_name: dict[str, SymbolRecord],
+        relationships: list[SymbolRelationshipRecord],
+        workspace_root: str,
+        enclosing_symbol: SymbolRecord | None,
+    ) -> None:
+        """Walk the tree for invocation_expression nodes and record "calls"
+        relationships, tracking the enclosing method by matching tree-sitter
+        method_declaration nodes to already-extracted symbols by start_line
+        (name extraction itself stays regex-based in _extract_method_symbol;
+        this only needs to know WHICH already-extracted symbol a given
+        declaration node corresponds to, not re-derive its name)."""
+        from .graph_retriever import make_relationship_id
+
+        next_enclosing = enclosing_symbol
+        if node.type == "method_declaration":
+            start_line = node.start_point[0] + 1
+            for sym in symbols:
+                if sym.kind in ("method", "function") and sym.start_line == start_line:
+                    next_enclosing = sym
+                    break
+
+        if node.type == "invocation_expression" and next_enclosing is not None:
+            callee_name = self._extract_invocation_target_name(node, source)
+            if callee_name:
+                target_symbol = symbol_by_name.get(callee_name)
+                to_symbol_id = target_symbol.id if target_symbol else None
+                call_end = node.children[0].end_point if node.children else node.end_point
+                relationships.append(
+                    SymbolRelationshipRecord(
+                        id=make_relationship_id(next_enclosing.id, callee_name, "calls", None),
+                        from_symbol_id=next_enclosing.id,
+                        to_symbol_id=to_symbol_id,
+                        to_symbol_name=callee_name,
+                        to_file_path=None,
+                        relation_type="calls",
+                        workspace_root=workspace_root,
+                        call_line=call_end[0] + 1,
+                        call_col=max(0, call_end[1] - 1),
+                    )
+                )
+
+        for child in node.children:
+            self._extract_calls(
+                child,
+                source=source,
+                symbols=symbols,
+                symbol_by_name=symbol_by_name,
+                relationships=relationships,
+                workspace_root=workspace_root,
+                enclosing_symbol=next_enclosing,
+            )
+
+    def _extract_invocation_target_name(self, invocation_node, source: str) -> str | None:
+        """Return the bare callee name for an invocation_expression.
+
+        Plain calls (Foo()) have an `identifier` first child. Member calls
+        (obj.Method(), this.Method()) have a `member_access_expression`
+        whose LAST `identifier` child is the method actually being invoked
+        (the first is the receiver) — tree-sitter-c-sharp doesn't
+        distinguish receiver vs. property by node type the way TS does, so
+        position (last) is what disambiguates them here.
+        """
+        if not invocation_node.children:
+            return None
+        target = invocation_node.children[0]
+        if target.type == "identifier":
+            return source[target.start_byte : target.end_byte]
+        if target.type == "member_access_expression":
+            identifiers = [c for c in target.children if c.type == "identifier"]
+            if identifiers:
+                last = identifiers[-1]
+                return source[last.start_byte : last.end_byte]
+        return None
 
     def _walk_tree(self, node, source: str, file_path: str, symbols: list[SymbolRecord]) -> None:
         """Recursively walk AST tree to extract symbols."""

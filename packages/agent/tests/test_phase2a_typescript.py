@@ -100,6 +100,79 @@ def test_extract_relationships_empty(extractor):
 }"""
     symbols = extractor.extract("test.ts", source, "hash123")
     rels = extractor.extract_relationships("test.ts", source, symbols, "/workspace")
-    
+
     # Phase 2a returns empty; Phase 2b will populate
     assert isinstance(rels, list)
+
+
+def test_extract_calls_plain_function_call_same_file(extractor):
+    """A plain identifier call to a same-file function resolves immediately."""
+    source = """function chargeCustomer(order) {
+    return true;
+}
+
+function validatePayment(order) {
+    chargeCustomer(order);
+    return true;
+}"""
+    symbols = extractor.extract("orders.ts", source, "hash123")
+    rels = extractor.extract_relationships("orders.ts", source, symbols, "/workspace")
+
+    calls = [r for r in rels if r.relation_type == "calls"]
+    assert any(
+        r.to_symbol_name == "chargeCustomer" and r.to_file_path == "orders.ts" and r.to_symbol_id
+        for r in calls
+    )
+
+
+def test_extract_calls_this_member_call_resolves_to_qualified_method(extractor):
+    """this.method() resolves against the qualified "ClassName.method" symbol."""
+    source = """class OrderService {
+    process(order) {
+        this.logEvent(order);
+    }
+
+    logEvent(order) {
+        console.log(order);
+    }
+}"""
+    symbols = extractor.extract("service.ts", source, "hash123")
+    rels = extractor.extract_relationships("service.ts", source, symbols, "/workspace")
+
+    log_event_symbol = next(s for s in symbols if s.name == "OrderService.logEvent")
+    calls = [r for r in rels if r.relation_type == "calls" and r.to_symbol_name == "logEvent"]
+    assert len(calls) == 1
+    assert calls[0].to_symbol_id == log_event_symbol.id
+    assert calls[0].to_file_path == "service.ts"
+
+
+def test_extract_calls_unresolvable_call_left_unresolved(extractor):
+    """A call with no matching symbol or import (e.g. a builtin) stays unresolved, not dropped."""
+    source = """function logDebug(message) {
+    console.log(message);
+}"""
+    symbols = extractor.extract("utils.ts", source, "hash123")
+    rels = extractor.extract_relationships("utils.ts", source, symbols, "/workspace")
+
+    calls = [r for r in rels if r.relation_type == "calls" and r.to_symbol_name == "log"]
+    assert len(calls) == 1
+    assert calls[0].to_symbol_id is None
+    assert calls[0].to_file_path is None
+
+
+def test_extract_calls_attributes_call_to_enclosing_function(extractor):
+    """A call inside a top-level function is attributed to that function, not module scope."""
+    source = """function outer(order) {
+    inner(order);
+}
+
+function inner(order) {
+    return order;
+}"""
+    symbols = extractor.extract("a.ts", source, "hash123")
+    rels = extractor.extract_relationships("a.ts", source, symbols, "/workspace")
+
+    outer_symbol = next(s for s in symbols if s.name == "outer")
+    calls = [r for r in rels if r.relation_type == "calls" and r.to_symbol_name == "inner"]
+    assert len(calls) == 1
+    assert calls[0].from_symbol_id == outer_symbol.id

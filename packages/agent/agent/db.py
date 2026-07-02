@@ -28,6 +28,10 @@ async def get_connection(db_path: Path) -> aiosqlite.Connection:
     try:
         await conn.execute("PRAGMA foreign_keys = ON")
         await conn.execute("PRAGMA journal_mode = WAL")
+        # NORMAL is the recommended pairing with WAL: still durable against app
+        # crashes, skips the fsync-per-commit cost of the FULL default. Safe for
+        # a local single-user tool where OS/power-loss durability isn't required.
+        await conn.execute("PRAGMA synchronous = NORMAL")
         conn.row_factory = aiosqlite.Row
         return conn
     except aiosqlite.DatabaseError:

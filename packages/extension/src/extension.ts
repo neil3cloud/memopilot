@@ -27,6 +27,7 @@ let fileWatcher: vscode.FileSystemWatcher | undefined;
 const pendingNew = new Set<string>();
 const pendingModified = new Set<string>();
 const pendingDeleted = new Set<string>();
+let pendingChangesBarDebounceTimer: ReturnType<typeof setTimeout> | undefined;
 
 function updatePendingChangesBar(): void {
     const total = pendingNew.size + pendingModified.size + pendingDeleted.size;
@@ -44,6 +45,18 @@ function updatePendingChangesBar(): void {
     pendingChangesBar.show();
 }
 
+// Debounces the status bar re-render so a burst of file events (e.g. a
+// multi-file save or branch switch) triggers one UI update instead of one per file.
+function scheduleUpdatePendingChangesBar(): void {
+    if (pendingChangesBarDebounceTimer) {
+        clearTimeout(pendingChangesBarDebounceTimer);
+    }
+    pendingChangesBarDebounceTimer = setTimeout(() => {
+        pendingChangesBarDebounceTimer = undefined;
+        updatePendingChangesBar();
+    }, 500);
+}
+
 function setupFileWatcher(context: vscode.ExtensionContext): void {
     fileWatcher?.dispose();
     const pattern = new vscode.RelativePattern(
@@ -55,19 +68,19 @@ function setupFileWatcher(context: vscode.ExtensionContext): void {
     fileWatcher.onDidCreate((uri) => {
         pendingNew.add(uri.fsPath);
         pendingDeleted.delete(uri.fsPath);
-        updatePendingChangesBar();
+        scheduleUpdatePendingChangesBar();
     });
     fileWatcher.onDidChange((uri) => {
         if (!pendingNew.has(uri.fsPath)) {
             pendingModified.add(uri.fsPath);
         }
-        updatePendingChangesBar();
+        scheduleUpdatePendingChangesBar();
     });
     fileWatcher.onDidDelete((uri) => {
         pendingNew.delete(uri.fsPath);
         pendingModified.delete(uri.fsPath);
         pendingDeleted.add(uri.fsPath);
-        updatePendingChangesBar();
+        scheduleUpdatePendingChangesBar();
     });
 
     context.subscriptions.push(fileWatcher);
@@ -367,6 +380,8 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         if (MemoPilotPanel.currentPanel) {
             MemoPilotPanel.currentPanel.setClient(backendClient);
         }
+        // refreshProviderStatus() doesn't depend on any of these — run it in the
+        // same batch instead of sequencing it after (was previously two round-trips).
         await Promise.all([
             profileProvider.refresh(),
             memoryProvider.refresh(),
@@ -375,9 +390,8 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
             costProvider.refresh(),
             historyProvider.refresh(),
             mcpProvider.refresh(),
+            refreshProviderStatus(),
         ]);
-
-        await refreshProviderStatus();
 
         // Probe vscode.lm once at startup — backend caches the result for every synthesis call
         if (backendManager) {

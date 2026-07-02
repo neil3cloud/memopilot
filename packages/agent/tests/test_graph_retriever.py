@@ -148,3 +148,50 @@ async def test_store_relationships_upserts_dedup(client: AsyncClient, test_token
     row = await cursor.fetchone()
     assert row[0] == 1
 
+
+@pytest.mark.asyncio
+async def test_get_callees_batch_returns_callees_per_symbol(client: AsyncClient, test_token: str, test_db):
+    headers = {"X-Agent-Token": test_token}
+    await client.post("/v1/workspace/init", headers=headers)
+
+    conn = await test_db.connect()
+    await _seed_symbols(conn, [
+        {"id": "sym-a", "name": "main_func", "file_path": "a.py"},
+        {"id": "sym-b", "name": "other_func", "file_path": "a.py"},
+        {"id": "sym-c", "name": "helper", "file_path": "b.py"},
+        {"id": "sym-d", "name": "unrelated", "file_path": "c.py"},
+    ])
+    await _seed_relationship(conn, "sym-a", "sym-c", "helper", "calls", "b.py")
+    await _seed_relationship(conn, "sym-b", "sym-c", "helper", "calls", "b.py")
+
+    graph = GraphRetriever(db=test_db)
+    result = await graph.get_callees_batch(["sym-a", "sym-b", "sym-d"])
+
+    assert set(result.keys()) == {"sym-a", "sym-b", "sym-d"}
+    assert [c.id for c in result["sym-a"]] == ["sym-c"]
+    assert [c.id for c in result["sym-b"]] == ["sym-c"]
+    assert result["sym-d"] == []
+
+
+@pytest.mark.asyncio
+async def test_get_callees_batch_excludes_unresolved_calls(client: AsyncClient, test_token: str, test_db):
+    headers = {"X-Agent-Token": test_token}
+    await client.post("/v1/workspace/init", headers=headers)
+
+    conn = await test_db.connect()
+    await _seed_symbols(conn, [{"id": "sym-a", "name": "main_func", "file_path": "a.py"}])
+    # Unresolved call — to_symbol_id is None (target never got cross-file resolved).
+    await _seed_relationship(conn, "sym-a", None, "missing_fn", "calls", "unknown.py")
+
+    graph = GraphRetriever(db=test_db)
+    result = await graph.get_callees_batch(["sym-a"])
+
+    assert result["sym-a"] == []
+
+
+@pytest.mark.asyncio
+async def test_get_callees_batch_empty_input_returns_empty_dict(test_db):
+    graph = GraphRetriever(db=test_db)
+    result = await graph.get_callees_batch([])
+    assert result == {}
+

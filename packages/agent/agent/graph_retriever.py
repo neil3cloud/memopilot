@@ -25,6 +25,11 @@ class RelatedSymbol:
     signature: str | None
     depth: int
     relation_type: str
+    # Populated by get_callees_batch() for Tier 3 cross-file context pull-in;
+    # left as None by callers that don't need them (get_callers, etc).
+    start_line: int | None = None
+    end_line: int | None = None
+    summary: str | None = None
 
 
 @dataclass(frozen=True)
@@ -128,6 +133,55 @@ class GraphRetriever:
         rows = await cursor.fetchall()
         return [self._row_to_related(row) for row in rows]
 
+    async def get_callees_batch(
+        self, symbol_ids: list[str]
+    ) -> dict[str, list[RelatedSymbol]]:
+        """Single-hop, batched callee lookup for many symbols at once.
+
+        Unlike get_callees() (single-id, recursive up to MAX_DEPTH), this is
+        depth=1 only and batched — built for Tier 3 cross-file context
+        pull-in, which needs the immediate callees of many Tier-1 symbols in
+        one query. Calling get_callees() once per symbol would reintroduce
+        the N+1 pattern fixed elsewhere in this codebase.
+        """
+        if not symbol_ids:
+            return {}
+        conn = await self._db.connect()
+        placeholders = ",".join("?" for _ in symbol_ids)
+        cursor = await conn.execute(
+            f"""
+            SELECT DISTINCT
+                sr.from_symbol_id AS caller_id,
+                s.id, s.file_path, s.name, s.kind, s.signature,
+                s.start_line, s.end_line, s.summary
+            FROM symbol_relationships sr
+            JOIN symbols s ON s.id = sr.to_symbol_id
+            WHERE sr.from_symbol_id IN ({placeholders})
+              AND sr.relation_type = 'calls'
+              AND sr.to_symbol_id IS NOT NULL
+            """,
+            symbol_ids,
+        )
+        rows = await cursor.fetchall()
+
+        result: dict[str, list[RelatedSymbol]] = {symbol_id: [] for symbol_id in symbol_ids}
+        for row in rows:
+            result[row["caller_id"]].append(
+                RelatedSymbol(
+                    id=row["id"],
+                    file_path=row["file_path"],
+                    name=row["name"],
+                    kind=row["kind"],
+                    signature=row["signature"],
+                    depth=1,
+                    relation_type="calls",
+                    start_line=row["start_line"],
+                    end_line=row["end_line"],
+                    summary=row["summary"],
+                )
+            )
+        return result
+
     async def get_import_dependents(self, file_path: str) -> list[str]:
         """Return file paths that import the given file."""
         conn = await self._db.connect()
@@ -182,17 +236,19 @@ class GraphRetriever:
         relationships: list[SymbolRelationshipRecord],
     ) -> None:
         """Upsert a batch of relationship records."""
-        for rel in relationships:
-            await conn.execute(
-                """
-                INSERT INTO symbol_relationships
-                    (id, from_symbol_id, to_symbol_id, to_symbol_name,
-                     to_file_path, relation_type, workspace_root)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(id) DO UPDATE SET
-                    to_symbol_id = excluded.to_symbol_id,
-                    to_file_path = excluded.to_file_path
-                """,
+        if not relationships:
+            return
+        await conn.executemany(
+            """
+            INSERT INTO symbol_relationships
+                (id, from_symbol_id, to_symbol_id, to_symbol_name,
+                 to_file_path, relation_type, workspace_root)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(id) DO UPDATE SET
+                to_symbol_id = excluded.to_symbol_id,
+                to_file_path = excluded.to_file_path
+            """,
+            [
                 (
                     rel.id,
                     rel.from_symbol_id,
@@ -201,8 +257,10 @@ class GraphRetriever:
                     rel.to_file_path,
                     rel.relation_type,
                     rel.workspace_root,
-                ),
-            )
+                )
+                for rel in relationships
+            ],
+        )
 
     def _row_to_related(self, row: aiosqlite.Row) -> RelatedSymbol:
         return RelatedSymbol(

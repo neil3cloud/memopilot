@@ -74,7 +74,8 @@ class JediResolver:
             return []
 
         try:
-            script = jedi.Script(source=source, path=abs_file_path, project=self._project)
+            # Jedi >=0.18 renamed Script's source kwarg to `code`.
+            script = jedi.Script(code=source, path=abs_file_path, project=self._project)
         except Exception:
             logger.debug("JediResolver: Script() failed for %s", abs_file_path, exc_info=True)
             return []
