@@ -293,20 +293,26 @@ class CSharpResolver:
         
         for rel in relationships:
             symbol_id = None
-            
-            if rel.relation_type == "import":
+
+            # NOTE: these relation_type strings must match what the extractors
+            # actually emit ("imports"/"inherits", per csharp_extractor.py and
+            # the symbol_relationships CHECK constraint) — this method
+            # previously checked "import"/"inheritance" (singular/different
+            # form), which never matched anything the extractor produced, so
+            # C# import and inheritance backfill silently never ran.
+            if rel.relation_type == "imports":
                 # Resolve import target
                 # to_symbol_name contains the using namespace
                 namespace_or_type = rel.to_symbol_name
                 if file_namespace:
                     # Try exact namespace first, then file's namespace
                     symbol_id = await self.resolve_namespace_to_symbol_async(
-                        namespace_or_type, 
+                        namespace_or_type,
                         namespace_or_type.split(".")[-1],  # Last component as potential class name
                         conn,
                     )
-            
-            elif rel.relation_type == "inheritance":
+
+            elif rel.relation_type == "inherits":
                 # Resolve base class/interface
                 base_name = rel.to_symbol_name
                 if file_namespace:
@@ -315,7 +321,7 @@ class CSharpResolver:
                         base_name,
                         conn,
                     )
-            
+
             elif rel.relation_type == "di_injection":
                 # Resolve interface to implementation
                 interface_name = rel.to_symbol_name
@@ -323,6 +329,21 @@ class CSharpResolver:
                     interface_name,
                     conn,
                 )
+
+            elif rel.relation_type == "calls":
+                # Same-file calls are already resolved at extraction time
+                # (csharp_extractor._extract_calls); anything reaching here
+                # is a cross-file or unresolvable (e.g. BCL) call. Reuse the
+                # same namespace-scoped symbol lookup as "inherits" — calls
+                # to names not actually indexed in this workspace (BCL/stdlib)
+                # simply won't match anything and stay unresolved.
+                callee_name = rel.to_symbol_name
+                if file_namespace:
+                    symbol_id = await self.resolve_namespace_to_symbol_async(
+                        file_namespace,
+                        callee_name,
+                        conn,
+                    )
             
             # Create new relationship with updated to_symbol_id if resolved
             if symbol_id:

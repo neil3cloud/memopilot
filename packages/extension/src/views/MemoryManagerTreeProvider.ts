@@ -137,7 +137,9 @@ export class MemoryManagerTreeProvider implements vscode.TreeDataProvider<vscode
 
     private _startPolling(): void {
         if (this._pollTimer) { return; }
-        this._pollTimer = setInterval(() => { void this.refresh(); }, 10_000);
+        // 20s: this only runs while summarization is in flight — no need for
+        // 10s granularity on a background process that takes minutes.
+        this._pollTimer = setInterval(() => { void this.refresh(); }, 20_000);
     }
 
     private _stopPolling(): void {

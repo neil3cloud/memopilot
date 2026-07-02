@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import logging
 import time
@@ -19,6 +20,7 @@ from .graph_retriever import GraphRetriever, SymbolRelationshipRecord
 from .jedi_resolver import JediResolver
 from .project_scanner import WorkspaceScanner
 from .python_extractor import PythonExtractor
+from .symbol_source import read_symbol_source
 from .symbol_summarizer import SymbolSummarizer
 from .typescript_extractor import TypeScriptExtractor
 
@@ -141,8 +143,8 @@ class WorkspaceIndexer:
                 (file_path,),
             )
             await conn.execute("DELETE FROM symbols WHERE file_path = ?", (file_path,))
-            for symbol in symbols:
-                await conn.execute(
+            if symbols:
+                await conn.executemany(
                     """
                     INSERT OR IGNORE INTO symbols
                     (
@@ -151,16 +153,19 @@ class WorkspaceIndexer:
                     )
                     VALUES (?, ?, ?, ?, ?, ?, ?, NULL, ?)
                     """,
-                    (
-                        symbol.id,
-                        symbol.file_path,
-                        symbol.name,
-                        symbol.kind,
-                        symbol.start_line,
-                        symbol.end_line,
-                        symbol.signature,
-                        symbol.content_hash,
-                    ),
+                    [
+                        (
+                            symbol.id,
+                            symbol.file_path,
+                            symbol.name,
+                            symbol.kind,
+                            symbol.start_line,
+                            symbol.end_line,
+                            symbol.signature,
+                            symbol.content_hash,
+                        )
+                        for symbol in symbols
+                    ],
                 )
 
             # Extract and store structural relationships
@@ -229,7 +234,8 @@ class WorkspaceIndexer:
     ) -> list[SymbolRelationshipRecord]:
         """Enrich to_symbol_id for cross-module call relationships.
 
-        Supports Python call resolution (Jedi) and C# namespace/DI backfill.
+        Supports Python call resolution (Jedi), C# namespace/DI backfill,
+        and TypeScript import-map-based resolution.
         """
         if language == "csharp":
             file_namespace = self._csharp_resolver.extract_namespace_from_source(source)
@@ -238,6 +244,9 @@ class WorkspaceIndexer:
                 conn,
                 file_namespace=file_namespace,
             )
+
+        if language == "typescript":
+            return await self._resolve_typescript_calls(conn=conn, relationships=relationships)
 
         # Only use Jedi for Python files
         if language != "python":
@@ -277,6 +286,27 @@ class WorkspaceIndexer:
         if not resolution_map:
             return relationships
 
+        # Batch-fetch every candidate symbol across all target files in one query,
+        # instead of one SELECT per relationship (N+1).
+        target_files = sorted({target_file for target_file, _ in resolution_map.values()})
+        placeholders = ",".join("?" for _ in target_files)
+        cursor = await conn.execute(
+            f"SELECT id, file_path, name FROM symbols WHERE file_path IN ({placeholders})",
+            target_files,
+        )
+        rows = await cursor.fetchall()
+
+        # (file_path, exact_name) -> id, plus (file_path, suffix_after_dot) -> id for
+        # methods stored as "ClassName.method_name" matched against a bare method name.
+        exact_lookup: dict[tuple[str, str], str] = {}
+        suffix_lookup: dict[tuple[str, str], str] = {}
+        for row in rows:
+            key = (row["file_path"], row["name"])
+            exact_lookup.setdefault(key, row["id"])
+            if "." in row["name"]:
+                suffix_key = (row["file_path"], row["name"].rsplit(".", 1)[1])
+                suffix_lookup.setdefault(suffix_key, row["id"])
+
         enriched: list[SymbolRelationshipRecord] = []
         for rel in relationships:
             if rel.id not in resolution_map:
@@ -284,23 +314,14 @@ class WorkspaceIndexer:
                 continue
 
             target_file, bare_name = resolution_map[rel.id]
-            # Find the symbol in the target file — methods are stored as
-            # "ClassName.method_name", top-level functions as "method_name".
-            cursor = await conn.execute(
-                """
-                SELECT id FROM symbols
-                WHERE file_path = ?
-                  AND (name = ? OR name LIKE ?)
-                LIMIT 1
-                """,
-                (target_file, bare_name, f"%.{bare_name}"),
+            symbol_id = exact_lookup.get((target_file, bare_name)) or suffix_lookup.get(
+                (target_file, bare_name)
             )
-            row = await cursor.fetchone()
-            if row:
+            if symbol_id:
                 enriched.append(SymbolRelationshipRecord(
                     id=rel.id,
                     from_symbol_id=rel.from_symbol_id,
-                    to_symbol_id=row["id"],
+                    to_symbol_id=symbol_id,
                     to_symbol_name=rel.to_symbol_name,
                     to_file_path=target_file,
                     relation_type=rel.relation_type,
@@ -316,6 +337,72 @@ class WorkspaceIndexer:
                 "_resolve_cross_module_calls: resolved %d/%d cross-module calls in %s",
                 resolved_count, len(unresolved), abs_file_path,
             )
+        return enriched
+
+    async def _resolve_typescript_calls(
+        self,
+        *,
+        conn: aiosqlite.Connection,
+        relationships: list[SymbolRelationshipRecord],
+    ) -> list[SymbolRelationshipRecord]:
+        """Resolve to_symbol_id for TS calls that already have a target file.
+
+        Unlike Python's Jedi-based resolution, the target file for a TS
+        cross-file call is already known at extraction time (typescript_extractor
+        resolves it via the file's own import map). This just needs a
+        batched symbol-table lookup in that target file — no static
+        analysis engine required.
+        """
+        unresolved = [
+            rel
+            for rel in relationships
+            if rel.relation_type == "calls"
+            and rel.to_symbol_id is None
+            and rel.to_file_path is not None
+        ]
+        if not unresolved:
+            return relationships
+        unresolved_ids = {id(rel) for rel in unresolved}
+
+        target_files = sorted({rel.to_file_path for rel in unresolved if rel.to_file_path})
+        placeholders = ",".join("?" for _ in target_files)
+        cursor = await conn.execute(
+            f"SELECT id, file_path, name FROM symbols WHERE file_path IN ({placeholders})",
+            target_files,
+        )
+        rows = await cursor.fetchall()
+
+        # Same batched exact/suffix lookup pattern as the Python/Jedi branch above.
+        exact_lookup: dict[tuple[str, str], str] = {}
+        suffix_lookup: dict[tuple[str, str], str] = {}
+        for row in rows:
+            key = (row["file_path"], row["name"])
+            exact_lookup.setdefault(key, row["id"])
+            if "." in row["name"]:
+                suffix_key = (row["file_path"], row["name"].rsplit(".", 1)[1])
+                suffix_lookup.setdefault(suffix_key, row["id"])
+
+        enriched: list[SymbolRelationshipRecord] = []
+        for rel in relationships:
+            if id(rel) not in unresolved_ids:
+                enriched.append(rel)
+                continue
+
+            symbol_id = exact_lookup.get(
+                (rel.to_file_path, rel.to_symbol_name)
+            ) or suffix_lookup.get((rel.to_file_path, rel.to_symbol_name))
+            if symbol_id:
+                enriched.append(SymbolRelationshipRecord(
+                    id=rel.id,
+                    from_symbol_id=rel.from_symbol_id,
+                    to_symbol_id=symbol_id,
+                    to_symbol_name=rel.to_symbol_name,
+                    to_file_path=rel.to_file_path,
+                    relation_type=rel.relation_type,
+                    workspace_root=rel.workspace_root,
+                ))
+            else:
+                enriched.append(rel)
         return enriched
 
     async def _summarize_pending_symbols(self, batch_size: int = _DEFAULT_BATCH_SIZE) -> None:
@@ -348,10 +435,12 @@ class WorkspaceIndexer:
             batch_symbols: list[dict] = []
             for row in batch_rows:
                 try:
-                    lines = self._read_text(
-                        self._config.workspace_path / row["file_path"]
-                    ).splitlines()
-                    source = "\n".join(lines[row["start_line"] - 1 : row["end_line"]])
+                    source = await read_symbol_source(
+                        workspace_root=self._config.workspace_path,
+                        file_path=row["file_path"],
+                        start_line=row["start_line"],
+                        end_line=row["end_line"],
+                    )
                     batch_symbols.append({
                         "id": row["id"],
                         "name": row["name"],

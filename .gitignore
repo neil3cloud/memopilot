@@ -8,6 +8,7 @@ dist/
 
 # Extension bundled agent (build artifact, copied by prebundle-agent)
 packages/extension/agent/
+packages/extension/requirements.txt
 
 # Python
 __pycache__/

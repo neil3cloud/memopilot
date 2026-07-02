@@ -249,8 +249,11 @@ namespace MyApp.Controllers
         symbols = extractor.extract("OrderController.cs", source, "hash123")
         relationships = extractor.extract_relationships("OrderController.cs", source, symbols, "/workspace")
 
-        # Should have relationships for using statements
-        import_rels = [r for r in relationships if r.relation_type == "import"]
+        # Should have relationships for using statements. relation_type is
+        # "imports" (matches the symbol_relationships CHECK constraint and
+        # what the extractor actually emits) — this test previously checked
+        # "import" (singular), which never matched anything.
+        import_rels = [r for r in relationships if r.relation_type == "imports"]
         assert len(import_rels) >= 1
 
     def test_extract_inheritance_relationships(self):
@@ -265,8 +268,10 @@ public class OrderService : IOrderService
         symbols = extractor.extract("OrderService.cs", source, "hash123")
         relationships = extractor.extract_relationships("OrderService.cs", source, symbols, "/workspace")
 
-        # Should have inheritance relationship
-        inheritance_rels = [r for r in relationships if r.relation_type == "inheritance"]
+        # Should have inheritance relationship. relation_type is "inherits"
+        # (matches the extractor and the CHECK constraint) — this test
+        # previously checked "inheritance", which never matched anything.
+        inheritance_rels = [r for r in relationships if r.relation_type == "inherits"]
         assert len(inheritance_rels) >= 1
 
     def test_extract_http_route_get(self):
@@ -287,8 +292,10 @@ public class OrdersController : ControllerBase
         symbols = extractor.extract("OrdersController.cs", source, "hash123")
         relationships = extractor.extract_relationships("OrdersController.cs", source, symbols, "/workspace")
 
-        # Should have route relationships
-        route_rels = [r for r in relationships if r.relation_type == "route"]
+        # Should have route relationships. HTTP routes are stored as
+        # relation_type "references" (the extractor never emitted "route") —
+        # this test previously checked a value that never matched anything.
+        route_rels = [r for r in relationships if r.relation_type == "references"]
         assert len(route_rels) >= 1
 
     def test_extract_http_route_post(self):
@@ -308,8 +315,98 @@ public class OrdersController
         symbols = extractor.extract("OrdersController.cs", source, "hash123")
         relationships = extractor.extract_relationships("OrdersController.cs", source, symbols, "/workspace")
 
-        route_rels = [r for r in relationships if r.relation_type == "route"]
+        route_rels = [r for r in relationships if r.relation_type == "references"]
         assert len(route_rels) >= 1
+
+
+class TestCSharpCallExtraction:
+    """Test C# method-call extraction (Phase 3c)."""
+
+    def test_plain_call_same_file_resolves(self):
+        source = """
+public class PaymentService
+{
+    public bool ValidatePayment(Order order)
+    {
+        ChargeCustomer(order);
+        return true;
+    }
+
+    private void ChargeCustomer(Order order) { }
+}
+"""
+        extractor = CSharpExtractor()
+        symbols = extractor.extract("service.cs", source, "hash123")
+        relationships = extractor.extract_relationships("service.cs", source, symbols, "/workspace")
+
+        charge_symbol = next(s for s in symbols if s.name == "ChargeCustomer")
+        calls = [r for r in relationships if r.relation_type == "calls" and r.to_symbol_name == "ChargeCustomer"]
+        assert len(calls) == 1
+        assert calls[0].to_symbol_id == charge_symbol.id
+
+    def test_this_member_call_resolves_bare_name(self):
+        """C# method symbol names are stored bare (not "Class.Method" like
+        Python/TS), so this.Method() resolves via a direct name match."""
+        source = """
+public class PaymentService
+{
+    public bool ValidatePayment(Order order)
+    {
+        this.LogEvent(order);
+        return true;
+    }
+
+    private void LogEvent(Order order) { }
+}
+"""
+        extractor = CSharpExtractor()
+        symbols = extractor.extract("service.cs", source, "hash123")
+        relationships = extractor.extract_relationships("service.cs", source, symbols, "/workspace")
+
+        log_symbol = next(s for s in symbols if s.name == "LogEvent")
+        calls = [r for r in relationships if r.relation_type == "calls" and r.to_symbol_name == "LogEvent"]
+        assert len(calls) == 1
+        assert calls[0].to_symbol_id == log_symbol.id
+
+    def test_bcl_call_left_unresolved_not_dropped(self):
+        source = """
+public class PaymentService
+{
+    private void LogEvent(Order order)
+    {
+        Console.WriteLine(order);
+    }
+}
+"""
+        extractor = CSharpExtractor()
+        symbols = extractor.extract("service.cs", source, "hash123")
+        relationships = extractor.extract_relationships("service.cs", source, symbols, "/workspace")
+
+        calls = [r for r in relationships if r.relation_type == "calls" and r.to_symbol_name == "WriteLine"]
+        assert len(calls) == 1
+        assert calls[0].to_symbol_id is None
+
+    def test_call_attributed_to_enclosing_method(self):
+        source = """
+public class PaymentService
+{
+    public bool Outer(Order order)
+    {
+        Inner(order);
+        return true;
+    }
+
+    private void Inner(Order order) { }
+}
+"""
+        extractor = CSharpExtractor()
+        symbols = extractor.extract("service.cs", source, "hash123")
+        relationships = extractor.extract_relationships("service.cs", source, symbols, "/workspace")
+
+        outer_symbol = next(s for s in symbols if s.name == "Outer")
+        calls = [r for r in relationships if r.relation_type == "calls" and r.to_symbol_name == "Inner"]
+        assert len(calls) == 1
+        assert calls[0].from_symbol_id == outer_symbol.id
 
 
 class TestCSharpResolverInitialization:
