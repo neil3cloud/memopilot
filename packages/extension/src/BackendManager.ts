@@ -1,5 +1,6 @@
 import * as vscode from 'vscode';
 import * as crypto from 'crypto';
+import * as os from 'os';
 import * as path from 'path';
 import * as fs from 'fs';
 import { ChildProcess, spawn } from 'child_process';
@@ -130,14 +131,45 @@ export class BackendManager {
         this.port = await this.waitForPort(60000);
         this.outputChannel.appendLine(`[MemoPilot v${EXTENSION_VERSION}] Backend started on port ${this.port}`);
 
-        // Write .cursor-mcp-env for MCP server (Cursor integration)
+        // Write env files for MCP server (Cursor + CLI integration)
         this.writeCursorMcpEnv(memopilotDir);
+        this.writeMcpEnv(memopilotDir);
+
+        // Auto-register as global MCP server for Claude Code & Gemini CLI
+        try {
+            this.registerGlobalMcpServers(pythonPath, agentParent);
+        } catch {
+            // Non-critical: CLI tools can still be configured manually
+        }
     }
 
     async stop(): Promise<void> {
         this._stopping = true;
         if (this.process) {
-            this.process.kill('SIGTERM');
+            const pid = this.process.pid;
+            try {
+                // On Windows, SIGTERM is ignored. Use taskkill /T to kill the
+                // entire process tree (backend + uvicorn worker).
+                if (process.platform === 'win32' && pid) {
+                    spawn('taskkill', ['/pid', String(pid), '/T', '/F'], {
+                        stdio: 'ignore',
+                    });
+                } else {
+                    this.process.kill('SIGTERM');
+                }
+            } catch {
+                // Process may have already exited
+            }
+
+            // Wait briefly for the process to actually exit
+            await new Promise<void>((resolve) => {
+                const timeout = setTimeout(() => resolve(), 3000);
+                this.process?.on('exit', () => {
+                    clearTimeout(timeout);
+                    resolve();
+                });
+            });
+
             this.process = undefined;
         }
         this.port = undefined;
@@ -150,6 +182,9 @@ export class BackendManager {
                 // Ignore cleanup errors
             }
         }
+
+        // Clean stale SQLite journal files that can cause "database is locked"
+        this.cleanStaleDatabaseJournals();
 
         // Clean .cursor-mcp-env
         this.deleteCursorMcpEnv();
@@ -388,8 +423,14 @@ export class BackendManager {
             await this.sleep(pollInterval);
         }
 
-        // Timeout — kill process
-        this.process?.kill('SIGTERM');
+        // Timeout — kill process tree
+        if (this.process?.pid && process.platform === 'win32') {
+            spawn('taskkill', ['/pid', String(this.process.pid), '/T', '/F'], {
+                stdio: 'ignore',
+            });
+        } else {
+            this.process?.kill('SIGTERM');
+        }
         const hint = this.stderrBuffer
             ? `\nLast stderr:\n${this.stderrBuffer.slice(-500)}`
             : '';
@@ -491,13 +532,46 @@ export class BackendManager {
     }
 
     private deleteCursorMcpEnv(): void {
-        try {
-            const envPath = path.join(this.workspacePath, '.memopilot', '.cursor-mcp-env');
-            if (fs.existsSync(envPath)) {
-                fs.unlinkSync(envPath);
+        const memopilotDir = path.join(this.workspacePath, '.memopilot');
+        for (const name of ['.cursor-mcp-env', '.mcp-env']) {
+            try {
+                const envPath = path.join(memopilotDir, name);
+                if (fs.existsSync(envPath)) {
+                    fs.unlinkSync(envPath);
+                }
+            } catch {
+                // Ignore cleanup errors
             }
+        }
+    }
+
+    private writeMcpEnv(memopilotDir: string): void {
+        try {
+            const envPath = path.join(memopilotDir, '.mcp-env');
+            const content = [
+                `MEMOPILOT_TOKEN=${this.token}`,
+                `MEMOPILOT_PORT=${this.port ?? ''}`,
+                `MEMOPILOT_WORKSPACE=${this.workspacePath}`,
+                '',
+            ].join('\n');
+            fs.writeFileSync(envPath, content, { mode: 0o600 });
+            this.ensureGitignoreEntry(memopilotDir, '.mcp-env');
         } catch {
-            // Ignore cleanup errors
+            // Non-critical
+        }
+    }
+
+    private cleanStaleDatabaseJournals(): void {
+        const dbDir = path.join(this.workspacePath, '.memopilot', 'memory');
+        for (const ext of ['-shm', '-wal', '-journal']) {
+            const journalPath = path.join(dbDir, `memopilot.db${ext}`);
+            try {
+                if (fs.existsSync(journalPath)) {
+                    fs.unlinkSync(journalPath);
+                }
+            } catch {
+                // May still be held briefly; next start will retry
+            }
         }
     }
 
@@ -514,6 +588,98 @@ export class BackendManager {
             }
         } catch {
             // Non-critical
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Auto-register MCP server for all supported clients
+    // ------------------------------------------------------------------
+
+    private registerGlobalMcpServers(pythonPath: string, agentCwd: string): void {
+        // The pythonPath from resolvePython() may be the workspace's Python (which
+        // lacks agent dependencies). For MCP config we need the Python that can
+        // actually run the agent — prefer the venv in the agent's parent tree.
+        const mcpPython = this.resolveMcpPython(pythonPath, agentCwd);
+        const entry = {
+            command: mcpPython,
+            args: ['-m', 'agent.mcp_server'],
+            cwd: agentCwd,
+            env: { PYTHONPATH: agentCwd },
+        };
+
+        const entryWithWorkspace = {
+            ...entry,
+            env: { ...entry.env, MEMOPILOT_WORKSPACE: this.workspacePath },
+        };
+
+        // Project-level: Claude Code extension, Cursor
+        this.writeMcpJsonFile(
+            path.join(this.workspacePath, '.mcp.json'),
+            entryWithWorkspace,
+            'project .mcp.json (Claude Code extension)',
+        );
+        this.writeMcpJsonFile(
+            path.join(this.workspacePath, '.cursor', 'mcp.json'),
+            entryWithWorkspace,
+            '.cursor/mcp.json (Cursor)',
+        );
+
+        // User-level: Claude Code CLI, Gemini CLI
+        this.writeMcpJsonFile(
+            path.join(os.homedir(), '.claude', '.mcp.json'),
+            entry,
+            '~/.claude/.mcp.json (Claude Code CLI)',
+        );
+        this.writeMcpJsonFile(
+            path.join(os.homedir(), '.gemini', 'settings.json'),
+            entry,
+            '~/.gemini/settings.json (Gemini CLI)',
+        );
+    }
+
+    private resolveMcpPython(fallback: string, agentCwd: string): string {
+        const isWindows = process.platform === 'win32';
+        const bin = isWindows ? 'Scripts' : 'bin';
+        const exe = isWindows ? 'python.exe' : 'python';
+
+        // Walk up from agentCwd to find a .venv with the right dependencies
+        let dir = agentCwd;
+        for (let i = 0; i < 5; i++) {
+            const candidate = path.join(dir, '.venv', bin, exe);
+            if (fs.existsSync(candidate)) {
+                return candidate;
+            }
+            const parent = path.dirname(dir);
+            if (parent === dir) break;
+            dir = parent;
+        }
+
+        return fallback;
+    }
+
+    private writeMcpJsonFile(
+        filePath: string,
+        entry: Record<string, unknown>,
+        label: string,
+    ): void {
+        try {
+            const dir = path.dirname(filePath);
+            if (!fs.existsSync(dir)) {
+                fs.mkdirSync(dir, { recursive: true });
+            }
+
+            let config: Record<string, unknown> = {};
+            if (fs.existsSync(filePath)) {
+                config = JSON.parse(fs.readFileSync(filePath, 'utf-8'));
+            }
+            if (!config.mcpServers || typeof config.mcpServers !== 'object') {
+                config.mcpServers = {};
+            }
+            (config.mcpServers as Record<string, unknown>).memopilot = entry;
+            fs.writeFileSync(filePath, JSON.stringify(config, null, 2) + '\n', 'utf-8');
+            this.outputChannel.appendLine(`[MemoPilot] Registered MCP server in ${label}`);
+        } catch (err) {
+            this.outputChannel.appendLine(`[MemoPilot] Failed to write ${label}: ${err}`);
         }
     }
 }
