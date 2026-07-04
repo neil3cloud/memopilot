@@ -213,6 +213,46 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         }
     };
 
+    const ingestSessions = async () => {
+        if (!backendClient) {
+            vscode.window.showWarningMessage('MemoPilot backend is not connected.');
+            return;
+        }
+
+        const sourceItems = [
+            { label: 'Auto-detect', value: 'auto', description: 'Pick the newest un-ingested session across all tools' },
+            { label: 'Claude Code', value: 'claude_code' },
+            { label: 'GitHub Copilot', value: 'copilot' },
+            { label: 'Cursor', value: 'cursor' },
+            { label: 'Gemini CLI', value: 'gemini_cli' },
+            { label: 'Codex CLI', value: 'codex_cli' },
+        ];
+        const picked = await vscode.window.showQuickPick(sourceItems, {
+            placeHolder: 'Select session source to ingest',
+        });
+        if (!picked) {
+            return;
+        }
+
+        try {
+            const result = await backendClient.ingestSession(picked.value);
+            if (result.outcome === 'ingested') {
+                vscode.window.showInformationMessage(
+                    `MemoPilot: Ingested session from ${result.source} — ${result.facts_written} fact(s) extracted (pending review).`,
+                );
+                memoryProvider?.refresh();
+            } else {
+                const reason = result.reason || 'No new sessions to ingest';
+                vscode.window.showInformationMessage(
+                    `MemoPilot: ${reason}.`,
+                );
+            }
+        } catch (err: unknown) {
+            const msg = err instanceof Error ? err.message : String(err);
+            vscode.window.showErrorMessage(`MemoPilot session ingest failed: ${msg}`);
+        }
+    };
+
     const switchLLMMode = async () => {
         if (!backendClient) {
             void vscode.window.showWarningMessage('MemoPilot backend is not connected.');
@@ -419,7 +459,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
                 backendClient.getLLMMode().catch(() => null),
             ]);
             statusProvider.updateProviderStatus(capabilities.items ?? []);
-            const hasProvider = (capabilities.items ?? []).some(c => c.healthy);
+            const hasProvider = (capabilities.items ?? []).length > 0;
             if (hasProvider || modeInfo?.copilot_available) {
                 void vscode.commands.executeCommand('setContext', 'memopilot.llmReady', true);
             }
@@ -1242,6 +1282,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         vscode.commands.registerCommand('memopilot.validateWorkspaceProfile', validateWorkspaceProfile),
         vscode.commands.registerCommand('memopilot.exportWorkspaceProfile', exportWorkspaceProfile),
         vscode.commands.registerCommand('memopilot.reviewMemory', reviewMemory),
+        vscode.commands.registerCommand('memopilot.ingestSessions', ingestSessions),
         vscode.commands.registerCommand('memopilot.approveMemoryItem', approveMemoryItem),
         vscode.commands.registerCommand('memopilot.rejectMemoryItem', rejectMemoryItem),
         vscode.commands.registerCommand('memopilot.bulkApproveMemory', bulkApproveMemory),

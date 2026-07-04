@@ -20,6 +20,7 @@ ENDPOINT_STATUS: dict[str, str] = {
     "GET /v1/policies/active": "real",
     "GET /v1/cost/dashboard": "real",
     "GET /v1/mcp/tools": "real",
+    "POST /v1/session/ingest": "real",
     # Memory
     "POST /v1/memory/recall": "real",
     "POST /v1/memory/writeback": "real",

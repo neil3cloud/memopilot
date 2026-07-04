@@ -1,7 +1,8 @@
 """Standalone MCP server implementing the Model Context Protocol for MemoPilot.
 
 Exposes retrieval-first tools over stdio JSON-RPC:
-    memopilot-search, memopilot-symbols, memopilot-memory, memopilot-profile
+    memopilot-search, memopilot-symbols, memopilot-memory, memopilot-profile,
+    memopilot-ingest-session
 
 Works with any MCP-compatible client:
     - Claude Code (VS Code extension)
@@ -84,6 +85,25 @@ _TOOL_SCHEMAS = [
         "inputSchema": {
             "type": "object",
             "properties": {
+                **_WORKSPACE_PROP,
+            },
+        },
+    },
+    {
+        "name": "memopilot-ingest-session",
+        "description": "Ingest a recent AI coding session transcript into MemoPilot memory.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "source": {
+                    "type": "string",
+                    "default": "auto",
+                    "description": "claude_code|copilot|cursor|gemini_cli|codex_cli|auto",
+                },
+                "session_id": {
+                    "type": "string",
+                    "default": "latest",
+                },
                 **_WORKSPACE_PROP,
             },
         },
@@ -371,6 +391,8 @@ class MCPServer:
             return await self._handle_memopilot_memory(args)
         if tool_name == "memopilot-profile":
             return await self._handle_memopilot_profile()
+        if tool_name == "memopilot-ingest-session":
+            return await self._handle_memopilot_ingest_session(args)
         raise ValueError(f"Unknown tool: {tool_name}")
 
     def _set_workspace(self, workspace: Path) -> None:
@@ -482,6 +504,32 @@ class MCPServer:
         if not profile_yaml:
             return "## MemoPilot Workspace Profile\n\nNo workspace profile is available.\n"
         return f"## MemoPilot Workspace Profile\n\n```yaml\n{profile_yaml.strip()}\n```"
+
+    async def _handle_memopilot_ingest_session(self, args: dict[str, Any]) -> str:
+        result = await self._backend_request(
+            "POST",
+            "/v1/session/ingest",
+            {
+                "source": args.get("source", "auto"),
+                "session_id": args.get("session_id", "latest"),
+            },
+        )
+        lines = ["## Session Ingest"]
+        lines.append("")
+        lines.append(f"- Source: {result.get('source', 'unknown')}")
+        lines.append(f"- Session: {result.get('session_id', 'unknown')}")
+        lines.append(f"- Facts written: {result.get('facts_written', 0)}")
+        lines.append(f"- Outcome: {result.get('outcome', 'unknown')}")
+        reason = result.get("reason", "")
+        if reason:
+            lines.append(f"- Reason: {reason}")
+        memory_ids = result.get("memory_item_ids", [])
+        if isinstance(memory_ids, list) and memory_ids:
+            lines.append("")
+            lines.append("Memory items:")
+            for item in memory_ids[:20]:
+                lines.append(f"- {item}")
+        return "\n".join(lines)
 
     # ------------------------------------------------------------------
     # JSON-RPC helpers

@@ -68,6 +68,7 @@ from .repo_map_generator import RepoMapGenerator
 from .response_cache import ResponseCacheService
 from .retention import enforce_retention
 from .security_policy import CredentialRedactor, DatabaseWriteBlocker
+from .session_ingest import IngestOutcome, SessionIngestService
 from .skill_loader import SkillLoaderService
 from .symbol_ranker import rank_symbols_for_task
 from .symbol_source import build_skeleton_line, read_symbol_source
@@ -1462,6 +1463,25 @@ class ActivateWorkspaceRootRequest(BaseModel):
     workspace_id: str | None = None
     root_path: str | None = None
     workspace_root: str | None = None
+
+
+class SessionIngestRequest(BaseModel):
+    source: str = Field(
+        default="auto",
+        pattern=r"^(claude_code|copilot|cursor|gemini_cli|codex_cli|auto)$",
+    )
+    session_id: str = "latest"
+    workspace_root: str | None = None
+
+
+class SessionIngestResponse(BaseModel):
+    session_id: str
+    source: str
+    facts_written: int
+    already_ingested: bool
+    outcome: IngestOutcome = "ingested"
+    reason: str = ""
+    memory_item_ids: list[str] = Field(default_factory=list)
 
 
 def configure(config: Config, db: DatabaseManager) -> None:
@@ -3625,6 +3645,7 @@ async def list_mcp_tools() -> dict:
         "memopilot-symbols",
         "memopilot-memory",
         "memopilot-profile",
+        "memopilot-ingest-session",
     ]
 
     for mcp_config_path in mcp_config_paths:
@@ -3672,6 +3693,39 @@ async def list_mcp_tools() -> dict:
     )
 
     return {"servers": servers}
+
+
+@app.post("/v1/session/ingest", response_model=SessionIngestResponse)
+async def ingest_external_session(request: SessionIngestRequest) -> SessionIngestResponse:
+    client = _get_session_writeback_client()
+    if client is None:
+        raise HTTPException(status_code=503, detail="No LLM client available")
+
+    workspace_root = request.workspace_root
+    if workspace_root:
+        workspace_service = WorkspaceRootsService(config=_get_config(), db=_get_db())
+        workspace_root = str(await workspace_service.resolve_workspace_root(workspace_root))
+
+    service = SessionIngestService(config=_get_config(), db=_get_db())
+    try:
+        result = await service.ingest_session(
+            source=request.source,
+            session_id=request.session_id,
+            client=client,
+            workspace_root=workspace_root,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    return SessionIngestResponse(
+        session_id=result.session_id,
+        source=result.source,
+        facts_written=result.facts_written,
+        already_ingested=result.already_ingested,
+        outcome=result.outcome,
+        reason=result.reason,
+        memory_item_ids=result.memory_item_ids,
+    )
 
 
 @app.post("/v1/mcp/agentic/run", response_model=AgenticRunResponse)

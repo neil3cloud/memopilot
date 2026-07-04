@@ -85,6 +85,16 @@ export interface SuggestMemoryResponse {
     pending_approval: boolean;
 }
 
+export interface SessionIngestResponse {
+    session_id: string;
+    source: string;
+    facts_written: number;
+    already_ingested: boolean;
+    outcome: 'ingested' | 'already_ingested' | 'no_sessions' | 'no_affinity';
+    reason: string;
+    memory_item_ids: string[];
+}
+
 export interface PrivacyRecentCloudCallResponse {
     provider: string;
     model: string;
@@ -499,6 +509,14 @@ export class BackendClient {
 
     async rebuildMemoryItem(itemId: string): Promise<void> {
         await this.manager.request('POST', `/v1/memory/items/${encodeURIComponent(itemId)}/rebuild`);
+    }
+
+    async ingestSession(source = 'auto', sessionId = 'latest'): Promise<SessionIngestResponse> {
+        const result = await this.manager.request('POST', '/v1/session/ingest', {
+            source,
+            session_id: sessionId,
+        });
+        return result as SessionIngestResponse;
     }
 
     async suggestMemoryUpdate(title: string, body: string): Promise<SuggestMemoryResponse> {

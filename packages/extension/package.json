@@ -160,6 +160,10 @@
         "title": "MemoPilot: Open Panel"
       },
       {
+        "command": "memopilot.ingestSessions",
+        "title": "MemoPilot: Ingest AI Sessions"
+      },
+      {
         "command": "memopilot.refreshMemoryReviewQueue",
         "title": "MemoPilot: Refresh Memory Review Queue",
         "icon": "$(refresh)"
