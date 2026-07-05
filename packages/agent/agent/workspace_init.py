@@ -167,11 +167,17 @@ def _upsert_managed_markdown(path: Path, managed_body: str) -> None:
     if _MARKER_START in content and _MARKER_END in content:
         start = content.index(_MARKER_START)
         end = content.index(_MARKER_END) + len(_MARKER_END)
-        updated = content[:start] + managed_block + content[end:]
+        # Keep the managed block replacement idempotent: collapse any leading
+        # blank lines after the managed block boundary so repeated bootstrap
+        # runs do not append one extra trailing blank line each time.
+        tail = content[end:]
+        tail = tail.lstrip("\r\n")
+        updated = content[:start] + managed_block + tail
     else:
         separator = "\n\n" if content.strip() else ""
         updated = content.rstrip() + separator + managed_block
-    path.write_text(updated, encoding="utf-8")
+    if updated != content:
+        path.write_text(updated, encoding="utf-8")
 
 
 def _render_retrieval_first_instructions(

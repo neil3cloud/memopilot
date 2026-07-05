@@ -1,6 +1,6 @@
 # MemoPilot: Master Product and Implementation Reference
 
-**Document Version:** 3.0 (Retry/Backoff Hardening + Multi-Provider Expansion + Documentation Update) **Target Product:** MemoPilot — Local-Memory, Rule-Aware Context System for VS Code/Cursor **Status:** Production Reference — Retrieval-First Default Surface Live
+**Document Version:** 3.1 (Retry/Backoff Hardening + Multi-Provider Expansion + Content-Aware Context Truncation + Documentation Update) **Target Product:** MemoPilot — Local-Memory, Rule-Aware Context System for VS Code/Cursor **Status:** Production Reference — Retrieval-First Default Surface Live
 
 ---
 
@@ -40,6 +40,7 @@
 32. [Workflow Intelligence + UI Redesign (v2.6)](#32-workflow-intelligence--ui-redesign-v26--june-2026)
 33. [LLM Integration + Provider Wiring + Pipeline Fixes (v2.7)](#33-llm-integration--provider-wiring--pipeline-fixes-v27--june-2026)
 34. [LLM Provider Retry/Backoff Hardening and Multi-Provider Expansion (v2.9)](#34-llm-provider-retrybackoff-hardening-and-multi-provider-expansion-v29--july-2026)
+35. [Content-Aware Context Truncation (v3.0)](#35-content-aware-context-truncation-v30--july-2026)
 
 ---
 
@@ -4698,3 +4699,111 @@ This phase resolved three critical hardening gaps in LLM provider integration:
 6. ✅ **Deprecation Elimination** — Migrated FastAPI from deprecated `@app.on_event()` to lifespan handler
 
 All changes are backward compatible, fully tested, and production-ready.
+
+---
+
+## 35. Content-Aware Context Truncation (v3.0 — July 2026)
+
+### 35.1 Overview
+
+This phase replaced the flat, character-count truncation used whenever a context item exceeds its tier's token budget with content-type-aware compaction, and added a new context-quality signal so future changes to truncation behavior can be measured rather than assumed. The motivation: a raw `content[:max_chars]` slice can cut a source file mid-function, a class mid-method, or a stack trace before the actual exception message — destroying signal at an arbitrary point rather than a meaningful one, on a routine code path (every context item that doesn't fit its tier's token cap goes through this, not an edge case).
+
+**Outcome:** Truncated code context now preferentially ends at a clean function/class boundary instead of mid-body; stack traces preserve both the failing call site (head) and the exception message (tail) instead of an arbitrary prefix; and `context_quality_scorer` can now detect and warn when truncation is landing mid-declaration, closing a gap where the existing quality scorer had no way to observe content-level truncation quality at all.
+
+### 35.2 Changes Delivered
+
+#### Backend — `context_budget.py` (Truncation Strategy)
+
+**Feature: Universal Line-Boundary Truncation**
+- `_truncate_at_line_boundary()` replaces the previous raw `content[:max_chars]` slice as the baseline for every content type — snaps to the last full line at or before the character limit, so no item ever ends mid-line.
+
+**Feature: Declaration-Boundary Truncation for Code**
+- `_truncate_at_declaration_boundary()` applies to `source_type in {"file", "symbol", "symbol_skeleton"}` — cuts before the last declaration that would otherwise be sliced mid-body, preferring a clean boundary over an arbitrary line.
+- Regex (`_DECLARATION_BOUNDARY_RE`) matches top-level and indented forms: `def`, `async def`, `class` (Python); `function`, `async function`, `export function`, `export async function`, `export default function`, `export class`, `export default class` (JS/TS).
+- Decorator lookback (`_DECORATOR_RE`): when the excluded declaration is preceded by `@decorator` lines, the cut point moves back before those lines too, so a decorator is never stranded without the declaration it decorates.
+- Falls back to plain line-boundary truncation if no declaration boundary is found within 60% of the allowed budget (`_DECLARATION_BOUNDARY_MIN_KEEP_RATIO`) — avoids discarding too much content just to land on a function edge.
+
+**Feature: Head/Tail Truncation for Stack Traces**
+- `_truncate_head_tail()` applies to `source_type == "stack_trace"` — keeps both the start and end of the content, dropping the middle, mirroring the existing head/tail pattern in `context_synthesizer.build_synthesis_user_prompt`. The exception message is usually at the tail of a traceback; a plain prefix cut would lose it.
+
+**Feature: Truncation Instrumentation**
+- `ContextItem` gained `truncated: bool` and `truncation_boundary: str` (`"none" | "line" | "declaration" | "head_tail"`), set by `_fit_item_to_budget`.
+- Each truncation event logs `source_type`, `tier`, `tokens_before`, `tokens_after`, and `boundary_used` via `logger.debug`.
+- New `compute_mid_declaration_truncation_pct(items)` — fraction of truncated code items that fell back to a plain line cut instead of a clean declaration boundary; the risk signal that a code item was likely cut mid-function/class.
+
+**Bug Fix: Type-Narrowing in `_coerce_candidate`**
+- Added `_coerce_int()`/`_coerce_float()` helpers so values pulled from an untyped `Mapping[str, object]` payload (`tokens`, `relevance_score`, `trust_level`) are properly narrowed before numeric conversion, resolving static type-checker diagnostics without changing runtime behavior.
+
+**Files Modified**
+- [packages/agent/agent/context_budget.py](packages/agent/agent/context_budget.py)
+  - New: `_truncate_at_line_boundary()`, `_truncate_at_declaration_boundary()`, `_truncate_head_tail()`, `compute_mid_declaration_truncation_pct()`, `_coerce_int()`, `_coerce_float()`
+  - Updated: `ContextItem` (added `truncated`, `truncation_boundary`), `_fit_item_to_budget()`, `_coerce_candidate()`
+
+#### Backend — `context_quality_scorer.py` (New Quality Signal)
+
+**Feature: Mid-Declaration Truncation Risk Signal**
+- `ContextPackSnapshot` and `ContextQualityScore` both gained `mid_declaration_truncation_pct: float` (0.0–1.0).
+- Surfaced as a `missing_signals` warning when above 30% (same threshold pattern as the existing stale-exclusion warning): *"N% of truncated code context was cut mid-function/class — consider a larger token budget or narrowing files_in_focus"*.
+- Deliberately **does not** alter the weighted `total` score — same informational treatment as the existing `dedup_savings_pct`/`graph_expansion_files` fields. Redistributing the fixed 0.25/0.20/0.20/0.15/0.10/0.10 scoring weights to make this move the verdict was judged a product decision outside this change's scope.
+
+**Files Modified**
+- [packages/agent/agent/context_quality_scorer.py](packages/agent/agent/context_quality_scorer.py)
+  - Updated: `ContextPackSnapshot`, `ContextQualityScore`, `score_context_pack()`
+
+#### Backend — `api.py` (Wiring)
+
+**Feature: Signal Propagation**
+- `compute_mid_declaration_truncation_pct(included_items)` wired into the `ContextPackSnapshot` built in `_generate_context_pack_response`.
+- `ContextQualityScoreResponse` gained `mid_declaration_truncation_pct: float = 0.0`.
+- `_serialize_context_item()` now includes `truncated`/`truncation_boundary` in its output for debuggability.
+
+**Files Modified**
+- [packages/agent/agent/api.py](packages/agent/agent/api.py)
+  - Updated: `ContextQualityScoreResponse`, `_generate_context_pack_response()`, `_serialize_context_item()`
+
+#### Tests (38 New/Updated Tests)
+
+**Test Coverage: Truncation Helpers**
+- Line-boundary, declaration-boundary (top-level, indented methods, `async def`, decorator lookback, JS `export default function`), and head/tail truncation — each tested directly and end-to-end through `build_budget_aware_context_pack`.
+- Direct regex-matrix test (`test_declaration_boundary_regex_matches_common_forms`) covering all supported and intentionally-unsupported declaration forms.
+
+**Test Coverage: Quality Signal**
+- `compute_mid_declaration_truncation_pct()` — empty when nothing truncated, ignores non-code source types, correctly counts fallback vs. clean cuts.
+- `ContextQualityScore.mid_declaration_truncation_pct` flows through, warns above 30%, silent below, and does not change the weighted `total` score.
+
+**Files Modified**
+- [packages/agent/tests/test_context_builder_budget.py](packages/agent/tests/test_context_builder_budget.py)
+- [packages/agent/tests/test_context_quality_scorer.py](packages/agent/tests/test_context_quality_scorer.py)
+
+### 35.3 What Was Explicitly Not Built
+
+Scoped deliberately against Headroom's more general content-router architecture (deterministic transforms, never LLM calls — same principle kept here):
+
+- No pluggable named-strategy registry, no `CompressionCache`, no CCR/reversible-retrieval (`headroom_retrieve`-equivalent tool) — MemoPilot's tool-result flow ends once Copilot consumes the returned markdown; there's no retrieval-call path back into MemoPilot to make reversibility meaningful without a separate, larger feature.
+- No AST-based parsing per language — regex line-prefix detection only.
+- No new `source_type` values (no diff/log/tabular ingestion — those extraction paths don't exist in MemoPilot today).
+- Output-token reduction (verbosity steering on MemoPilot's own LLM-initiated calls) and a full compression-strategy router were evaluated but deferred pending instrumentation data — see the context-budget instrumentation added here as the prerequisite for that future decision.
+
+### 35.4 Validation
+
+**Code Quality**
+- ✅ All 38 tests in `test_context_builder_budget.py` + `test_context_quality_scorer.py` pass
+- ✅ Full backend suite: 492 passed, same 12 pre-existing failures (unrelated, confirmed via git-stash comparison against the base branch — identical failing set before and after this change)
+- ✅ Static type-narrowing diagnostics in `_coerce_candidate` resolved
+
+**Functional Verification**
+- ✅ Declaration-boundary truncation verified to never end mid-function/mid-class on Python and JS/TS samples, including indented methods, `async def`, and decorated declarations
+- ✅ Head/tail truncation verified to preserve both the traceback start and the exception message
+- ✅ `mid_declaration_truncation_pct` verified to flow from `context_budget.py` → `context_quality_scorer.py` → `api.py` response models without affecting the existing weighted quality score
+
+### 35.5 Summary
+
+This phase closed a real accuracy gap in context assembly: truncation previously destroyed content at an arbitrary character offset regardless of what that content was. It now:
+
+1. ✅ **Never splits a line** — universal line-boundary fallback for every content type
+2. ✅ **Preserves whole functions/classes where possible** — declaration-boundary truncation for code, with decorator-aware cutting
+3. ✅ **Preserves both ends of a stack trace** — head/tail truncation keeps the failing call site and the exception message
+4. ✅ **Makes the improvement measurable, not just assumed** — new `mid_declaration_truncation_pct` signal in `context_quality_scorer`, since the existing scorer had no way to detect content-level truncation quality at all
+5. ✅ **Fixed a pre-existing type-safety gap** in `_coerce_candidate` while touching the same module
+
+All changes are backward compatible (new `ContextItem`/`ContextPackSnapshot` fields default to their prior implicit values), fully tested, and scoped to avoid speculative architecture MemoPilot's current request/response model can't actually support.
