@@ -85,6 +85,16 @@ export interface SuggestMemoryResponse {
     pending_approval: boolean;
 }
 
+export interface SessionIngestResponse {
+    session_id: string;
+    source: string;
+    facts_written: number;
+    already_ingested: boolean;
+    outcome: 'ingested' | 'already_ingested' | 'no_sessions' | 'no_affinity';
+    reason: string;
+    memory_item_ids: string[];
+}
+
 export interface PrivacyRecentCloudCallResponse {
     provider: string;
     model: string;
@@ -264,6 +274,16 @@ export interface ProviderCapabilityItemResponse {
 
 export interface ProviderCapabilitiesResponse {
     items: ProviderCapabilityItemResponse[];
+}
+
+export interface LLMModeResponse {
+    mode: string;
+    model_id: string;
+    copilot_available: boolean;
+    cloud_available: boolean;
+    local_available: boolean;
+    provider: string;
+    provider_model_id: string;
 }
 
 export interface LocalModelItem {
@@ -501,6 +521,14 @@ export class BackendClient {
         await this.manager.request('POST', `/v1/memory/items/${encodeURIComponent(itemId)}/rebuild`);
     }
 
+    async ingestSession(source = 'auto', sessionId = 'latest'): Promise<SessionIngestResponse> {
+        const result = await this.manager.request('POST', '/v1/session/ingest', {
+            source,
+            session_id: sessionId,
+        });
+        return result as SessionIngestResponse;
+    }
+
     async suggestMemoryUpdate(title: string, body: string): Promise<SuggestMemoryResponse> {
         const result = await this.manager.request('POST', '/v1/memory/suggestions', {
             title,
@@ -607,9 +635,9 @@ export class BackendClient {
         return result as ProviderCapabilitiesResponse;
     }
 
-    async getLLMMode(): Promise<{ mode: string; model_id: string; copilot_available: boolean; cloud_available: boolean; local_available: boolean }> {
+    async getLLMMode(): Promise<LLMModeResponse> {
         const result = await this.manager.request('GET', '/v1/config/llm-mode');
-        return result as { mode: string; model_id: string; copilot_available: boolean; cloud_available: boolean; local_available: boolean };
+        return result as LLMModeResponse;
     }
 
     async setLLMMode(mode: string): Promise<{ ok: boolean; mode: string }> {

@@ -12,8 +12,8 @@ from agent.mcp_server import MCPServer, _TOOL_SCHEMAS
 
 
 class TestToolSchemas:
-    def test_four_tools_defined(self):
-        assert len(_TOOL_SCHEMAS) == 4
+    def test_five_tools_defined(self):
+        assert len(_TOOL_SCHEMAS) == 5
 
     def test_all_tools_have_required_fields(self):
         for tool in _TOOL_SCHEMAS:
@@ -33,6 +33,7 @@ class TestToolSchemas:
             "memopilot-symbols",
             "memopilot-memory",
             "memopilot-profile",
+            "memopilot-ingest-session",
         ):
             assert expected in names
 
@@ -52,7 +53,7 @@ class TestMCPServerDispatch:
     async def test_tools_list_response(self):
         req = {"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}}
         resp = await self.server._handle(req)
-        assert len(resp["result"]["tools"]) == 4
+        assert len(resp["result"]["tools"]) == 5
 
     @pytest.mark.asyncio
     async def test_unknown_method_returns_error(self):
@@ -178,3 +179,46 @@ class TestMemopilotSearchHandler:
 
         assert "MemoPilot Workspace Profile" in result
         assert "primary_language: python" in result
+
+    @pytest.mark.asyncio
+    async def test_ingest_session_renders_summary(self):
+        async def mock_backend(method, path, body=None):
+            assert method == "POST"
+            assert path == "/v1/session/ingest"
+            assert body == {"source": "auto", "session_id": "latest"}
+            return {
+                "session_id": "abc",
+                "source": "copilot",
+                "facts_written": 2,
+                "already_ingested": False,
+                "outcome": "ingested",
+                "reason": "",
+                "memory_item_ids": ["m1", "m2"],
+            }
+
+        with patch.object(self.server, "_backend_request", side_effect=mock_backend):
+            result = await self.server._handle_memopilot_ingest_session({})
+
+        assert "Session Ingest" in result
+        assert "Source: copilot" in result
+        assert "Facts written: 2" in result
+        assert "Outcome: ingested" in result
+
+    @pytest.mark.asyncio
+    async def test_ingest_session_renders_reason_when_present(self):
+        async def mock_backend(method, path, body=None):
+            return {
+                "session_id": "",
+                "source": "auto",
+                "facts_written": 0,
+                "already_ingested": False,
+                "outcome": "no_affinity",
+                "reason": "No sessions matched this workspace (no file path overlap)",
+                "memory_item_ids": [],
+            }
+
+        with patch.object(self.server, "_backend_request", side_effect=mock_backend):
+            result = await self.server._handle_memopilot_ingest_session({})
+
+        assert "Outcome: no_affinity" in result
+        assert "Reason: No sessions matched this workspace" in result

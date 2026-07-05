@@ -96,6 +96,8 @@ export class BackendManager {
                     ? {
                         OPENAI_API_KEY: await context.secrets.get('memopilot.openaiApiKey') ?? '',
                         ANTHROPIC_API_KEY: await context.secrets.get('memopilot.anthropicApiKey') ?? '',
+                        MEMOPILOT_GOOGLE_KEY: await context.secrets.get('memopilot.googleApiKey') ?? '',
+                        MEMOPILOT_OPENROUTER_KEY: await context.secrets.get('memopilot.openrouterApiKey') ?? '',
                         MEMOPILOT_OLLAMA_URL: vscode.workspace.getConfiguration('memopilot').get<string>('ollamaUrl', 'http://localhost:11434'),
                     }
                     : {}),

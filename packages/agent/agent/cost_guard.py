@@ -493,9 +493,12 @@ def infer_selected_tier(
         return "frontier"
     if any(local_marker in normalized_model for local_marker in ("llama", "mistral", "ollama")):
         return "local"
-    if "mini" in normalized_model:
+    if "mini" in normalized_model or "flash" in normalized_model:
         return "cheap_cloud"
-    if any(marker in normalized_model for marker in ("gpt-4", "gpt-5", "claude", "sonnet", "opus", "frontier")):
+    if any(
+        marker in normalized_model
+        for marker in ("gpt-4", "gpt-5", "claude", "sonnet", "opus", "frontier", "gemini-1.5-pro", "gemini-2.0-pro", "gemini-2.5-pro")
+    ):
         return "frontier"
     return "cheap_cloud"
 

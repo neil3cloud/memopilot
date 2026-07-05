@@ -15,6 +15,11 @@ import { McpToolsTreeProvider } from './views/McpToolsTreeProvider';
 import { MemoPilotPanel } from './panels/MemoPilotPanel';
 import { SynthesisHostClient } from './SynthesisHostClient';
 
+// Cloud provider key fields that must never be persisted in plaintext to config.yaml —
+// keys live only in SecretStorage. Used to scrub stale on-disk values whenever we write
+// provider config, so an older plaintext key can't silently keep being used.
+const PROVIDER_KEY_FIELDS = ['anthropic_api_key', 'openai_api_key', 'google_api_key', 'openrouter_api_key'];
+
 let backendManager: BackendManager | undefined;
 let backendClient: BackendClient | undefined;
 let synthesisHostClient: SynthesisHostClient | undefined;
@@ -210,6 +215,46 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         } catch (err: unknown) {
             const msg = err instanceof Error ? err.message : String(err);
             vscode.window.showErrorMessage(`MemoPilot memory rebuild failed: ${msg}`);
+        }
+    };
+
+    const ingestSessions = async () => {
+        if (!backendClient) {
+            vscode.window.showWarningMessage('MemoPilot backend is not connected.');
+            return;
+        }
+
+        const sourceItems = [
+            { label: 'Auto-detect', value: 'auto', description: 'Pick the newest un-ingested session across all tools' },
+            { label: 'Claude Code', value: 'claude_code' },
+            { label: 'GitHub Copilot', value: 'copilot' },
+            { label: 'Cursor', value: 'cursor' },
+            { label: 'Gemini CLI', value: 'gemini_cli' },
+            { label: 'Codex CLI', value: 'codex_cli' },
+        ];
+        const picked = await vscode.window.showQuickPick(sourceItems, {
+            placeHolder: 'Select session source to ingest',
+        });
+        if (!picked) {
+            return;
+        }
+
+        try {
+            const result = await backendClient.ingestSession(picked.value);
+            if (result.outcome === 'ingested') {
+                vscode.window.showInformationMessage(
+                    `MemoPilot: Ingested session from ${result.source} — ${result.facts_written} fact(s) extracted (pending review).`,
+                );
+                memoryProvider?.refresh();
+            } else {
+                const reason = result.reason || 'No new sessions to ingest';
+                vscode.window.showInformationMessage(
+                    `MemoPilot: ${reason}.`,
+                );
+            }
+        } catch (err: unknown) {
+            const msg = err instanceof Error ? err.message : String(err);
+            vscode.window.showErrorMessage(`MemoPilot session ingest failed: ${msg}`);
         }
     };
 
@@ -419,12 +464,18 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
                 backendClient.getLLMMode().catch(() => null),
             ]);
             statusProvider.updateProviderStatus(capabilities.items ?? []);
-            const hasProvider = (capabilities.items ?? []).some(c => c.healthy);
-            if (hasProvider || modeInfo?.copilot_available) {
+            const hasProvider = (capabilities.items ?? []).length > 0;
+            if (hasProvider || modeInfo?.copilot_available || modeInfo?.cloud_available) {
                 void vscode.commands.executeCommand('setContext', 'memopilot.llmReady', true);
             }
             if (modeInfo) {
-                statusProvider.updateLLMMode(modeInfo.mode, modeInfo.model_id, modeInfo.copilot_available);
+                statusProvider.updateLLMMode(
+                    modeInfo.mode,
+                    modeInfo.model_id,
+                    modeInfo.copilot_available,
+                    modeInfo.cloud_available ? modeInfo.provider : '',
+                    modeInfo.provider_model_id,
+                );
                 context.globalState.update('memopilot.llmMode', modeInfo.mode);
                 context.globalState.update('memopilot.llmModeModelId', modeInfo.model_id);
                 context.globalState.update('memopilot.copilotAvailable', modeInfo.copilot_available);
@@ -889,13 +940,20 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
                 [
                     { label: 'Anthropic', description: 'claude-haiku-4-5 (recommended)', value: 'anthropic' as const },
                     { label: 'OpenAI', description: 'gpt-4o-mini', value: 'openai' as const },
+                    { label: 'Google AI Studio', description: 'gemini-2.0-flash', value: 'google' as const },
+                    { label: 'OpenRouter', description: 'deepseek/deepseek-chat-v3-0324:free (and other free models)', value: 'openrouter' as const },
                 ],
                 { title: 'Cloud model provider for LLM touch points' },
             );
             if (!provider) { return; }
 
-            const keyName = provider.value === 'openai' ? 'memopilot.openaiApiKey' : 'memopilot.anthropicApiKey';
-            const placeholder = provider.value === 'openai' ? 'sk-...' : 'sk-ant-...';
+            const providerKeyInfo: Record<string, { keyName: string; placeholder: string }> = {
+                openai: { keyName: 'memopilot.openaiApiKey', placeholder: 'sk-...' },
+                anthropic: { keyName: 'memopilot.anthropicApiKey', placeholder: 'sk-ant-...' },
+                google: { keyName: 'memopilot.googleApiKey', placeholder: 'AIza...' },
+                openrouter: { keyName: 'memopilot.openrouterApiKey', placeholder: 'sk-or-v1-...' },
+            };
+            const { keyName, placeholder } = providerKeyInfo[provider.value];
             const apiKey = await vscode.window.showInputBox({
                 title: `${provider.label} API key`,
                 prompt: 'Stored securely in SecretStorage — used only for summarization, synthesis, writeback, and profile inference',
@@ -906,6 +964,30 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
             if (!apiKey) { return; }
 
             await extensionContext.secrets.store(keyName, apiKey);
+
+            // Point the backend at this provider (the key alone doesn't select it — see local-model branch above for the same pattern)
+            const cloudWorkspaceFolder = vscode.workspace.workspaceFolders?.[0];
+            if (cloudWorkspaceFolder) {
+                const configDir = vscode.Uri.joinPath(cloudWorkspaceFolder.uri, '.memopilot');
+                const configFile = vscode.Uri.joinPath(configDir, 'config.yaml');
+                let existing = '';
+                try {
+                    existing = Buffer.from(await vscode.workspace.fs.readFile(configFile)).toString('utf8');
+                } catch { /* file doesn't exist yet */ }
+                const update = (yaml: string, key: string, value: string): string => {
+                    const re = new RegExp(`^(\\s*#\\s*)?${key}:.*$`, 'm');
+                    const line = `${key}: ${value}`;
+                    return re.test(yaml) ? yaml.replace(re, line) : yaml + `\n${line}`;
+                };
+                let yaml = existing || '# MemoPilot provider config — do not commit\n';
+                for (const field of PROVIDER_KEY_FIELDS) {
+                    yaml = yaml.replace(new RegExp(`^${field}:.*\\n?`, 'm'), '');
+                }
+                yaml = update(yaml, 'provider', provider.value);
+                await vscode.workspace.fs.createDirectory(configDir);
+                await vscode.workspace.fs.writeFile(configFile, Buffer.from(yaml, 'utf8'));
+            }
+
             const action = await vscode.window.showInformationMessage(
                 `${provider.label} API key saved. Restart MemoPilot backend to apply.`,
                 'Restart Now',
@@ -1242,6 +1324,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         vscode.commands.registerCommand('memopilot.validateWorkspaceProfile', validateWorkspaceProfile),
         vscode.commands.registerCommand('memopilot.exportWorkspaceProfile', exportWorkspaceProfile),
         vscode.commands.registerCommand('memopilot.reviewMemory', reviewMemory),
+        vscode.commands.registerCommand('memopilot.ingestSessions', ingestSessions),
         vscode.commands.registerCommand('memopilot.approveMemoryItem', approveMemoryItem),
         vscode.commands.registerCommand('memopilot.rejectMemoryItem', rejectMemoryItem),
         vscode.commands.registerCommand('memopilot.bulkApproveMemory', bulkApproveMemory),
@@ -1267,7 +1350,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
             await vscode.commands.executeCommand('memopilot.indexWorkspace');
         }),
         vscode.commands.registerCommand('memopilot.showPanel', () => {
-            MemoPilotPanel.createOrShow(context.extensionUri, backendClient);
+            MemoPilotPanel.createOrShow(context.extensionUri, backendClient, context);
         }),
         vscode.commands.registerCommand('memopilot.restartBackend', async () => {
             await restartBackendNow();

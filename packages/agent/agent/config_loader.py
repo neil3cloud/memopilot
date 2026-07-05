@@ -21,21 +21,29 @@ _ENV_MAP = {
     "MEMOPILOT_PROVIDER": "provider",
     "MEMOPILOT_ANTHROPIC_KEY": "anthropic_api_key",
     "MEMOPILOT_OPENAI_KEY": "openai_api_key",
+    "MEMOPILOT_GOOGLE_KEY": "google_api_key",
+    "MEMOPILOT_OPENROUTER_KEY": "openrouter_api_key",
     "MEMOPILOT_ANTHROPIC_MODEL": "anthropic_model",
     "MEMOPILOT_OPENAI_MODEL": "openai_model",
+    "MEMOPILOT_GOOGLE_MODEL": "google_model",
+    "MEMOPILOT_OPENROUTER_MODEL": "openrouter_model",
     "MEMOPILOT_OLLAMA_MODEL": "ollama_model",
     "MEMOPILOT_OLLAMA_URL": "ollama_base_url",
     "MEMOPILOT_LMSTUDIO_URL": "lmstudio_base_url",
     "MEMOPILOT_LOCAL_URL": "local_url",
     "MEMOPILOT_LOCAL_MODEL": "local_model",
     "MEMOPILOT_BUDGET_PROFILE": "budget_profile",
+    "MEMOPILOT_RETRY_ENABLED": "retry_enabled",
+    "MEMOPILOT_RETRY_MAX_ATTEMPTS": "retry_max_attempts",
+    "MEMOPILOT_RETRY_BASE_DELAY_SECONDS": "retry_base_delay_seconds",
+    "MEMOPILOT_RETRY_MAX_DELAY_SECONDS": "retry_max_delay_seconds",
 }
 
 _TEMPLATE = """\
 # .memopilot/config.yaml — GITIGNORED — do not commit API keys
 
 # provider: local        # Uncomment and set to use a local model server instead of GitHub Copilot
-#                        # Options: local | anthropic | openai
+#                        # Options: local | anthropic | openai | google | openrouter
 budget_profile: cost_saver   # cost_saver | balanced | strict_local | max_accuracy
 
 # Local AI — any OpenAI-compatible server (Ollama, LM Studio, vLLM, OpenVINO, llama.cpp, etc.)
@@ -47,6 +55,17 @@ budget_profile: cost_saver   # cost_saver | balanced | strict_local | max_accura
 # anthropic_model: claude-haiku-4-5
 # openai_api_key: sk-...
 # openai_model: gpt-4o-mini
+# google_api_key: AIza...
+# google_model: gemini-2.0-flash
+# openrouter_api_key: sk-or-v1-...
+# openrouter_model: deepseek/deepseek-chat-v3-0324:free
+
+# Retry/backoff for cloud providers
+# retry_enabled: true
+# retry_max_attempts: 3
+# retry_base_delay_seconds: 1.0
+# retry_max_delay_seconds: 60.0
+# openrouter_retry_base_delay_seconds: 5
 """
 
 _DEFAULTS: dict = {

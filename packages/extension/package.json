@@ -160,6 +160,10 @@
         "title": "MemoPilot: Open Panel"
       },
       {
+        "command": "memopilot.ingestSessions",
+        "title": "MemoPilot: Ingest AI Sessions"
+      },
+      {
         "command": "memopilot.refreshMemoryReviewQueue",
         "title": "MemoPilot: Refresh Memory Review Queue",
         "icon": "$(refresh)"
@@ -309,7 +313,9 @@
             "auto",
             "ollama",
             "openai",
-            "anthropic"
+            "anthropic",
+            "google",
+            "openrouter"
           ],
           "default": "auto",
           "description": "Preferred LLM provider. 'auto' uses the cheapest available provider."

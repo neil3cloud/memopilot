@@ -23,6 +23,7 @@ async def test_mcp_tools_returns_builtin(client: AsyncClient, test_token: str):
     assert "memopilot-symbols" in builtins[0]["tools"]
     assert "memopilot-memory" in builtins[0]["tools"]
     assert "memopilot-profile" in builtins[0]["tools"]
+    assert "memopilot-ingest-session" in builtins[0]["tools"]
 
 
 @pytest.mark.asyncio
@@ -90,4 +91,5 @@ async def test_mcp_tools_detects_generated_vscode_mcp_config(client: AsyncClient
         "memopilot-symbols",
         "memopilot-memory",
         "memopilot-profile",
+        "memopilot-ingest-session",
     ]
