@@ -53,13 +53,16 @@ AI coding assistants are powerful — but uncontrolled. They send too much conte
 - Budget-aware allocation — per-tier token caps prevent any single source from crowding out others
 - Stale memory items surfaced with a rebuild prompt
 
-### 🤖 LLM Mode Toggle
-- **Three modes:** Copilot (default), Local (Ollama), Cloud (OpenAI/Anthropic)
+### 🤖 LLM Mode Toggle & Multi-Provider Support
+- **Six provider options:** Copilot (default), Anthropic, OpenAI, Google Gemini, OpenRouter, plus local modes (Ollama, LM Studio)
 - Switch mode any time via **MemoPilot: Switch LLM Mode** — no restart needed
 - **Copilot mode** uses `vscode.lm` — GitHub Copilot subscription handles all tokens; no API key, no token cost
-- **Local mode** — Ollama at a configurable URL; fully offline
-- **Cloud mode** — direct API call to OpenAI or Anthropic with your own key
-- Current mode shown in the Status sidebar
+- **Local modes** — Ollama, LM Studio, or any OpenAI-compatible server; fully offline
+- **Cloud modes** — direct API calls (Anthropic, OpenAI, Google Gemini, OpenRouter) with your own API key
+- **Automatic retry/backoff** on cloud providers for transient failures (rate limits, 5xx errors, network timeouts)
+- **Free-tier model support** — OpenRouter exposes free-tier models (e.g., Deepseek) requiring no credits
+- Current mode and active model shown in the Status sidebar
+- Per-provider retry configuration in `.memopilot/config.yaml`
 
 ### 📊 Memory Manager
 - **Run Summarization** button — sends pending symbols to the LLM in configurable batches (25/50/75) without wiping existing summaries
@@ -76,12 +79,12 @@ AI coding assistants are powerful — but uncontrolled. They send too much conte
 ### 📄 Document Ingestion (backend)
 The backend can extract text and structure from several document types via `/v1/evidence/extract-*` endpoints — useful when building context from non-code sources:
 
-| Format | Notes |
-|--------|-------|
-| `.pdf` | Text and tables via pdfplumber |
-| `.xlsx` / `.csv` | Column mapping + sheet selection |
-| `.docx` / `.pptx` | Sections + slides via python-docx/python-pptx |
-| `.png` / `.jpg` | OCR (pytesseract) with optional local (Ollama LLaVA) or cloud vision fallback |
+| Format | Tool | Notes |
+|--------|------|-------|
+| `.pdf` | pdfplumber | Text extraction + table detection |
+| `.xlsx` / `.csv` | openpyxl / csv | Column mapping + sheet selection |
+| `.docx` / `.pptx` | python-docx / python-pptx | Sections + slides with formatting |
+| `.png` / `.jpg` | pytesseract (local) or Gemini Vision (cloud) | OCR with optional Ollama LLaVA or cloud vision fallback |
 
 These are backend primitives without a dedicated sidebar workflow in the current extension UI.
 
@@ -235,17 +238,17 @@ fallback_order:
 
 ## Sidebar Views
 
-| View | Shows |
-|------|-------|
-| **Status** | Backend health, schema version, indexing progress, detected languages |
-| **Workspace Profile** | Detected stack, languages, frameworks |
-| **Memory Manager** | Browse, filter, approve/reject memory items, language badges |
-| **Rules & Skills** | Active rules by source, skills with match criteria |
-| **Context Pack** | Files, tokens, rules, and cost for the active context pack |
-| **Usage Stats** | Symbols indexed/summarized (%), memory items, queries this session |
-| **Privacy Dashboard** | Local-only vs. sent-to-provider data |
-| **Task History** | Past tasks with status, model, cost, duration |
-| **MCP Tools** | Connected tool servers and available tools |
+| View | Shows | Key Features |
+|------|-------|----------------|
+| **Status** | Backend health, schema version, indexing progress, detected languages | Quick restart button; shows current LLM mode, provider, and active model; progress bar during indexing |
+| **Workspace Profile** | Detected stack, languages, frameworks | Auto-inferred from source files; editable for teams; shows test framework and build tools |
+| **Memory Manager** | Browse, filter, approve/reject memory items, language badges | Filters: all, rules, symbols, file summaries, stale, pending; language badges (`[Py]`, `[TS]`, `[C#]`); bulk approve/reject actions |
+| **Rules & Skills** | Active rules by source, skills with match criteria | Hierarchical precedence visualization (safety > policy > workspace > global); conflict detection; source traceability |
+| **Context Pack** | Files, tokens, rules, memory, and cost for the active context pack | Stale memory warnings; callers not included; budget allocation breakdown; estimated token usage and cost |
+| **Usage Stats** | Symbols indexed/summarized (%), memory items, queries this session | Real-time percentage completion; cumulative cost tracking; session query count and latency stats |
+| **Privacy Dashboard** | Local-only vs. sent-to-provider data | Audit trail showing which data leaves the machine; redaction counts; per-call transparency |
+| **Task History** | Past tasks with status, model, cost, duration | Re-run button for any task with same context; filter by provider/model; export task details |
+| **MCP Tools** | Connected MCP servers and available tools | Live server list with connection status; tool schemas and parameter details; availability per provider |
 
 ---
 

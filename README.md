@@ -36,11 +36,16 @@ VS Code/Cursor Extension (TypeScript)
 
 **LLM modes** (switchable at runtime via `MemoPilot: Switch LLM Mode`):
 
-| Mode | Provider | Requires |
-|------|----------|---------|
-| Copilot (default) | `vscode.lm` relay via extension | GitHub Copilot subscription |
-| Local | Ollama | Local model running at configured URL |
-| Cloud | OpenAI or Anthropic direct API | API key in `.memopilot/config.yaml` |
+| Mode | Providers | Requires | Config Key |
+|------|-----------|----------|------------|
+| Copilot (default) | GitHub Copilot via `vscode.lm` | GitHub Copilot subscription | `provider: host` |
+| Local | Ollama, LM Studio, generic OpenAI-compatible | Local model running at configured URL | `provider: local\|ollama\|lmstudio` |
+| Cloud | Anthropic, OpenAI, Google, OpenRouter | API key in `.memopilot/config.yaml` or env | `provider: anthropic\|openai\|google\|openrouter` |
+
+**Environment Variables** (optional, override YAML config):
+- `MEMOPILOT_PROVIDER` — Which provider to use
+- `MEMOPILOT_ANTHROPIC_KEY`, `MEMOPILOT_OPENAI_KEY`, `MEMOPILOT_GOOGLE_KEY`, `MEMOPILOT_OPENROUTER_KEY` — API keys
+- `MEMOPILOT_RETRY_ENABLED`, `MEMOPILOT_RETRY_MAX_ATTEMPTS`, `MEMOPILOT_RETRY_BASE_DELAY_SECONDS`, `MEMOPILOT_RETRY_MAX_DELAY_SECONDS` — Retry policy (cloud providers only)
 
 ```
 packages/
@@ -51,13 +56,35 @@ docs/          — Product documentation
 
 ## Features
 
+### LLM Provider Support
+
+MemoPilot supports multiple LLM providers with automatic retry/backoff for transient failures:
+
+| Provider | Mode | Requires | Status |
+|----------|------|----------|--------|
+| GitHub Copilot | `copilot` | VS Code subscription | Default; no API key |
+| Anthropic (Claude) | `cloud` | API key in config | Production-ready |
+| OpenAI (GPT-4o, etc.) | `cloud` | API key in config | Production-ready |
+| Google Gemini | `cloud` | API key in config | Production-ready |
+| OpenRouter | `cloud` | API key in config | Production-ready with free-tier models |
+| Ollama (local) | `local` | Running instance at localhost:11434 | Production-ready |
+| LM Studio (local) | `local` | Running instance at localhost:1234 | Production-ready |
+| Generic OpenAI-compatible | `local` | Any OpenAI-compatible server | Supported |
+
+**Retry/Backoff Behavior (Cloud Providers Only):**
+- Automatic retry on transient failures (429, 500, 502, 503, 504)
+- Includes httpx transport errors (connection, timeout, TLS)
+- Respects `Retry-After` header when present; falls back to exponential backoff with jitter
+- Configurable: `retry_max_attempts` (default 3), `retry_base_delay_seconds` (default 1.0), `retry_max_delay_seconds` (default 60.0)
+- Local providers (Ollama, LM Studio, generic local) are hard-exempt from retry
+
 ### Implemented and Active
 
 | Feature | Notes |
 |---------|-------|
 | Multi-language symbol indexing | Python, TypeScript/JS, C# |
 | FTS5 full-text search + vector/semantic search | Hybrid retrieval |
-| LLM symbol summarization | Batch size 25/50/75; Copilot, Ollama, or cloud API |
+| LLM symbol summarization | Batch size 25/50/75; all supported providers |
 | Memory seeding from summaries | Auto-seeds memory items after summarization completes |
 | File-watcher pending-changes notification | Status bar shows new/modified/deleted files; click to reindex |
 | Jedi cross-module call resolution | Cross-file caller/callee relationships for Python |
@@ -66,7 +93,8 @@ docs/          — Product documentation
 | Rules & Policy Packs | Hierarchical rules; org policy packs with precedence |
 | Skill Store | Skills with conflict detection and optimizer |
 | Context Pack sidebar | Populated after Search Project Context — files, tokens, quality score, callers not in context |
-| LLM mode toggle | Copilot / Local / Ollama / Cloud — switchable at runtime |
+| LLM mode toggle | Copilot / Local / Cloud (any provider) — switchable at runtime |
+| Per-provider retry configuration | Global + per-provider override in `.memopilot/config.yaml` |
 | Budget profiles | Affect cost multiplier math (`balanced`, `cost_saver`, `strict_local`, `enterprise_privacy`) |
 | Select Budget Profile command | Wired to GET/POST /v1/budget/profiles |
 | Workspace Profile | Auto-detected stack, languages, frameworks |
@@ -77,13 +105,20 @@ docs/          — Product documentation
 | Backup / Restore Memory | Timestamped backup with FTS rebuild |
 | AI Call Replay | Re-run a past task with the same context |
 | Secret redaction | `detect-secrets` in context packs |
+| API key storage | SecretStorage for cloud provider keys; environment variables for all config |
+| Configuration validation | Safe numeric/boolean coercion; clamping of invalid retry parameters |
 
 ### Backend-Only (No Extension UI)
 
-| Feature | Backend Location |
-|---------|-----------------|
-| Document ingestion | PDF, Excel, DOCX, PPTX, image OCR via `/v1/evidence/extract-*` |
-| Patch generation & validation | `patcher.py`, `validation_runner.py` — no extension commands wired |
+| Feature | Backend Location | Details |
+|---------|------------------|----------|
+| Document ingestion | `/v1/evidence/extract-*` endpoints | PDF, Excel, DOCX, PPTX, image OCR via pytesseract + optional Ollama LLaVA or cloud vision |
+| Patch generation & validation | `patcher.py`, `validation_runner.py` | No extension commands wired; available for internal pipelines |
+| Git history analysis | `git_history_indexer.py` | Analyzes commit patterns and author history |
+| Workspace initialization | `workspace_init.py` | Automatic `.memopilot/` directory setup and gitignore wiring |
+| Retention enforcement | `retention.py` | Automatic cleanup of stale items per policy |
+| Configuration loading | `config_loader.py` | Multi-source config merging with safe type coercion |
+| Migration runner | `migration_runner.py` | Database schema versioning and upgrade automation |
 
 ## Sidebar Views
 
