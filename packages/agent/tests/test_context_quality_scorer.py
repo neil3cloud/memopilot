@@ -94,6 +94,32 @@ def test_stale_penalty_applied():
     assert result_fresh.total > result_stale.total
 
 
+def test_mid_declaration_truncation_pct_flows_through():
+    pack = _make_pack(mid_declaration_truncation_pct=0.85)
+    result = score_context_pack(pack)
+    assert result.mid_declaration_truncation_pct == 0.85
+
+
+def test_mid_declaration_truncation_warns_above_threshold():
+    pack = _make_pack(mid_declaration_truncation_pct=0.5)
+    result = score_context_pack(pack)
+    assert any("mid-function" in s.lower() for s in result.missing_signals)
+
+
+def test_mid_declaration_truncation_silent_below_threshold():
+    pack = _make_pack(mid_declaration_truncation_pct=0.1)
+    result = score_context_pack(pack)
+    assert not any("mid-function" in s.lower() for s in result.missing_signals)
+
+
+def test_mid_declaration_truncation_pct_does_not_change_total_score():
+    # Informational signal (same pattern as dedup_savings_pct/graph_expansion_files) -
+    # it should not silently shift verdicts by changing the weighted total.
+    pack_clean = _make_pack(mid_declaration_truncation_pct=0.0)
+    pack_risky = _make_pack(mid_declaration_truncation_pct=0.9)
+    assert score_context_pack(pack_clean).total == score_context_pack(pack_risky).total
+
+
 def test_build_quality_warning_includes_verdict():
     pack = _make_pack(files=[], rules=[], source_types=[], primary_symbol=None)
     quality = score_context_pack(pack)

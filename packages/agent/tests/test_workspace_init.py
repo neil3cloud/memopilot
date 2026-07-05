@@ -113,3 +113,35 @@ async def test_workspace_init_is_idempotent(
     response2 = await client.post("/v1/workspace/init", headers=headers)
     assert response2.status_code == 200
     assert response2.json()["initialized"] is True
+
+
+@pytest.mark.asyncio
+async def test_workspace_init_does_not_append_blank_lines_in_managed_instruction_files(
+    client: AsyncClient, test_token: str, test_config: Config
+):
+    """Repeated init should not drift managed instruction files by adding trailing blank lines."""
+    headers = {"X-Agent-Token": test_token}
+
+    response1 = await client.post("/v1/workspace/init", headers=headers)
+    assert response1.status_code == 200
+
+    managed_paths = [
+        test_config.workspace_path / ".github" / "copilot-instructions.md",
+        test_config.workspace_path / "CLAUDE.md",
+        test_config.workspace_path / "GEMINI.md",
+        test_config.workspace_path / ".cursor" / "rules" / "memopilot.mdc",
+    ]
+    snapshot_after_first = {
+        str(path): path.read_text(encoding="utf-8")
+        for path in managed_paths
+    }
+
+    response2 = await client.post("/v1/workspace/init", headers=headers)
+    assert response2.status_code == 200
+
+    snapshot_after_second = {
+        str(path): path.read_text(encoding="utf-8")
+        for path in managed_paths
+    }
+
+    assert snapshot_after_second == snapshot_after_first

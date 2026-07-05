@@ -37,6 +37,7 @@ class ContextQualityScore:
     graph_expansion_files: int      # files added by call-graph expansion
     verdict: str                    # 'good' | 'acceptable' | 'poor' | 'rebuild'
     missing_signals: list[str] = field(default_factory=list)
+    mid_declaration_truncation_pct: float = 0.0  # 0.0-1.0 fraction of truncated code items cut mid-function/class
 
     def as_dict(self) -> dict[str, object]:
         return {
@@ -51,6 +52,7 @@ class ContextQualityScore:
             "graph_expansion_files": self.graph_expansion_files,
             "verdict": self.verdict,
             "missing_signals": self.missing_signals,
+            "mid_declaration_truncation_pct": round(self.mid_declaration_truncation_pct, 3),
         }
 
 
@@ -64,6 +66,7 @@ class ContextPackSnapshot:
     dedup_savings_pct: float = 0.0
     graph_expansion_files: int = 0
     primary_symbol: str | None = None   # primary symbol name being modified
+    mid_declaration_truncation_pct: float = 0.0  # 0.0-1.0, see context_budget.compute_mid_declaration_truncation_pct
 
 
 def score_context_pack(
@@ -116,6 +119,12 @@ def score_context_pack(
     if pack.stale_exclusion_pct > 0.3:
         pct = int(pack.stale_exclusion_pct * 100)
         missing.append(f"{pct}% of recalled memory was stale — consider rebuilding index")
+    if pack.mid_declaration_truncation_pct > 0.3:
+        pct = int(pack.mid_declaration_truncation_pct * 100)
+        missing.append(
+            f"{pct}% of truncated code context was cut mid-function/class "
+            "— consider a larger token budget or narrowing files_in_focus"
+        )
 
     return ContextQualityScore(
         total=round(score, 3),
@@ -129,6 +138,7 @@ def score_context_pack(
         graph_expansion_files=pack.graph_expansion_files,
         verdict=verdict,
         missing_signals=missing,
+        mid_declaration_truncation_pct=pack.mid_declaration_truncation_pct,
     )
 
 

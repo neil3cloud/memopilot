@@ -37,6 +37,7 @@ from .context_budget import (
     ContextBudget,
     ContextItem,
     build_budget_aware_context_pack,
+    compute_mid_declaration_truncation_pct,
 )
 from .context_builder import ContextBuilderService
 from .context_deduplicator import deduplicate_text_list
@@ -496,6 +497,7 @@ class ContextQualityScoreResponse(BaseModel):
     graph_expansion_files: int
     verdict: str            # 'good' | 'acceptable' | 'poor' | 'rebuild'
     missing_signals: list[str] = Field(default_factory=list)
+    mid_declaration_truncation_pct: float = 0.0
 
 
 class ContextBuildResponse(BaseModel):
@@ -2185,6 +2187,8 @@ def _serialize_context_item(item: ContextItem) -> dict[str, object]:
         "retrieval_method": item.retrieval_method,
         "trust_level": item.trust_level,
         "tier": item.tier,
+        "truncated": item.truncated,
+        "truncation_boundary": item.truncation_boundary,
     }
 
 
@@ -2892,6 +2896,7 @@ async def _generate_context_pack_response(request: ContextBuildRequest) -> Conte
         dedup_savings_pct=dedup_savings_pct,
         graph_expansion_files=graph_expansion_files,
         primary_symbol=_extract_primary_symbol(request.task_description),
+        mid_declaration_truncation_pct=compute_mid_declaration_truncation_pct(included_items),
     )
     quality = score_context_pack(quality_pack, task_description=request.task_description)
     quality_response = ContextQualityScoreResponse(**quality.as_dict())

@@ -107,6 +107,8 @@ MemoPilot supports multiple LLM providers with automatic retry/backoff for trans
 | Secret redaction | `detect-secrets` in context packs |
 | API key storage | SecretStorage for cloud provider keys; environment variables for all config |
 | Configuration validation | Safe numeric/boolean coercion; clamping of invalid retry parameters |
+| Content-aware context truncation | Declaration-boundary-safe cuts for code (preserves whole functions/classes), head/tail preservation for stack traces — replaces flat character-count truncation |
+| Truncation quality signal | `mid_declaration_truncation_pct` in context quality scoring flags when code context was cut mid-function/class |
 
 ### Backend-Only (No Extension UI)
 
