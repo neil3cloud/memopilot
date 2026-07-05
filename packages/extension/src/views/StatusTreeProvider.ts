@@ -1,6 +1,13 @@
 import * as vscode from 'vscode';
 import { IndexStatusResponse, ProviderCapabilityItemResponse } from '../BackendClient';
 
+const PROVIDER_LABELS: Record<string, string> = {
+    anthropic: 'Anthropic',
+    openai: 'OpenAI',
+    google: 'Google AI Studio',
+    openrouter: 'OpenRouter',
+};
+
 type BackendStatus = 'connecting' | 'connected' | 'error' | 'no-workspace';
 
 export class StatusTreeProvider implements vscode.TreeDataProvider<vscode.TreeItem> {
@@ -14,6 +21,8 @@ export class StatusTreeProvider implements vscode.TreeDataProvider<vscode.TreeIt
     private llmMode: string = 'local';
     private llmModeModelId: string = '';
     private copilotAvailable: boolean = false;
+    private cloudProvider: string = '';
+    private cloudProviderModelId: string = '';
 
     setStatus(status: BackendStatus, message: string): void {
         this.status = status;
@@ -34,10 +43,18 @@ export class StatusTreeProvider implements vscode.TreeDataProvider<vscode.TreeIt
         this._onDidChangeTreeData.fire(undefined);
     }
 
-    updateLLMMode(mode: string, modelId: string, copilotAvailable: boolean): void {
+    updateLLMMode(
+        mode: string,
+        modelId: string,
+        copilotAvailable: boolean,
+        cloudProvider: string = '',
+        cloudProviderModelId: string = '',
+    ): void {
         this.llmMode = mode;
         this.llmModeModelId = modelId;
         this.copilotAvailable = copilotAvailable;
+        this.cloudProvider = cloudProvider;
+        this.cloudProviderModelId = cloudProviderModelId;
         this._onDidChangeTreeData.fire(undefined);
     }
 
@@ -146,6 +163,11 @@ export class StatusTreeProvider implements vscode.TreeDataProvider<vscode.TreeIt
 
     private buildProviderLabel(): string {
         if (!this.providerCapabilities.length) {
+            if (this.cloudProvider) {
+                const label = PROVIDER_LABELS[this.cloudProvider] ?? this.cloudProvider;
+                const model = this.cloudProviderModelId ? ` (${this.cloudProviderModelId})` : '';
+                return `LLM Touch Points: ${label}${model}`;
+            }
             return 'LLM Touch Points: Not configured - run MemoPilot: Configure LLM Touch Points';
         }
 

@@ -21,6 +21,7 @@ import os
 import re
 import sys
 import uuid
+from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -82,7 +83,17 @@ from .workspace_roots import WorkspaceRootsService
 
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="MemoPilot Agent", version="0.1.0")
+
+@asynccontextmanager
+async def _lifespan(app_obj: FastAPI):
+    await startup_event()
+    try:
+        yield
+    finally:
+        await shutdown_event()
+
+
+app = FastAPI(title="MemoPilot Agent", version="0.1.0", lifespan=_lifespan)
 
 # Module-level state (set during startup)
 _config: Config | None = None
@@ -115,6 +126,10 @@ _session_synthesis_task: "asyncio.Task[None] | None" = None
 # local: direct HTTP to configured local provider (LM Studio/Ollama)
 _llm_mode: str = "local"
 _llm_mode_model_id: str = ""  # copilot model id from probe
+# True once the user (or the extension on their behalf) has explicitly chosen a mode via
+# POST /v1/config/llm-mode — distinguishes that from the config-derived default set at startup,
+# so the Copilot auto-upgrade probe doesn't have to guess which "local"/"cloud" value it's looking at.
+_llm_mode_user_set: bool = False
 
 # Unified LLM relay — extension listens on SSE, fulfills requests via vscode.lm
 _relay_sse_queue: asyncio.Queue = asyncio.Queue()
@@ -124,6 +139,19 @@ _relay_futures: dict[str, asyncio.Future] = {}
 _host_model_available: bool = False
 _synthesis_sse_queue: asyncio.Queue = _relay_sse_queue
 _synthesis_relay_futures: dict[str, asyncio.Future] = _relay_futures
+
+
+def _configured_llm_mode(provider: str) -> str | None:
+    """Map provider config to an LLM mode override.
+
+    Returns None when provider should not force a mode (for example "host").
+    """
+    normalized = (provider or "").strip().lower()
+    if normalized in {"anthropic", "openai", "google", "openrouter"}:
+        return "cloud"
+    if normalized in {"local", "ollama", "lmstudio"}:
+        return "local"
+    return None
 
 
 def _get_effective_summarizer() -> "SymbolSummarizer | None":
@@ -1512,9 +1540,8 @@ async def _retention_loop() -> None:
         return
 
 
-@app.on_event("startup")
 async def startup_event() -> None:
-    global _retention_task, _synthesizer, _writeback_client, _symbol_summarizer
+    global _retention_task, _synthesizer, _writeback_client, _symbol_summarizer, _llm_mode
     try:
         await _run_retention_pass()
     except Exception:
@@ -1528,6 +1555,9 @@ async def startup_event() -> None:
     try:
         cfg = load_provider_config(str(_get_config().workspace_path))
         _llm_client = build_client(cfg.get("provider", "host"), cfg)
+        mode_override = _configured_llm_mode(str(cfg.get("provider", "host")))
+        if mode_override is not None:
+            _llm_mode = mode_override
         _synthesizer = ContextSynthesizer(_llm_client)
         _writeback_client = _llm_client
         _symbol_summarizer = SymbolSummarizer(_llm_client)
@@ -1567,7 +1597,6 @@ async def _seed_local_providers() -> None:
     logger.info("Seeded %d local model(s) into provider registry", len(models))
 
 
-@app.on_event("shutdown")
 async def shutdown_event() -> None:
     global _retention_task
     if _retention_task is None:
@@ -3311,8 +3340,10 @@ async def host_model_ready(request: HostModelReadyRequest):
     global _host_model_available, _llm_mode, _llm_mode_model_id
     _host_model_available = request.available
     _llm_mode_model_id = request.model_id
-    if request.available and _llm_mode == "local":
-        # Auto-upgrade to copilot on first successful probe
+    if request.available and not _llm_mode_user_set:
+        # Auto-upgrade to copilot on first successful probe, unless the user has
+        # explicitly chosen a mode (via set_llm_mode) — a configured cloud/local
+        # provider default from startup should not block this.
         _llm_mode = "copilot"
     logger.info("Host model probe: available=%s model=%s mode=%s", request.available, request.model_id, _llm_mode)
     return {"ok": True}
@@ -3325,7 +3356,7 @@ class LLMModeRequest(BaseModel):
 @app.post("/v1/config/llm-mode")
 async def set_llm_mode(request: LLMModeRequest):
     """Extension posts this when user toggles the LLM mode."""
-    global _llm_mode
+    global _llm_mode, _llm_mode_user_set
     allowed = {"copilot", "cloud", "local"}
     if request.mode not in allowed:
         raise HTTPException(status_code=400, detail=f"mode must be one of {allowed}")
@@ -3333,6 +3364,7 @@ async def set_llm_mode(request: LLMModeRequest):
         raise HTTPException(status_code=400, detail="Copilot model not available — probe first")
     prev = _llm_mode
     _llm_mode = request.mode
+    _llm_mode_user_set = True
     # Cancel any in-flight relay futures so they fail fast and caller can retry
     if prev != request.mode:
         for fut in list(_relay_futures.values()):
@@ -3346,12 +3378,15 @@ async def set_llm_mode(request: LLMModeRequest):
 @app.get("/v1/config/llm-mode")
 async def get_llm_mode():
     """Return current LLM mode and available options."""
+    provider_name = getattr(_writeback_client, "provider_name", "") if _writeback_client is not None else ""
     return {
         "mode": _llm_mode,
         "model_id": _llm_mode_model_id,
         "copilot_available": _host_model_available,
-        "cloud_available": _writeback_client is not None and getattr(_writeback_client, "provider_name", "") not in ("local", ""),
-        "local_available": _writeback_client is not None and getattr(_writeback_client, "provider_name", "") == "local",
+        "cloud_available": provider_name not in ("", "local", "ollama", "lmstudio"),
+        "local_available": provider_name in ("local", "ollama", "lmstudio"),
+        "provider": provider_name,
+        "provider_model_id": getattr(_writeback_client, "model_id", "") if _writeback_client is not None else "",
     }
 
 

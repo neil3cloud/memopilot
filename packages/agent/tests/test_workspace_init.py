@@ -34,6 +34,8 @@ async def test_workspace_init_creates_directories(
     assert (test_config.workspace_path / ".vscode" / "mcp.json").exists()
     assert (test_config.workspace_path / ".github" / "copilot-instructions.md").exists()
     assert (test_config.workspace_path / ".cursor" / "rules" / "memopilot.mdc").exists()
+    assert (test_config.workspace_path / "CLAUDE.md").exists()
+    assert (test_config.workspace_path / "GEMINI.md").exists()
 
 
 @pytest.mark.asyncio
@@ -63,6 +65,14 @@ async def test_workspace_init_generates_retrieval_bootstrap_files(
     assert "memopilot-search" in cursor_rule
     assert "memopilot-symbols" in cursor_rule
 
+    claude_md = (test_config.workspace_path / "CLAUDE.md").read_text(encoding="utf-8")
+    assert "memopilot-search" in claude_md
+    assert "memopilot-memory" in claude_md
+
+    gemini_md = (test_config.workspace_path / "GEMINI.md").read_text(encoding="utf-8")
+    assert "memopilot-search" in gemini_md
+    assert "memopilot-memory" in gemini_md
+
 
 @pytest.mark.asyncio
 async def test_workspace_init_preserves_unmanaged_instruction_files(
@@ -71,6 +81,9 @@ async def test_workspace_init_preserves_unmanaged_instruction_files(
     instructions_path = test_config.workspace_path / ".github" / "copilot-instructions.md"
     instructions_path.parent.mkdir(parents=True, exist_ok=True)
     instructions_path.write_text("# Existing project instructions\n", encoding="utf-8")
+
+    claude_md_path = test_config.workspace_path / "CLAUDE.md"
+    claude_md_path.write_text("# Existing Claude instructions\n", encoding="utf-8")
 
     response = await client.post(
         "/v1/workspace/init",
@@ -81,6 +94,10 @@ async def test_workspace_init_preserves_unmanaged_instruction_files(
     content = instructions_path.read_text(encoding="utf-8")
     assert "# Existing project instructions" in content
     assert "MemoPilot managed block" in content
+
+    claude_content = claude_md_path.read_text(encoding="utf-8")
+    assert "# Existing Claude instructions" in claude_content
+    assert "MemoPilot managed block" in claude_content
 
 
 @pytest.mark.asyncio

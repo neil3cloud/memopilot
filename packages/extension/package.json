@@ -313,7 +313,9 @@
             "auto",
             "ollama",
             "openai",
-            "anthropic"
+            "anthropic",
+            "google",
+            "openrouter"
           ],
           "default": "auto",
           "description": "Preferred LLM provider. 'auto' uses the cheapest available provider."

@@ -276,6 +276,16 @@ export interface ProviderCapabilitiesResponse {
     items: ProviderCapabilityItemResponse[];
 }
 
+export interface LLMModeResponse {
+    mode: string;
+    model_id: string;
+    copilot_available: boolean;
+    cloud_available: boolean;
+    local_available: boolean;
+    provider: string;
+    provider_model_id: string;
+}
+
 export interface LocalModelItem {
     model_id: string;
     source: string;
@@ -625,9 +635,9 @@ export class BackendClient {
         return result as ProviderCapabilitiesResponse;
     }
 
-    async getLLMMode(): Promise<{ mode: string; model_id: string; copilot_available: boolean; cloud_available: boolean; local_available: boolean }> {
+    async getLLMMode(): Promise<LLMModeResponse> {
         const result = await this.manager.request('GET', '/v1/config/llm-mode');
-        return result as { mode: string; model_id: string; copilot_available: boolean; cloud_available: boolean; local_available: boolean };
+        return result as LLMModeResponse;
     }
 
     async setLLMMode(mode: string): Promise<{ ok: boolean; mode: string }> {

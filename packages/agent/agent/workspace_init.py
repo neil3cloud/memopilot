@@ -102,15 +102,16 @@ def generate_workspace_bootstrap(
     primary_language = workspace.get("primary_language", "unknown") if isinstance(workspace, dict) else "unknown"
     workspace_name = workspace.get("name", workspace_path.name) if isinstance(workspace, dict) else workspace_path.name
 
-    _write_vscode_mcp_json(workspace_path)
-    _upsert_managed_markdown(
-        workspace_path / ".github" / "copilot-instructions.md",
-        _render_copilot_instructions(
-            workspace_name=workspace_name,
-            primary_language=str(primary_language),
-            frameworks=[str(item) for item in frameworks if isinstance(item, str)],
-        ),
+    retrieval_first_body = _render_retrieval_first_instructions(
+        workspace_name=workspace_name,
+        primary_language=str(primary_language),
+        frameworks=[str(item) for item in frameworks if isinstance(item, str)],
     )
+
+    _write_vscode_mcp_json(workspace_path)
+    _upsert_managed_markdown(workspace_path / ".github" / "copilot-instructions.md", retrieval_first_body)
+    _upsert_managed_markdown(workspace_path / "CLAUDE.md", retrieval_first_body)
+    _upsert_managed_markdown(workspace_path / "GEMINI.md", retrieval_first_body)
     _upsert_managed_markdown(
         workspace_path / ".cursor" / "rules" / "memopilot.mdc",
         _render_cursor_rule(
@@ -173,12 +174,13 @@ def _upsert_managed_markdown(path: Path, managed_body: str) -> None:
     path.write_text(updated, encoding="utf-8")
 
 
-def _render_copilot_instructions(
+def _render_retrieval_first_instructions(
     *,
     workspace_name: str,
     primary_language: str,
     frameworks: list[str],
 ) -> str:
+    """Shared managed-block body for plain-markdown instruction files (Copilot, Claude Code, Gemini CLI)."""
     framework_line = ", ".join(frameworks) if frameworks else "none detected"
     return f"""# MemoPilot Retrieval-First Instructions
 

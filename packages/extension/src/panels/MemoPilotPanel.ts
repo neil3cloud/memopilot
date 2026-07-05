@@ -4,6 +4,16 @@ import { MemoPilotPanelBase } from './MemoPilotPanelBase';
 import { NAVIGATION_ITEMS } from './navigationItems';
 import type { WebviewOutboundMessage, WorkspaceStatusDTO, NavigationItemDTO } from './types';
 
+// Cloud provider key fields that must never be persisted in plaintext to config.yaml —
+// keys live only in SecretStorage. Kept here so we can scrub stale values left by an
+// older MemoPilot build (or a hand-edited config.yaml) whenever we touch the file.
+const PROVIDER_KEY_FIELDS: Record<string, string> = {
+    anthropic: 'anthropic_api_key',
+    openai: 'openai_api_key',
+    google: 'google_api_key',
+    openrouter: 'openrouter_api_key',
+};
+
 /**
  * Main MemoPilot panel — shell with navigation sidebar and content area.
  * Handles view switching, backend status display, and message routing.
@@ -14,8 +24,13 @@ export class MemoPilotPanel extends MemoPilotPanelBase {
 
     private client: BackendClient | undefined;
     private activeViewId: string = 'workspace-status';
+    private extensionContext: vscode.ExtensionContext;
 
-    public static createOrShow(extensionUri: vscode.Uri, client: BackendClient | undefined): void {
+    public static createOrShow(
+        extensionUri: vscode.Uri,
+        client: BackendClient | undefined,
+        extensionContext: vscode.ExtensionContext,
+    ): void {
         const column = vscode.window.activeTextEditor?.viewColumn ?? vscode.ViewColumn.One;
 
         if (MemoPilotPanel.currentPanel) {
@@ -36,12 +51,18 @@ export class MemoPilotPanel extends MemoPilotPanelBase {
             },
         );
 
-        MemoPilotPanel.currentPanel = new MemoPilotPanel(panel, extensionUri, client);
+        MemoPilotPanel.currentPanel = new MemoPilotPanel(panel, extensionUri, client, extensionContext);
     }
 
-    private constructor(panel: vscode.WebviewPanel, extensionUri: vscode.Uri, client: BackendClient | undefined) {
+    private constructor(
+        panel: vscode.WebviewPanel,
+        extensionUri: vscode.Uri,
+        client: BackendClient | undefined,
+        extensionContext: vscode.ExtensionContext,
+    ) {
         super(panel, extensionUri);
         this.client = client;
+        this.extensionContext = extensionContext;
 
         this.panel.onDidDispose(() => {
             MemoPilotPanel.currentPanel = undefined;
@@ -204,15 +225,27 @@ export class MemoPilotPanel extends MemoPilotPanelBase {
 
     private async handleEnterApiKey(): Promise<void> {
         const provider = await vscode.window.showQuickPick(
-            ['anthropic', 'openai'],
+            ['anthropic', 'openai', 'google', 'openrouter'],
             { placeHolder: 'Select provider' },
         );
         if (!provider) { return; }
 
+        const providerLabels: Record<string, string> = {
+            anthropic: 'Anthropic',
+            openai: 'OpenAI',
+            google: 'Google AI Studio',
+            openrouter: 'OpenRouter',
+        };
+        const providerPlaceholders: Record<string, string> = {
+            anthropic: 'sk-ant-...',
+            openai: 'sk-...',
+            google: 'AIza...',
+            openrouter: 'sk-or-v1-...',
+        };
         const key = await vscode.window.showInputBox({
-            prompt: `Enter your ${provider === 'anthropic' ? 'Anthropic' : 'OpenAI'} API key`,
+            prompt: `Enter your ${providerLabels[provider]} API key`,
             password: true,
-            placeHolder: provider === 'anthropic' ? 'sk-ant-...' : 'sk-...',
+            placeHolder: providerPlaceholders[provider],
         });
         if (!key) { return; }
 
@@ -222,18 +255,59 @@ export class MemoPilotPanel extends MemoPilotPanelBase {
             return;
         }
 
+        const secretKeyNames: Record<string, string> = {
+            anthropic: 'memopilot.anthropicApiKey',
+            openai: 'memopilot.openaiApiKey',
+            google: 'memopilot.googleApiKey',
+            openrouter: 'memopilot.openrouterApiKey',
+        };
+
         const configDir = vscode.Uri.joinPath(workspaceFolder.uri, '.memopilot');
         const configFile = vscode.Uri.joinPath(configDir, 'config.yaml');
 
         try {
-            const keyField = provider === 'anthropic' ? 'anthropic_api_key' : 'openai_api_key';
-            const yaml = `# MemoPilot provider config — do not commit\n${keyField}: ${key}\n`;
+            // The key itself is stored in SecretStorage (never written to disk) —
+            // only the provider selection goes into the workspace config.yaml.
+            await this.extensionContext.secrets.store(secretKeyNames[provider], key);
+
+            let existing = '';
+            try {
+                existing = Buffer.from(await vscode.workspace.fs.readFile(configFile)).toString('utf8');
+            } catch { /* file doesn't exist yet */ }
+
+            const update = (yaml: string, field: string, value: string): string => {
+                const re = new RegExp(`^(\\s*#\\s*)?${field}:.*$`, 'm');
+                const line = `${field}: ${value}`;
+                return re.test(yaml) ? yaml.replace(re, line) : yaml + `\n${line}`;
+            };
+
+            // Scrub any plaintext key ever written by an older MemoPilot build (or a
+            // hand-edited config.yaml) so a stale on-disk value can't silently keep
+            // being used if SecretStorage is later cleared or fails to load.
+            const scrubLegacyPlaintextKeys = (yaml: string): string => {
+                let result = yaml;
+                for (const field of Object.values(PROVIDER_KEY_FIELDS)) {
+                    result = result.replace(new RegExp(`^${field}:.*\\n?`, 'm'), '');
+                }
+                return result;
+            };
+
+            let yaml = existing || '# MemoPilot provider config — do not commit\n';
+            yaml = scrubLegacyPlaintextKeys(yaml);
+            yaml = update(yaml, 'provider', provider);
+
             await vscode.workspace.fs.createDirectory(configDir);
             await vscode.workspace.fs.writeFile(configFile, Buffer.from(yaml, 'utf8'));
-            vscode.window.showInformationMessage(`API key saved to .memopilot/config.yaml`);
+            const action = await vscode.window.showInformationMessage(
+                `${providerLabels[provider]} API key saved. Restart MemoPilot backend to apply.`,
+                'Restart Now',
+            );
+            if (action === 'Restart Now') {
+                await vscode.commands.executeCommand('memopilot.restartBackend');
+            }
             this.sendWorkspaceStatus();
         } catch (err: unknown) {
-            vscode.window.showErrorMessage(`Failed to write config: ${err instanceof Error ? err.message : String(err)}`);
+            vscode.window.showErrorMessage(`Failed to save API key: ${err instanceof Error ? err.message : String(err)}`);
         }
     }
 
@@ -412,7 +486,7 @@ export class MemoPilotPanel extends MemoPilotPanelBase {
                     + '<p style="font-size:12px;margin:8px 0 12px;opacity:0.8;">No AI providers detected. Choose how to enable AI patch generation:</p>'
                     + '<div style="display:flex;flex-direction:column;gap:8px;">'
                     + '<button class="mp-setup-ollama-btn" style="background:var(--mp-button-bg);color:var(--mp-button-fg);border:none;padding:8px 12px;border-radius:4px;cursor:pointer;text-align:left;">🦙 Install Ollama (free, local) — ollama.com</button>'
-                    + '<button class="mp-setup-key-btn" style="background:var(--mp-button-bg);color:var(--mp-button-fg);border:none;padding:8px 12px;border-radius:4px;cursor:pointer;text-align:left;">🔑 Enter API key (Anthropic or OpenAI)</button>'
+                    + '<button class="mp-setup-key-btn" style="background:var(--mp-button-bg);color:var(--mp-button-fg);border:none;padding:8px 12px;border-radius:4px;cursor:pointer;text-align:left;">🔑 Enter API key (Anthropic, OpenAI, Google AI Studio, or OpenRouter)</button>'
                     + '<button class="mp-setup-copilot-btn" style="background:var(--mp-button-bg);color:var(--mp-button-fg);border:none;padding:8px 12px;border-radius:4px;cursor:pointer;text-align:left;">🤖 Use Copilot subscription (VS Code only)</button>'
                     + '</div></div>';
             }
